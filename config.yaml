@@ -1,0 +1,33 @@
+system:
+  app-name: "navmesh"
+  addr: 3007
+  db-type: sqlite
+  router-prefix: /api
+jwt:
+  issuer: navmesh
+  signing-key: "navmesh"
+  expires-time: 24h
+  buffer-time: 1h
+local:
+  oss-path: ./data/oss
+  proxy-oss-path: /oss
+  cache-path: ./data/cache.json
+sqlite:
+  db-name: navmesh
+  path: ./data/
+zap:
+  director: logback
+  level: info
+  prefix: '[navmesh-server]'
+  retention-day: 3
+navmesh:
+  data-dir: ./data/navmesh
+  heartbeat-timeout: 90s
+  session-idle-timeout: 30m
+  audit-retention-days: 90
+  http-access-retention-days: 30
+  session-retention-days: 90
+  heartbeat-retention-days: 7
+  device-connection-retention-days: 30
+  default-target-host: "127.0.0.1"
+  default-target-port: 22

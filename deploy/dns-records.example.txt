@@ -1,0 +1,9 @@
+# SSH aliases require distinct entry IPs because SSH does not carry Host/SNI.
+test01.navfirst.com. 300 IN AAAA 2400:xxxx::1001
+test02.navfirst.com. 300 IN AAAA 2400:xxxx::1002
+
+# HTTP mappings can share one gateway IP because Caddy/HTTP provides SNI/Host.
+*.qx.navfirst.com. 300 IN A 203.0.113.10
+
+# Custom domains should CNAME to a Caddy-managed host or A/AAAA to the gateway.
+my-device.example.com. 300 IN CNAME custom.qx.navfirst.com.

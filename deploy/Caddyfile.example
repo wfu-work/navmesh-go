@@ -1,0 +1,22 @@
+# NavMesh production entry.
+# Caddy owns HTTPS, wildcard/custom-domain certificates and TLS policy.
+# Go Gateway only receives plain HTTP on http_listen, default 127.0.0.1:8080.
+
+{
+	email ops@navfirst.com
+}
+
+*.qx.navfirst.com {
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Example custom domain bound to a navmesh_port_mappings.public_host row.
+# Add one site block per customer domain, or generate it from your control plane.
+my-device.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Management API. Restrict this host at firewall or Caddy layer in production.
+navmesh-admin.navfirst.com {
+	reverse_proxy 127.0.0.1:3007
+}
