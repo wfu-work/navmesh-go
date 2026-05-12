@@ -28,7 +28,6 @@ func Init() {
 	sysInit := commonInits.SysInit{}
 	sysInit.OnTableInit(registerTables)
 	sysInit.OnRouterInit(func(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
-		routers.RouterGroupApp.InitAuthRouter(publicGroup, privateGroup)
 		routers.RouterGroupApp.InitAccessPolicyRouter(privateGroup)
 		routers.RouterGroupApp.InitAuditRouter(privateGroup)
 		routers.RouterGroupApp.InitDeviceRouter(publicGroup, privateGroup)
@@ -63,7 +62,6 @@ func registerTables() {
 		domains.DeviceGroup{},
 		domains.Event{},
 		domains.AuditLog{},
-		domains.User{},
 		domains.Setting{},
 	)
 	if err != nil {
@@ -116,8 +114,6 @@ func seedDefaultSettings() {
 		"default_ssh_port":                 "22",
 		"device_register_token":            "navfirst@2020",
 		"session_idle_timeout":             "30m",
-		"admin_username":                   "admin",
-		"admin_initial_password":           "navmesh@2020",
 		"retention_cleanup_enabled":        "true",
 		"retention_cleanup_interval":       "24h",
 		"audit_retention_days":             "90",
@@ -140,15 +136,6 @@ func seedDefaultSettings() {
 		if err := global.NAV_DB.Create(&row).Error; err != nil {
 			global.NAV_LOG.Warn("seed navmesh default setting failed", zap.String("key", key), zap.Error(err))
 		}
-	}
-	seedDefaultAdmin()
-}
-
-func seedDefaultAdmin() {
-	username := getSettingValue("admin_username", "admin")
-	password := getSettingValue("admin_initial_password", "navmesh@2020")
-	if err := services.ServiceGroupApp.AuthService.EnsureDefaultAdmin(username, password); err != nil {
-		global.NAV_LOG.Warn("seed navmesh default admin failed", zap.Error(err))
 	}
 }
 

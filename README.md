@@ -782,7 +782,7 @@ WantedBy=multi-user.target
 
 - 服务启动：`main.go` 调用 `inits.Init()`，通过 `nav-common-go-lib/inits.SysInit` 读取 `config.yaml`、初始化日志、SQLite、系统表和 Gin HTTP 服务。
 - 基础配置：`config.yaml` 只保留服务启动必需配置，域名、监听地址、默认映射域等运行期配置写入 `navmesh_settings`。
-- 自动建表：已创建设备、设备 Token、连接、心跳、SSH 入口、端口映射、自定义域名、会话、HTTP 访问日志、事件、审计、单管理员、settings 等表。
+- 自动建表：已创建设备、设备 Token、连接、心跳、SSH 入口、端口映射、自定义域名、会话、HTTP 访问日志、事件、审计、settings 等业务表；用户、角色、登录等系统表由 `nav-common-go-lib` 初始化。
 - 默认 settings：初始化 `public_domain`、`ssh_gateway_domain`、`http_mapping_domain`、`ssh_listen`、`tunnel_listen`、`device_register_token` 等配置项。
 - 设备注册：`POST /api/device/register`，支持 `sncode`、`deviceId`、`type`、`remark`、`sshPort`、`webPort`、`webDomain` 入库。
 - 设备类型：内置 `ssh`、`radar`、`radar-one`、`rain`、`hipnames`、`dic`、`ppp`、`sag`、`data` 的默认 Web 端口和默认域名。
@@ -808,8 +808,8 @@ WantedBy=multi-user.target
 - HTTP 映射管理接口：`GET /api/port-mappings/list`、`POST /api/port-mappings`、`DELETE /api/port-mappings/:guid`。
 - HTTP 访问日志接口：`GET /api/http-access-logs/list`，记录 Host、路径、来源 IP、状态码、耗时、入站/出站字节数和上游失败原因。
 - 域名冲突校验：创建或更新端口映射时校验 `publicHost` 全局唯一，避免两个映射绑定同一个外部域名。
-- 单管理员认证：启动时初始化 `navmesh_users` 默认管理员，默认用户名 `admin`，默认初始密码 `navmesh@2020`；提供 `POST /api/navmesh-auth/login`、`GET /api/navmesh-auth/profile`、`PUT /api/navmesh-auth/password`。
-- 管理端 JWT：登录后签发 `nav-common-go-lib` 兼容 JWT，角色编码为 `SUPER_ADMIN`，第一版不做多用户、多角色和复杂 RBAC。
+- 管理端认证：复用 `nav-common-go-lib` 的系统用户、登录、登出和当前用户接口，例如 `POST /api/login/in`、`POST /api/login/out`、`GET /api/user/token`。
+- 管理端 JWT：由 `nav-common-go-lib` 登录流程签发，并通过基础框架中间件注入当前用户信息。
 - 访问策略 ACL：已实现 `navmesh_access_policies` 管理接口，支持 `global`、`device`、`mapping` 三种 scope；没有匹配策略时默认放行，有匹配策略时按 `allowSsh` / `allowHttp` 控制。
 - ACL 接入点：SSH Gateway 打开设备 SSHD 隧道前校验 `allowSsh`；HTTP Mapping Gateway 在 Host 命中后、打开设备本地端口前校验 `allowHttp`。
 - 审计日志：已实现 `GET /api/audit-logs/list`，登录、修改密码、settings 保存、设备禁用、设备 Token 禁用、SSH 入口/别名保存、SSH 别名禁用、端口映射保存/禁用、访问策略保存/禁用都会写入 `navmesh_audit_logs`。
@@ -835,8 +835,8 @@ make build
 GET /api/health
 POST /api/device/register
 POST /api/device/heartbeat
-POST /api/navmesh-auth/login
-GET /api/navmesh-auth/profile
+POST /api/login/in
+GET /api/user/token
 GET /api/audit-logs/list
 POST /api/maintenance/retention-cleanup
 QUIC tunnel server started on :3008

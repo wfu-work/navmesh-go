@@ -7,7 +7,6 @@ var ApiGroupApp = new(ApiGroup)
 type ApiGroup struct {
 	AccessPolicyApi
 	AuditApi
-	AuthApi
 	DeviceApi
 	MappingApi
 	MaintenanceApi
@@ -20,7 +19,6 @@ type ApiGroup struct {
 var (
 	accessPolicyService = services.ServiceGroupApp.AccessPolicyService
 	auditService        = services.ServiceGroupApp.AuditService
-	authService         = services.ServiceGroupApp.AuthService
 	deviceService       = services.ServiceGroupApp.DeviceService
 	mappingService      = services.ServiceGroupApp.MappingService
 	maintenanceService  = services.ServiceGroupApp.MaintenanceService

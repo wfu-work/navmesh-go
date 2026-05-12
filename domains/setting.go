@@ -22,17 +22,6 @@ type AuditLog struct {
 
 func (AuditLog) TableName() string { return "navmesh_audit_logs" }
 
-type User struct {
-	ID           uint   `json:"id" gorm:"primaryKey"`
-	Username     string `json:"username" gorm:"size:128;uniqueIndex;comment:管理员用户名"`
-	PasswordHash string `json:"-" gorm:"size:255;comment:密码Hash"`
-	Status       int    `json:"status" gorm:"index;comment:状态"`
-	CreateTime   int64  `json:"createTime" gorm:"comment:创建时间"`
-	UpdateTime   int64  `json:"updateTime" gorm:"comment:更新时间"`
-}
-
-func (User) TableName() string { return "navmesh_users" }
-
 type AccessPolicy struct {
 	ID         uint   `json:"id" gorm:"primaryKey"`
 	Guid       string `json:"guid" gorm:"size:64;uniqueIndex;comment:策略ID"`

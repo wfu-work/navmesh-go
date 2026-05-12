@@ -30,4 +30,4 @@ navmesh:
   heartbeat-retention-days: 7
   device-connection-retention-days: 30
   default-target-host: "127.0.0.1"
-  default-target-port: 22
+  default-target-port: 2222

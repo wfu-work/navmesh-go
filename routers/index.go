@@ -7,7 +7,6 @@ var RouterGroupApp = new(RouterGroup)
 type RouterGroup struct {
 	AccessPolicyRouter
 	AuditRouter
-	AuthRouter
 	DeviceRouter
 	MappingRouter
 	MaintenanceRouter
@@ -20,7 +19,6 @@ type RouterGroup struct {
 var (
 	accessPolicyApi = apis.ApiGroupApp.AccessPolicyApi
 	auditApi        = apis.ApiGroupApp.AuditApi
-	authApi         = apis.ApiGroupApp.AuthApi
 	deviceApi       = apis.ApiGroupApp.DeviceApi
 	mappingApi      = apis.ApiGroupApp.MappingApi
 	maintenanceApi  = apis.ApiGroupApp.MaintenanceApi
