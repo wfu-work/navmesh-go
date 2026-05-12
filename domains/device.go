@@ -5,9 +5,6 @@ const (
 	DeviceStatusOnline     = 2
 	DeviceStatusOffline    = 3
 	DeviceStatusDisabled   = 4
-
-	DeviceTokenStatusDisabled = 0
-	DeviceTokenStatusEnabled  = 1
 )
 
 type Device struct {
@@ -32,42 +29,3 @@ type Device struct {
 }
 
 func (Device) TableName() string { return "navmesh_devices" }
-
-type DeviceToken struct {
-	ID         uint   `json:"id" gorm:"primaryKey"`
-	Guid       string `json:"guid" gorm:"size:64;uniqueIndex;comment:Token ID"`
-	DeviceGuid string `json:"deviceGuid" gorm:"size:64;index;comment:设备ID"`
-	TokenHash  string `json:"-" gorm:"size:255;comment:Token Hash"`
-	Name       string `json:"name" gorm:"size:128;comment:名称"`
-	Status     int    `json:"status" gorm:"index;comment:状态"`
-	ExpireTime int64  `json:"expireTime" gorm:"comment:过期时间"`
-	CreateTime int64  `json:"createTime" gorm:"comment:创建时间"`
-	UpdateTime int64  `json:"updateTime" gorm:"comment:更新时间"`
-}
-
-func (DeviceToken) TableName() string { return "navmesh_device_tokens" }
-
-type DeviceConnection struct {
-	ID             uint   `json:"id" gorm:"primaryKey"`
-	DeviceGuid     string `json:"deviceGuid" gorm:"size:64;index;comment:设备ID"`
-	ConnectionID   string `json:"connectionId" gorm:"size:64;uniqueIndex;comment:连接ID"`
-	Protocol       string `json:"protocol" gorm:"size:32;comment:协议"`
-	RemoteAddr     string `json:"remoteAddr" gorm:"size:128;comment:远端地址"`
-	Status         int    `json:"status" gorm:"index;comment:状态"`
-	ConnectedTime  int64  `json:"connectedTime" gorm:"index;comment:连接时间"`
-	LastActiveTime int64  `json:"lastActiveTime" gorm:"index;comment:最后活动时间"`
-	CreateTime     int64  `json:"createTime" gorm:"comment:创建时间"`
-	UpdateTime     int64  `json:"updateTime" gorm:"comment:更新时间"`
-}
-
-func (DeviceConnection) TableName() string { return "navmesh_device_connections" }
-
-type DeviceHeartbeat struct {
-	ID         uint   `json:"id" gorm:"primaryKey"`
-	DeviceGuid string `json:"deviceGuid" gorm:"size:64;index;comment:设备ID"`
-	SourceIP   string `json:"sourceIp" gorm:"size:64;comment:来源IP"`
-	HostIP     string `json:"hostIp" gorm:"size:64;comment:设备本机IP"`
-	CreateTime int64  `json:"createTime" gorm:"index;comment:创建时间"`
-}
-
-func (DeviceHeartbeat) TableName() string { return "navmesh_device_heartbeats" }

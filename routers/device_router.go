@@ -17,6 +17,7 @@ func (d *DeviceRouter) InitDeviceRouter(publicGroup *gin.RouterGroup, privateGro
 		devices.GET("types/defaults", deviceApi.TypeDefaults)
 		devices.GET(":guid", deviceApi.Get)
 		devices.DELETE(":guid", deviceApi.Delete)
+		devices.POST(":guid/tokens/:tokenGuid/enable", deviceApi.EnableToken)
 		devices.DELETE(":guid/tokens/:tokenGuid", deviceApi.DisableToken)
 	}
 }

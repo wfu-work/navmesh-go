@@ -81,6 +81,17 @@ func (d DeviceApi) DisableToken(c *gin.Context) {
 	response.Ok(true, c)
 }
 
+func (d DeviceApi) EnableToken(c *gin.Context) {
+	guid := c.Param("guid")
+	tokenGuid := c.Param("tokenGuid")
+	if err := deviceService.EnableToken(guid, tokenGuid); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "enable", Resource: "device_token", ResourceID: tokenGuid, Message: guid, SourceIP: c.ClientIP()})
+	response.Ok(true, c)
+}
+
 func (d DeviceApi) TypeDefaults(c *gin.Context) {
 	response.Ok(deviceService.TypeDefaults(), c)
 }

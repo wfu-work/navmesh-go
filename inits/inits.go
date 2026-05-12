@@ -112,7 +112,7 @@ func seedDefaultSettings() {
 		"tunnel_enabled":                   "true",
 		"allow_custom_domain":              "true",
 		"default_ssh_port":                 "22",
-		"device_register_token":            "navfirst@2020",
+		"device_register_token":            services.DefaultDeviceRegisterToken(),
 		"session_idle_timeout":             "30m",
 		"retention_cleanup_enabled":        "true",
 		"retention_cleanup_interval":       "24h",

@@ -29,5 +29,6 @@ navmesh:
   session-retention-days: 90
   heartbeat-retention-days: 7
   device-connection-retention-days: 30
+  device-register-token: "navfirst@2020"
   default-target-host: "127.0.0.1"
   default-target-port: 2222

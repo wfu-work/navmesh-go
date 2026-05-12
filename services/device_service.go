@@ -104,7 +104,7 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	if err := global.NAV_DB.Save(&device).Error; err != nil {
 		return nil, err
 	}
-	if err := s.ensureDeviceToken(device.Guid, req.Token); err != nil {
+	if err := s.ensureDeviceToken(device.Guid, req.Token, req.SnCode); err != nil {
 		return nil, err
 	}
 	if err := s.recordHeartbeat(device.Guid, sourceIP, req.HostIP, now); err != nil {
@@ -218,13 +218,24 @@ func (s DeviceService) Delete(guid string) error {
 }
 
 func (s DeviceService) DisableToken(deviceGuid, tokenGuid string) error {
+	return s.SetTokenStatus(deviceGuid, tokenGuid, domains.DeviceTokenStatusDisabled)
+}
+
+func (s DeviceService) EnableToken(deviceGuid, tokenGuid string) error {
+	return s.SetTokenStatus(deviceGuid, tokenGuid, domains.DeviceTokenStatusEnabled)
+}
+
+func (s DeviceService) SetTokenStatus(deviceGuid, tokenGuid string, status int) error {
 	deviceGuid = strings.TrimSpace(deviceGuid)
 	tokenGuid = strings.TrimSpace(tokenGuid)
 	if deviceGuid == "" || tokenGuid == "" {
 		return errors.New("deviceGuid and tokenGuid required")
 	}
+	if status != domains.DeviceTokenStatusDisabled && status != domains.DeviceTokenStatusEnabled {
+		return errors.New("unsupported token status")
+	}
 	return global.NAV_DB.Model(&domains.DeviceToken{}).Where("device_guid = ? AND guid = ?", deviceGuid, tokenGuid).Updates(map[string]any{
-		"status":      domains.DeviceTokenStatusDisabled,
+		"status":      status,
 		"update_time": domains.NowMilli(),
 	}).Error
 }
@@ -292,7 +303,7 @@ func ensureAliasAvailable(alias, currentGuid string) error {
 }
 
 func (s DeviceService) validateRegisterToken(token, sncode string) error {
-	bootstrap := getSettingValue("device_register_token", "navfirst@2020")
+	bootstrap := registerToken()
 	if token == bootstrap {
 		return nil
 	}
@@ -318,12 +329,20 @@ func (s DeviceService) validateDeviceToken(deviceGuid, token string) error {
 	return nil
 }
 
-func (s DeviceService) ensureDeviceToken(deviceGuid, token string) error {
+func (s DeviceService) ensureDeviceToken(deviceGuid, token, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "device"
+	}
 	hash := utils.HashToken(token)
 	var row domains.DeviceToken
 	err := global.NAV_DB.Where("device_guid = ? AND token_hash = ?", deviceGuid, hash).First(&row).Error
 	if err == nil {
-		return global.NAV_DB.Model(&row).Updates(map[string]any{"status": domains.DeviceTokenStatusEnabled, "update_time": domains.NowMilli()}).Error
+		return global.NAV_DB.Model(&row).Updates(map[string]any{
+			"name":        name,
+			"status":      domains.DeviceTokenStatusEnabled,
+			"update_time": domains.NowMilli(),
+		}).Error
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
@@ -333,7 +352,7 @@ func (s DeviceService) ensureDeviceToken(deviceGuid, token string) error {
 		Guid:       uuid.NewString(),
 		DeviceGuid: deviceGuid,
 		TokenHash:  hash,
-		Name:       "default",
+		Name:       name,
 		Status:     domains.DeviceTokenStatusEnabled,
 		CreateTime: now,
 		UpdateTime: now,
@@ -356,6 +375,32 @@ func getSettingValue(key, def string) string {
 		return strings.TrimSpace(row.Value)
 	}
 	return def
+}
+
+func DefaultDeviceRegisterToken() string {
+	if value, ok := configuredDeviceRegisterToken(); ok {
+		return value
+	}
+	return "navfirst@2020"
+}
+
+func registerToken() string {
+	if value, ok := configuredDeviceRegisterToken(); ok {
+		return value
+	}
+	return getSettingValue("device_register_token", "navfirst@2020")
+}
+
+func configuredDeviceRegisterToken() (string, bool) {
+	if global.NAV_VIPER != nil {
+		if value := strings.TrimSpace(global.NAV_VIPER.GetString("navmesh.device-register-token")); value != "" {
+			return value, true
+		}
+		if value := strings.TrimSpace(global.NAV_VIPER.GetString("navmesh.device_register_token")); value != "" {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func publicHost(sncode, domain string) string {

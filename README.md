@@ -442,6 +442,7 @@ navmesh:
   heartbeat-timeout: 90s
   session-idle-timeout: 30m
   audit-retention-days: 90
+  device-register-token: "navfirst@2020"
   default-target-host: "127.0.0.1"
   default-target-port: 22
 ```
@@ -467,6 +468,7 @@ navmesh:
 
 - 管理员初始账号配置。
 - 设备注册是否允许自助申请。
+- 设备注册 Token 支持通过 `navmesh.device-register-token` 配置；未配置 YAML 时使用管理页保存的 `device_register_token`，再回落到 `navfirst@2020`。
 - Token 默认有效期。
 - SSH 网关 Host Key 路径。
 - 通配 DNS 和自定义域名绑定配置提示。
