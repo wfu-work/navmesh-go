@@ -81,6 +81,34 @@ func (d DeviceApi) DisableToken(c *gin.Context) {
 	response.Ok(true, c)
 }
 
+func (d DeviceApi) CreateToken(c *gin.Context) {
+	var req services.CreateDeviceTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	guid := c.Param("guid")
+	result, err := deviceService.CreateToken(guid, req)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "create", Resource: "device_token", ResourceID: result.Item.Guid, Message: guid, SourceIP: c.ClientIP()})
+	response.Ok(result, c)
+}
+
+func (d DeviceApi) RotateToken(c *gin.Context) {
+	guid := c.Param("guid")
+	tokenGuid := c.Param("tokenGuid")
+	result, err := deviceService.RotateToken(guid, tokenGuid)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "rotate", Resource: "device_token", ResourceID: tokenGuid, Message: result.Item.Guid, SourceIP: c.ClientIP()})
+	response.Ok(result, c)
+}
+
 func (d DeviceApi) EnableToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")

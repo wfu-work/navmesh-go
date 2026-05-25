@@ -11,6 +11,7 @@ type TunnelSession struct {
 	TargetPort       int    `json:"targetPort" gorm:"comment:目标端口"`
 	PublicHost       string `json:"publicHost" gorm:"size:255;index;comment:访问域名"`
 	Status           int    `json:"status" gorm:"index;comment:状态"`
+	ForceClosed      bool   `json:"forceClosed" gorm:"comment:是否由管理端断开"`
 	BytesIn          int64  `json:"bytesIn" gorm:"comment:入站字节"`
 	BytesOut         int64  `json:"bytesOut" gorm:"comment:出站字节"`
 	StartTime        int64  `json:"startTime" gorm:"index;comment:开始时间"`

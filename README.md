@@ -461,6 +461,9 @@ navmesh:
 | `allow_custom_domain` | `true` | 是否允许用户绑定自定义域名 |
 | `default_ssh_port` | `22` | 默认设备本机 SSH 端口 |
 | `session_idle_timeout` | `30m` | 会话空闲超时 |
+| `max_concurrent_sessions` | `0` | 全局最大并发会话数，`0` 表示不限制 |
+| `max_device_sessions` | `0` | 单设备最大并发会话数，`0` 表示不限制 |
+| `rate_limit_per_minute` | `0` | 单来源 IP 每分钟最大新建会话数，`0` 表示不限制 |
 
 这些配置需要支持页面修改、保存、审计和必要的服务重载。监听端口类配置修改后，第一版可以要求重启服务生效；域名、默认映射域、自定义域名开关等配置应尽量运行期生效。
 
@@ -786,18 +789,20 @@ WantedBy=multi-user.target
 - 基础配置：`config.yaml` 只保留服务启动必需配置，域名、监听地址、默认映射域等运行期配置写入 `navmesh_settings`。
 - 自动建表：已创建设备、设备 Token、连接、心跳、SSH 入口、端口映射、自定义域名、会话、HTTP 访问日志、事件、审计、settings 等业务表；用户、角色、登录等系统表由 `nav-common-go-lib` 初始化。
 - 默认 settings：初始化 `public_domain`、`ssh_gateway_domain`、`http_mapping_domain`、`ssh_listen`、`tunnel_listen`、`device_register_token` 等配置项。
-- 设备注册：`POST /api/device/register`，支持 `sncode`、`deviceId`、`type`、`remark`、`sshPort`、`webPort`、`webDomain` 入库。
+- 设备注册：`POST /api/device/register`，支持 `sncode`、`deviceId`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、`groupGuid`、`tags` 入库。
 - 设备类型：内置 `ssh`、`radar`、`radar-one`、`rain`、`hipnames`、`dic`、`ppp`、`sag`、`data` 的默认 Web 端口和默认域名。
 - Token 校验：注册阶段使用 `device_register_token`，注册成功后写入设备 Token；心跳接口校验设备 Token。
 - 设备心跳：`POST /api/device/heartbeat`，更新在线状态、来源 IP、本机 IP、主机名、客户端版本和最后在线时间。
 - 管理接口：`GET /api/devices/list`、`GET /api/devices/:guid`、`DELETE /api/devices/:guid`、`GET /api/devices/types/defaults`。
+- 设备分组：已实现 `GET /api/device-groups/list`、`POST /api/device-groups`、`DELETE /api/device-groups/:guid`、`PUT /api/devices/:guid/group`；设备列表支持按 `groupGuid` 和 `tag` 过滤。
+- Token 管理：已实现 `POST /api/devices/:guid/tokens` 新建设备 Token、`POST /api/devices/:guid/tokens/:tokenGuid/rotate` 轮换 Token、`POST /api/devices/:guid/tokens/:tokenGuid/enable` 启用 Token、`DELETE /api/devices/:guid/tokens/:tokenGuid` 禁用 Token。
 - Settings 接口：`GET /api/settings/list`、`PUT /api/settings/:key`。
 - QUIC 隧道入口：服务启动后根据 `navmesh_settings.tunnel_listen` 启动 QUIC Server，默认监听 `:3008/udp`。
 - 隧道认证：设备连接后通过首个 QUIC stream 发送 `hello` 帧，服务端校验设备 Token，并复用设备心跳逻辑更新在线状态。
 - 连接池：已实现 `tunnel.DefaultManager`，按 `deviceGuid` 管理在线 QUIC 连接，记录连接时间、远端地址和最后活动时间。
-- 连接入库：设备 QUIC 连接建立后写入 `navmesh_device_connections`，断开后标记为禁用状态。
+- 连接入库：设备 QUIC 连接建立后写入 `navmesh_device_connections`，断开后标记为禁用状态，并将设备状态更新为离线。
 - 基础协议帧：已定义 `hello`、`hello_ack`、`heartbeat`、`ping`、`pong`、`open_tcp`、`open_tcp_ack`、`error`。
-- 基础流转发能力：服务端已提供 `OpenTCPStream(ctx, deviceGuid, targetHost, targetPort)`，用于后续 SSH/HTTP 网关向设备侧打开本地端口流。
+- 基础流转发能力：服务端已提供 `OpenTCPStream(ctx, deviceGuid, targetHost, targetPort)`，用于 SSH/HTTP 网关向设备侧打开本地端口流；客户端会返回 `open_tcp_ack` 或 `error`，服务端可记录真实失败原因。
 - 隧道调试接口：`GET /api/tunnel/connections` 查询当前在线隧道连接。
 - SSH Gateway：已实现透明 TCP SSH Proxy，服务端不终止 SSH 协议、不保存 SSH 密码，用户最终仍由设备本机 SSHD 完成认证。
 - SSH 路由：根据 TCP 连接的本地目标 IP 查询 `navmesh_ssh_aliases` / `navmesh_ssh_entrypoints`，找到对应设备后通过 QUIC 隧道打开设备本机 `127.0.0.1:<sshPort>`。
@@ -808,15 +813,17 @@ WantedBy=multi-user.target
 - HTTP 路由方式：按请求 Host 精确查询 `navmesh_port_mappings.public_host`，支持系统生成域名和用户自定义域名；第一版只做 Host 到设备本地端口的一对一映射，不做路径级转发、同域多映射和多证书绑定。
 - HTTP 转发链路：映射命中后通过 `tunnel.DefaultManager.OpenTCPStream(ctx, deviceGuid, targetHost, targetPort)` 打开设备侧本地端口，例如 `127.0.0.1:7090`，并把外部 HTTP 请求和设备本地服务响应桥接起来。
 - HTTP 映射管理接口：`GET /api/port-mappings/list`、`POST /api/port-mappings`、`DELETE /api/port-mappings/:guid`。
+- 自定义域名管理：已实现 `GET /api/custom-domains/list`、`POST /api/custom-domains`、`POST /api/custom-domains/:domain/verify`、`DELETE /api/custom-domains/:domain`，支持校验 Token 和 verified 状态。
 - HTTP 访问日志接口：`GET /api/http-access-logs/list`，记录 Host、路径、来源 IP、状态码、耗时、入站/出站字节数和上游失败原因。
 - 域名冲突校验：创建或更新端口映射时校验 `publicHost` 全局唯一，避免两个映射绑定同一个外部域名。
 - 管理端认证：复用 `nav-common-go-lib` 的系统用户、登录、登出和当前用户接口，例如 `POST /api/login/in`、`POST /api/login/out`、`GET /api/user/token`。
 - 管理端 JWT：由 `nav-common-go-lib` 登录流程签发，并通过基础框架中间件注入当前用户信息。
-- 访问策略 ACL：已实现 `navmesh_access_policies` 管理接口，支持 `global`、`device`、`mapping` 三种 scope；没有匹配策略时默认放行，有匹配策略时按 `allowSsh` / `allowHttp` 控制。
+- 访问策略 ACL：已实现 `navmesh_access_policies` 管理接口，支持 `global`、`device`、`group`、`mapping` 四种 scope；没有匹配策略时默认放行，有匹配策略时按 `allowSsh` / `allowHttp` 控制。
 - ACL 接入点：SSH Gateway 打开设备 SSHD 隧道前校验 `allowSsh`；HTTP Mapping Gateway 在 Host 命中后、打开设备本地端口前校验 `allowHttp`。
 - 审计日志：已实现 `GET /api/audit-logs/list`，登录、修改密码、settings 保存、设备禁用、设备 Token 禁用、SSH 入口/别名保存、SSH 别名禁用、端口映射保存/禁用、访问策略保存/禁用都会写入 `navmesh_audit_logs`。
-- 会话查询：已实现 `GET /api/tunnel-sessions/list`，支持按设备、会话类型、访问域名和状态查询 SSH 隧道会话。
-- Token 禁用：已实现 `DELETE /api/devices/:guid/tokens/:tokenGuid`，用于禁用指定设备 Token。
+- 会话查询、统计和断开：已实现 `GET /api/tunnel-sessions/list`、`GET /api/tunnel-sessions/stats`、`POST /api/tunnel-sessions/:guid/close`，支持按设备、会话类型、访问域名和状态查询 SSH/HTTP 隧道会话，并可关闭当前进程内仍在转发的会话。
+- 运行时连接保护：SSH/HTTP 网关会读取 `max_concurrent_sessions`、`max_device_sessions`、`rate_limit_per_minute` 和 `session_idle_timeout`，用于限制全局并发、单设备并发、来源 IP 新建速率和空闲连接。
+- 事件中心：已实现 `GET /api/events/list`、`POST /api/events/:guid/ack`、`POST /api/events/:guid/close`，设备隧道离线和 `open_tcp` 失败会写入事件表。
 - HTTP 访问日志查询增强：`GET /api/http-access-logs/list` 支持按 Host、设备、方法、路径和状态码过滤。
 - 生产保留策略：已实现后台 retention cleaner，按 settings 清理审计日志、HTTP 访问日志、隧道会话、设备心跳和设备连接历史。
 - 手动维护接口：已实现 `POST /api/maintenance/retention-cleanup`，管理员可手动触发保留策略清理，并写入审计日志。
@@ -857,7 +864,7 @@ HTTP mapping gateway started on :8080
 - 断线重连：注册失败、QUIC 连接失败、隧道断开后自动重连；重连等待使用指数退避，默认从 `5s` 增长到最大 `60s`。
 - 失败探测：连续心跳失败达到阈值后主动关闭当前 QUIC 连接并进入重连流程，避免设备侧长期停留在假在线状态。
 - 优雅退出：收到 `SIGTERM` 或 `Ctrl-C` 时停止心跳并关闭 QUIC 连接。
-- 本地端口桥接：收到服务端 `open_tcp` 后连接设备本机目标端口，例如 `127.0.0.1:22` 或 `127.0.0.1:7090`，并在 QUIC stream 和本地 TCP 之间双向转发。
+- 本地端口桥接：收到服务端 `open_tcp` 后连接设备本机目标端口，例如 `127.0.0.1:22` 或 `127.0.0.1:7090`；成功后返回 `open_tcp_ack` 并在 QUIC stream 和本地 TCP 之间双向转发，失败时返回 `error` 供服务端审计。
 
 客户端示例：
 
@@ -898,4 +905,4 @@ HTTP mapping gateway started on :8080
 GET /api/tunnel/connections
 ```
 
-下一步建议进入联调完善阶段：补充真实 SSHD 和本地 Web 服务端到端测试脚本、客户端安装脚本、客户端日志轮转、断网重连压测和 `open_tcp` 失败原因上报。
+下一步建议进入联调完善阶段：补充真实 SSHD 和本地 Web 服务端到端测试脚本、客户端安装脚本、客户端日志轮转、断网重连压测和多实例部署下的分布式会话控制。

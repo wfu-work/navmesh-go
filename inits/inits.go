@@ -31,6 +31,8 @@ func Init() {
 		routers.RouterGroupApp.InitAccessPolicyRouter(privateGroup)
 		routers.RouterGroupApp.InitAuditRouter(privateGroup)
 		routers.RouterGroupApp.InitDeviceRouter(publicGroup, privateGroup)
+		routers.RouterGroupApp.InitEventRouter(privateGroup)
+		routers.RouterGroupApp.InitGroupRouter(privateGroup)
 		routers.RouterGroupApp.InitMappingRouter(privateGroup)
 		routers.RouterGroupApp.InitMaintenanceRouter(privateGroup)
 		routers.RouterGroupApp.InitSessionRouter(privateGroup)
@@ -114,6 +116,9 @@ func seedDefaultSettings() {
 		"default_ssh_port":                 "22",
 		"device_register_token":            services.DefaultDeviceRegisterToken(),
 		"session_idle_timeout":             "30m",
+		"max_concurrent_sessions":          "0",
+		"max_device_sessions":              "0",
+		"rate_limit_per_minute":            "0",
 		"retention_cleanup_enabled":        "true",
 		"retention_cleanup_interval":       "24h",
 		"audit_retention_days":             "90",

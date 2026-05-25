@@ -5,6 +5,7 @@ type DeviceGroup struct {
 	Guid       string `json:"guid" gorm:"size:64;uniqueIndex;comment:分组ID"`
 	Name       string `json:"name" gorm:"size:128;uniqueIndex;comment:分组名称"`
 	Remark     string `json:"remark" gorm:"size:512;comment:备注"`
+	Status     int    `json:"status" gorm:"index;comment:状态"`
 	CreateTime int64  `json:"createTime" gorm:"comment:创建时间"`
 	UpdateTime int64  `json:"updateTime" gorm:"comment:更新时间"`
 }

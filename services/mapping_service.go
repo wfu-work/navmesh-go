@@ -26,6 +26,11 @@ type SavePortMappingRequest struct {
 	Status         int    `json:"status"`
 }
 
+type SaveCustomDomainRequest struct {
+	Domain      string `json:"domain"`
+	MappingGuid string `json:"mappingGuid"`
+}
+
 func (s MappingService) List(params map[string]string) ([]domains.PortMapping, int64, error) {
 	db := global.NAV_DB.Model(&domains.PortMapping{})
 	if keyword := strings.TrimSpace(utils.FirstNonEmpty(params["keyword"], params["content"])); keyword != "" {
@@ -96,6 +101,24 @@ func (s MappingService) Save(req SavePortMappingRequest) (*domains.PortMapping, 
 	if err := global.NAV_DB.Save(&row).Error; err != nil {
 		return nil, err
 	}
+	if row.IsCustomDomain {
+		var custom domains.CustomDomain
+		if err := global.NAV_DB.Where("domain = ?", row.PublicHost).First(&custom).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+			token, tokenErr := randomToken()
+			if tokenErr != nil {
+				return nil, tokenErr
+			}
+			_ = global.NAV_DB.Create(&domains.CustomDomain{
+				Domain:      row.PublicHost,
+				MappingGuid: row.Guid,
+				VerifyToken: token,
+				Verified:    false,
+				Status:      int(domains.StatusEnabled),
+				CreateTime:  now,
+				UpdateTime:  now,
+			}).Error
+		}
+	}
 	return &row, nil
 }
 
@@ -105,6 +128,93 @@ func (s MappingService) Disable(guid string) error {
 		return errors.New("guid required")
 	}
 	return global.NAV_DB.Model(&domains.PortMapping{}).Where("guid = ?", guid).Updates(map[string]any{
+		"status":      int(domains.StatusDisabled),
+		"update_time": domains.NowMilli(),
+	}).Error
+}
+
+func (s MappingService) CustomDomains(params map[string]string) ([]domains.CustomDomain, int64, error) {
+	db := global.NAV_DB.Model(&domains.CustomDomain{})
+	if domain := strings.TrimSpace(params["domain"]); domain != "" {
+		db = db.Where("domain LIKE ?", "%"+normalizeHost(domain)+"%")
+	}
+	if mappingGuid := strings.TrimSpace(params["mappingGuid"]); mappingGuid != "" {
+		db = db.Where("mapping_guid = ?", mappingGuid)
+	}
+	if status := utils.Str2Int(params["status"]); status > 0 {
+		db = db.Where("status = ?", status)
+	}
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	page := utils.Str2Int(params["page"])
+	size := utils.Str2Int(params["size"])
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 {
+		size = 20
+	}
+	var items []domains.CustomDomain
+	err := db.Order("update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
+	return items, total, err
+}
+
+func (s MappingService) SaveCustomDomain(req SaveCustomDomainRequest) (*domains.CustomDomain, error) {
+	domain := normalizeHost(req.Domain)
+	mappingGuid := strings.TrimSpace(req.MappingGuid)
+	if domain == "" {
+		return nil, errors.New("domain required")
+	}
+	if mappingGuid == "" {
+		return nil, errors.New("mappingGuid required")
+	}
+	var mapping domains.PortMapping
+	if err := global.NAV_DB.Where("guid = ?", mappingGuid).First(&mapping).Error; err != nil {
+		return nil, errors.New("mapping not found")
+	}
+	token, err := randomToken()
+	if err != nil {
+		return nil, err
+	}
+	now := domains.NowMilli()
+	var row domains.CustomDomain
+	err = global.NAV_DB.Where("domain = ?", domain).First(&row).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		row = domains.CustomDomain{Domain: domain, CreateTime: now}
+	}
+	row.MappingGuid = mappingGuid
+	row.VerifyToken = token
+	row.Verified = false
+	row.Status = int(domains.StatusEnabled)
+	row.UpdateTime = now
+	if err := global.NAV_DB.Save(&row).Error; err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+func (s MappingService) VerifyCustomDomain(domain, token string) error {
+	domain = normalizeHost(domain)
+	token = strings.TrimSpace(token)
+	if domain == "" || token == "" {
+		return errors.New("domain and token required")
+	}
+	return global.NAV_DB.Model(&domains.CustomDomain{}).
+		Where("domain = ? AND verify_token = ? AND status = ?", domain, token, int(domains.StatusEnabled)).
+		Updates(map[string]any{"verified": true, "update_time": domains.NowMilli()}).Error
+}
+
+func (s MappingService) DisableCustomDomain(domain string) error {
+	domain = normalizeHost(domain)
+	if domain == "" {
+		return errors.New("domain required")
+	}
+	return global.NAV_DB.Model(&domains.CustomDomain{}).Where("domain = ?", domain).Updates(map[string]any{
 		"status":      int(domains.StatusDisabled),
 		"update_time": domains.NowMilli(),
 	}).Error

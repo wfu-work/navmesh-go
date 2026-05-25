@@ -16,4 +16,12 @@ func (m *MappingRouter) InitMappingRouter(router *gin.RouterGroup) {
 	{
 		logs.GET("list", mappingApi.AccessLogs)
 	}
+
+	customDomains := router.Group("custom-domains")
+	{
+		customDomains.GET("list", mappingApi.CustomDomains)
+		customDomains.POST("", mappingApi.SaveCustomDomain)
+		customDomains.POST(":domain/verify", mappingApi.VerifyCustomDomain)
+		customDomains.DELETE(":domain", mappingApi.DisableCustomDomain)
+	}
 }

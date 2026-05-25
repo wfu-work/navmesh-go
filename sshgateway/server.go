@@ -94,6 +94,19 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 		global.NAV_LOG.Warn("ssh access denied by policy", zap.String("deviceGuid", route.Device.Guid), zap.String("sourceIp", sourceIP))
 		return
 	}
+	permit, err := services.DefaultRuntimePolicy.Acquire(route.Device.Guid, sourceIP)
+	if err != nil {
+		global.NAV_LOG.Warn("ssh session rejected by runtime policy", zap.String("deviceGuid", route.Device.Guid), zap.String("sourceIp", sourceIP), zap.Error(err))
+		services.ServiceGroupApp.EventService.Record(services.EventInput{
+			DeviceGuid: route.Device.Guid,
+			EventType:  "session_rejected",
+			Level:      "warn",
+			Title:      "ssh session rejected",
+			Message:    err.Error(),
+		})
+		return
+	}
+	defer services.DefaultRuntimePolicy.Release(permit)
 	targetPort := route.Device.SSHPort
 	if targetPort <= 0 {
 		targetPort = 22
@@ -119,13 +132,26 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	upstream, err := s.manager.OpenTCPStream(streamCtx, route.Device.Guid, "127.0.0.1", targetPort)
 	if err != nil {
 		global.NAV_LOG.Warn("open ssh tunnel stream failed", zap.String("deviceGuid", route.Device.Guid), zap.Error(err))
+		services.ServiceGroupApp.EventService.Record(services.EventInput{
+			DeviceGuid: route.Device.Guid,
+			EventType:  "open_tcp_failed",
+			Level:      "error",
+			Title:      "open ssh target failed",
+			Message:    err.Error(),
+		})
 		markSessionClosed(session.Guid, 0, 0, "open_tunnel_failed: "+err.Error())
 		return
 	}
 	defer upstream.Close()
+	services.DefaultSessionRegistry.RegisterSession(session.Guid, client, upstream)
+	defer services.DefaultSessionRegistry.UnregisterSession(session.Guid)
 
-	bytesIn, bytesOut := bridge(client, upstream)
-	markSessionClosed(session.Guid, bytesIn, bytesOut, "closed")
+	bytesIn, bytesOut := bridge(client, upstream, services.DefaultRuntimePolicy.IdleTimeout())
+	reason := "closed"
+	if isForceClosed(session.Guid) {
+		reason = "closed_by_admin"
+	}
+	markSessionClosed(session.Guid, bytesIn, bytesOut, reason)
 }
 
 type sshRoute struct {
@@ -191,23 +217,63 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) (int64, int64) {
+func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser, idleTimeout time.Duration) (int64, int64) {
 	aCounter := &countingWriter{w: a}
 	bCounter := &countingWriter{w: b}
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(bCounter, a)
+		_, _ = copyWithIdleDeadline(bCounter, a, idleTimeout)
 		_ = b.Close()
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(aCounter, b)
+		_, _ = copyWithIdleDeadline(aCounter, b, idleTimeout)
 		_ = a.Close()
 		done <- struct{}{}
 	}()
 	<-done
 	<-done
 	return bCounter.n, aCounter.n
+}
+
+func copyWithIdleDeadline(dst io.Writer, src io.Reader, idleTimeout time.Duration) (int64, error) {
+	if idleTimeout <= 0 {
+		return io.Copy(dst, src)
+	}
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		setReadDeadline(src, time.Now().Add(idleTimeout))
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			setWriteDeadline(dst, time.Now().Add(idleTimeout))
+			nw, ew := dst.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			return written, er
+		}
+	}
+}
+
+func setReadDeadline(value any, deadline time.Time) {
+	if conn, ok := value.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = conn.SetReadDeadline(deadline)
+	}
+}
+
+func setWriteDeadline(value any, deadline time.Time) {
+	if conn, ok := value.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = conn.SetWriteDeadline(deadline)
+	}
 }
 
 func markSessionClosed(guid string, bytesIn, bytesOut int64, reason string) {
@@ -221,6 +287,14 @@ func markSessionClosed(guid string, bytesIn, bytesOut int64, reason string) {
 		"disconnect_reason": strings.TrimSpace(reason),
 	}
 	_ = global.NAV_DB.Model(&domains.TunnelSession{}).Where("guid = ?", guid).Updates(updates).Error
+}
+
+func isForceClosed(guid string) bool {
+	var session domains.TunnelSession
+	if err := global.NAV_DB.Select("force_closed").Where("guid = ?", guid).First(&session).Error; err != nil {
+		return false
+	}
+	return session.ForceClosed
 }
 
 func ListenHost(addr string) string {

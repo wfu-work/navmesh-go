@@ -418,9 +418,14 @@ func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
 	local, err := (&net.Dialer{Timeout: cfg.RequestTimeout}).DialContext(dialCtx, "tcp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 	if err != nil {
 		log.Printf("dial local target failed target=%s:%d err=%v", targetHost, targetPort, err)
+		_ = writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, OK: false, Message: err.Error()})
 		return
 	}
 	defer local.Close()
+	if err := writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeOpenTCPAck, RequestID: frame.RequestID, OK: true}); err != nil {
+		log.Printf("write open_tcp ack failed: %v", err)
+		return
+	}
 	bridge(local, stream)
 }
 

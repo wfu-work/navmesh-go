@@ -103,9 +103,11 @@ func (s AccessPolicyService) IsAllowed(deviceGuid, mappingGuid, protocol string)
 	mappingGuid = strings.TrimSpace(mappingGuid)
 	query := global.NAV_DB.Where("status = ?", int(domains.StatusEnabled))
 	if mappingGuid != "" {
-		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id = ?)", "global", "device", deviceGuid, "mapping", mappingGuid)
+		groupGuid := deviceGroupGuid(deviceGuid)
+		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id = ?)", "global", "device", deviceGuid, "group", groupGuid, "mapping", mappingGuid)
 	} else {
-		query = query.Where("scope = ? OR (scope = ? AND target_id = ?)", "global", "device", deviceGuid)
+		groupGuid := deviceGroupGuid(deviceGuid)
+		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id = ?)", "global", "device", deviceGuid, "group", groupGuid)
 	}
 	if err := query.Find(&policies).Error; err != nil || len(policies) == 0 {
 		return true
@@ -120,6 +122,14 @@ func (s AccessPolicyService) IsAllowed(deviceGuid, mappingGuid, protocol string)
 		}
 	}
 	return allowed
+}
+
+func deviceGroupGuid(deviceGuid string) string {
+	var device domains.Device
+	if err := global.NAV_DB.Select("group_guid").Where("guid = ?", strings.TrimSpace(deviceGuid)).First(&device).Error; err != nil {
+		return ""
+	}
+	return strings.TrimSpace(device.GroupGuid)
 }
 
 func normalizePolicyRequest(req SaveAccessPolicyRequest) SaveAccessPolicyRequest {

@@ -22,6 +22,8 @@ type Device struct {
 	SSHPort       int    `json:"sshPort" gorm:"comment:本机SSH端口"`
 	WebPort       int    `json:"webPort" gorm:"comment:本机Web端口"`
 	WebDomain     string `json:"webDomain" gorm:"size:255;comment:Web映射域名"`
+	GroupGuid     string `json:"groupGuid" gorm:"size:64;index;comment:设备分组ID"`
+	Tags          string `json:"tags" gorm:"size:512;comment:设备标签，逗号分隔"`
 	Status        int    `json:"status" gorm:"index;comment:状态"`
 	LastSeenTime  int64  `json:"lastSeenTime" gorm:"index;comment:最后在线时间"`
 	CreateTime    int64  `json:"createTime" gorm:"comment:创建时间"`

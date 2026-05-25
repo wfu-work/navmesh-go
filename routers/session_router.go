@@ -8,5 +8,7 @@ func (s *SessionRouter) InitSessionRouter(router *gin.RouterGroup) {
 	group := router.Group("tunnel-sessions")
 	{
 		group.GET("list", sessionApi.List)
+		group.GET("stats", sessionApi.Stats)
+		group.POST(":guid/close", sessionApi.Close)
 	}
 }

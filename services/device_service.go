@@ -1,6 +1,8 @@
 package services
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"strings"
 
@@ -29,6 +31,8 @@ type RegisterDeviceRequest struct {
 	SSHPort       int    `json:"sshPort"`
 	WebPort       int    `json:"webPort"`
 	WebDomain     string `json:"webDomain"`
+	GroupGuid     string `json:"groupGuid"`
+	Tags          string `json:"tags"`
 }
 
 type HeartbeatRequest struct {
@@ -45,6 +49,16 @@ type DeviceRegisterResult struct {
 	Device      domains.Device    `json:"device"`
 	TypeDefault DeviceTypeDefault `json:"typeDefault"`
 	PublicHost  string            `json:"publicHost"`
+}
+
+type CreateDeviceTokenRequest struct {
+	Name       string `json:"name"`
+	ExpireTime int64  `json:"expireTime"`
+}
+
+type DeviceTokenResult struct {
+	Token string              `json:"token"`
+	Item  domains.DeviceToken `json:"item"`
 }
 
 func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*DeviceRegisterResult, error) {
@@ -97,6 +111,8 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	device.SSHPort = req.SSHPort
 	device.WebPort = req.WebPort
 	device.WebDomain = req.WebDomain
+	device.GroupGuid = req.GroupGuid
+	device.Tags = normalizeTags(req.Tags)
 	device.Status = domains.DeviceStatusOnline
 	device.LastSeenTime = now
 	device.UpdateTime = now
@@ -186,6 +202,12 @@ func (s DeviceService) List(params map[string]string) ([]domains.Device, int64, 
 	if deviceType := strings.TrimSpace(params["type"]); deviceType != "" {
 		db = db.Where("device_type = ?", deviceType)
 	}
+	if groupGuid := strings.TrimSpace(params["groupGuid"]); groupGuid != "" {
+		db = db.Where("group_guid = ?", groupGuid)
+	}
+	if tag := strings.TrimSpace(params["tag"]); tag != "" {
+		db = db.Where("tags = ? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?", tag, tag+",%", "%,"+tag, "%,"+tag+",%")
+	}
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -240,6 +262,48 @@ func (s DeviceService) SetTokenStatus(deviceGuid, tokenGuid string, status int) 
 	}).Error
 }
 
+func (s DeviceService) CreateToken(deviceGuid string, req CreateDeviceTokenRequest) (*DeviceTokenResult, error) {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" {
+		return nil, errors.New("deviceGuid required")
+	}
+	if err := ensureDeviceExists(deviceGuid); err != nil {
+		return nil, err
+	}
+	token, err := randomToken()
+	if err != nil {
+		return nil, err
+	}
+	now := domains.NowMilli()
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = "manual"
+	}
+	row := domains.DeviceToken{
+		Guid:       uuid.NewString(),
+		DeviceGuid: deviceGuid,
+		TokenHash:  utils.HashToken(token),
+		Name:       name,
+		Status:     domains.DeviceTokenStatusEnabled,
+		ExpireTime: req.ExpireTime,
+		CreateTime: now,
+		UpdateTime: now,
+	}
+	if err := global.NAV_DB.Create(&row).Error; err != nil {
+		return nil, err
+	}
+	return &DeviceTokenResult{Token: token, Item: row}, nil
+}
+
+func (s DeviceService) RotateToken(deviceGuid, tokenGuid string) (*DeviceTokenResult, error) {
+	if err := s.DisableToken(deviceGuid, tokenGuid); err != nil {
+		return nil, err
+	}
+	var old domains.DeviceToken
+	_ = global.NAV_DB.Where("device_guid = ? AND guid = ?", strings.TrimSpace(deviceGuid), strings.TrimSpace(tokenGuid)).First(&old).Error
+	return s.CreateToken(deviceGuid, CreateDeviceTokenRequest{Name: old.Name, ExpireTime: old.ExpireTime})
+}
+
 func (s DeviceService) TypeDefaults() []DeviceTypeDefault {
 	return ListDeviceTypeDefaults()
 }
@@ -267,6 +331,8 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 	req.HostIP = strings.TrimSpace(req.HostIP)
 	req.ClientVersion = strings.TrimSpace(req.ClientVersion)
 	req.WebDomain = strings.TrimSpace(req.WebDomain)
+	req.GroupGuid = strings.TrimSpace(req.GroupGuid)
+	req.Tags = normalizeTags(req.Tags)
 	if req.Alias == "" {
 		req.Alias = req.SnCode
 	}
@@ -282,6 +348,14 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 		}
 	}
 	return req
+}
+
+func randomToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "nmt_" + hex.EncodeToString(buf), nil
 }
 
 func ensureAliasAvailable(alias, currentGuid string) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,8 +126,35 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 		_ = stream.Close()
 		return nil, err
 	}
+	ack, err := readFrame(stream)
+	if err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	if ack.Type == FrameTypeError || !ack.OK {
+		_ = stream.Close()
+		if ack.Message == "" {
+			ack.Message = "open tcp rejected"
+		}
+		return nil, errors.New(ack.Message)
+	}
+	if ack.Type != FrameTypeOpenTCPAck {
+		_ = stream.Close()
+		return nil, errors.New("invalid open tcp ack")
+	}
 	m.Touch(deviceGuid)
 	return stream, nil
+}
+
+func (m *Manager) SetOffline(deviceGuid string) {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" {
+		return
+	}
+	now := domains.NowMilli()
+	_ = global.NAV_DB.Model(&domains.Device{}).
+		Where("guid = ? AND status != ?", deviceGuid, domains.DeviceStatusDisabled).
+		Updates(map[string]any{"status": domains.DeviceStatusOffline, "update_time": now}).Error
 }
 
 func (m *Manager) CloseAll() {

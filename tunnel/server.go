@@ -119,7 +119,17 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 	s.manager.Register(*device, conn)
 	_ = writeFrame(stream, Frame{Type: FrameTypeHelloAck, OK: true, DeviceGuid: device.Guid, SnCode: device.SnCode})
 	_ = stream.Close()
-	defer s.manager.Unregister(device.Guid)
+	defer func() {
+		s.manager.Unregister(device.Guid)
+		s.manager.SetOffline(device.Guid)
+		services.ServiceGroupApp.EventService.Record(services.EventInput{
+			DeviceGuid: device.Guid,
+			EventType:  "device_offline",
+			Level:      "warn",
+			Title:      "device tunnel offline",
+			Message:    conn.RemoteAddr().String(),
+		})
+	}()
 
 	for {
 		next, err := conn.AcceptStream(ctx)

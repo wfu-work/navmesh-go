@@ -6,6 +6,8 @@ type ServiceGroup struct {
 	AccessPolicyService
 	AuditService
 	DeviceService
+	EventService
+	GroupService
 	MappingService
 	MaintenanceService
 	SessionService
