@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/gin-gonic/gin v1.12.0
-	github.com/wfu-work/nav-common-go-lib v0.0.0-20260410115433-425e7da57c9c
+	github.com/wfu-work/nav-common-go-lib v0.0.0-20260525160434-bb3f44c0b557
 	go.uber.org/zap v1.28.0
 )
 
