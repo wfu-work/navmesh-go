@@ -23,22 +23,13 @@ var tunnelServer *tunnel.Server
 var sshServer *sshgateway.Server
 var httpMappingServer *httpgateway.Server
 var maintenanceCancel context.CancelFunc
+var deviceOfflineCancel context.CancelFunc
 
 func Init() {
 	sysInit := commonInits.SysInit{}
 	sysInit.OnTableInit(registerTables)
 	sysInit.OnRouterInit(func(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
-		routers.RouterGroupApp.InitAccessPolicyRouter(privateGroup)
-		routers.RouterGroupApp.InitAuditRouter(privateGroup)
-		routers.RouterGroupApp.InitDeviceRouter(publicGroup, privateGroup)
-		routers.RouterGroupApp.InitEventRouter(privateGroup)
-		routers.RouterGroupApp.InitGroupRouter(privateGroup)
-		routers.RouterGroupApp.InitMappingRouter(privateGroup)
-		routers.RouterGroupApp.InitMaintenanceRouter(privateGroup)
-		routers.RouterGroupApp.InitSessionRouter(privateGroup)
-		routers.RouterGroupApp.InitSettingRouter(privateGroup)
-		routers.RouterGroupApp.InitSSHRouter(privateGroup)
-		routers.RouterGroupApp.InitTunnelRouter(privateGroup)
+		routers.RouterGroupApp.InitRouters(publicGroup, privateGroup)
 	})
 	sysInit.OnOtherInit(startBackgroundServers)
 	sysInit.OnShutInit(stopBackgroundServers)
@@ -71,6 +62,7 @@ func registerTables() {
 		return
 	}
 	seedDefaultSettings()
+	services.ServiceGroupApp.GroupService.SeedDefaults()
 	global.NAV_LOG.Info("register navmesh business table success")
 }
 
@@ -104,7 +96,7 @@ func seedDefaultSettings() {
 	defaults := map[string]string{
 		"public_domain":                    "navfirst.com",
 		"ssh_gateway_domain":               "ssh.navfirst.com",
-		"http_mapping_domain":              "qx.navfirst.com",
+		"http_mapping_domain":              "http.navfirst.com",
 		"ssh_listen":                       ":22",
 		"ssh_enabled":                      "true",
 		"http_listen":                      ":8080",
@@ -115,6 +107,8 @@ func seedDefaultSettings() {
 		"allow_custom_domain":              "true",
 		"default_ssh_port":                 "22",
 		"device_register_token":            services.DefaultDeviceRegisterToken(),
+		"device_heartbeat_timeout":         "90s",
+		"device_offline_check_interval":    "30s",
 		"session_idle_timeout":             "30m",
 		"max_concurrent_sessions":          "0",
 		"max_device_sessions":              "0",
@@ -145,7 +139,10 @@ func seedDefaultSettings() {
 }
 
 func startBackgroundServers() {
+	services.RegisterDeviceConnectionCloser(tunnel.DefaultManager)
+	markBootStaleDevicesOffline()
 	startMaintenanceJobs()
+	startDeviceOfflineCleaner()
 	startTunnelServer()
 	startSSHServer()
 	startHTTPMappingServer()
@@ -155,7 +152,19 @@ func stopBackgroundServers() {
 	stopHTTPMappingServer()
 	stopSSHServer()
 	stopTunnelServer()
+	stopDeviceOfflineCleaner()
 	stopMaintenanceJobs()
+}
+
+func markBootStaleDevicesOffline() {
+	affected, err := services.ServiceGroupApp.DeviceService.MarkOnlineDevicesOffline()
+	if err != nil {
+		global.NAV_LOG.Warn("mark boot online devices offline failed", zap.Error(err))
+		return
+	}
+	if affected > 0 {
+		global.NAV_LOG.Info("mark boot online devices offline", zap.Int64("affected", affected))
+	}
 }
 
 func startMaintenanceJobs() {
@@ -167,6 +176,18 @@ func startMaintenanceJobs() {
 func stopMaintenanceJobs() {
 	if maintenanceCancel != nil {
 		maintenanceCancel()
+	}
+}
+
+func startDeviceOfflineCleaner() {
+	ctx, cancel := context.WithCancel(context.Background())
+	deviceOfflineCancel = cancel
+	go services.ServiceGroupApp.DeviceService.StartOfflineCleaner(ctx)
+}
+
+func stopDeviceOfflineCleaner() {
+	if deviceOfflineCancel != nil {
+		deviceOfflineCancel()
 	}
 }
 

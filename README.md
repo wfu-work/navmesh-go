@@ -138,10 +138,10 @@ Go SSH Gateway 根据本地目标 IP 2400:xxxx::1001 找到设备 test01
 设备侧组件首次启动后：
 
 - 使用命令行参数中的 `-server`、`-port`、`-token` 连接中心服务。
-- 上报设备信息，例如 `-sncode`、`-deviceId`、`-type`、本机 IP 和客户端版本。
+- 上报设备信息，例如 `-sncode`、`-type`、本机 IP 和客户端版本。
 - 绑定或申请设备别名，默认使用 `-sncode`，例如 `test01`。
 - 填写设备备注，例如 `-remark 深圳工厂1号测试网关`。
-- 服务端保存设备 ID、别名、Token 状态和最近在线时间。
+- 服务端保存设备 GUID、别名、Token 状态和最近在线时间。
 
 ### 2. 设备保持反向隧道
 
@@ -226,10 +226,9 @@ https://test01.qx.navfirst.com
 
 ### 2. 设备管理
 
-- 设备注册：生成或绑定设备 ID。
+- 设备注册：生成或绑定设备 GUID。
 - 设备序列号：使用 `sncode` 作为设备接入主标识，默认也作为设备别名。
-- 设备 ID：支持可选 `deviceId`，用于兼容已有业务系统设备编号。
-- 设备类型：支持 `ssh`、`radar`、`radar-one`、`rain`、`hipnames`、`dic`、`ppp`、`sag`、`data` 等类型。
+- 设备类型：由 `DeviceGroup` 动态维护，默认初始化 `ssh`、`radar`、`radar-one`、`rain`、`hipnames`、`dic`、`ppp`、`sag`、`data` 等类型。
 - 设备别名：创建、修改、全局唯一性校验、禁用。
 - 设备备注：支持中文备注信息，便于管理人员识别设备用途和位置。
 - 设备认证：每台设备使用独立 Token 接入中心服务。
@@ -237,7 +236,7 @@ https://test01.qx.navfirst.com
 - 在线状态：维护连接状态、最后心跳、来源 IP、客户端版本。
 - 设备分组：支持按客户、站点、区域、业务、标签筛选。
 
-设备类型默认端口和域名参考现有 `navpn-client/vpn-client.go`：
+系统启动时会把以下默认设备类型写入 `navmesh_device_groups`，后续可通过管理接口新增、修改、禁用或查询全部类型：
 
 | 设备类型 | 默认 Web 端口 | 默认映射域名 | 说明 |
 | --- | --- | --- | --- |
@@ -356,7 +355,7 @@ my-device.example.com
 
 | 表 | 用途 |
 | --- | --- |
-| `devices` | 设备基础信息、`sncode`、`device_id`、设备类型、全局唯一别名、中文备注、状态、版本、来源 IP |
+| `devices` | 设备基础信息、`sncode`、设备类型、全局唯一别名、中文备注、状态、版本、来源 IP |
 | `device_tokens` | 每设备独立 Token、状态、过期时间、轮换记录 |
 | `device_connections` | 设备到中心的在线连接状态 |
 | `device_heartbeats` | 设备心跳历史 |
@@ -460,6 +459,8 @@ navmesh:
 | `tunnel_listen` | `:3008` | QUIC 隧道监听地址 |
 | `allow_custom_domain` | `true` | 是否允许用户绑定自定义域名 |
 | `default_ssh_port` | `22` | 默认设备本机 SSH 端口 |
+| `device_heartbeat_timeout` | `90s` | 设备超过该时间没有心跳/隧道活动后自动标记离线 |
+| `device_offline_check_interval` | `30s` | 后台离线状态扫描间隔 |
 | `session_idle_timeout` | `30m` | 会话空闲超时 |
 | `max_concurrent_sessions` | `0` | 全局最大并发会话数，`0` 表示不限制 |
 | `max_device_sessions` | `0` | 单设备最大并发会话数，`0` 表示不限制 |
@@ -638,7 +639,6 @@ make build
   -port 8880 \
   -token navfirst@2020 \
   -sncode test01 \
-  -deviceId 1050001 \
   -type rain \
   -sshPort 22 \
   -webPort 7090 \
@@ -652,9 +652,10 @@ make build
 | --- | --- | --- | --- |
 | `-server` | 否 | `navpn.navfirst.com` | 中心隧道服务地址 |
 | `-port` | 否 | `8880` | 中心隧道服务端口 |
-| `-token` | 否 | `navfirst@2020` | 设备接入 Token |
+| `-token` | 否 | `navfirst@2020` | 首次注册令牌；注册成功后客户端保存并改用设备独立 Token |
+| `-deviceToken` | 否 | 空 | 设备独立 Token；状态文件丢失时可由管理端重新生成后填入 |
+| `-stateFile` | 否 | `/var/lib/navmesh-client/<sncode>.json` | 保存设备独立 Token 的状态文件；无权限时回退当前目录 |
 | `-sncode` | 是 | 无 | 设备序列号，默认作为全局唯一设备别名 |
-| `-deviceId` | 否 | 空 | 业务系统设备 ID |
 | `-type` | 是 | `radar` | 设备类型，例如 `ssh`、`radar`、`rain`、`data` |
 | `-remark` | 否 | 空 | 中文备注，例如设备位置、用途 |
 | `-sshPort` | 否 | `22` | 设备本机 SSH 端口 |
@@ -681,7 +682,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/navmesh-client -server navpn.navfirst.com -port 8880 -token navfirst@2020 -sncode test01 -deviceId 1050001 -type rain -sshPort 22 -webPort 7090 -webDomain qx.navfirst.com -remark 深圳工厂1号测试网关
+ExecStart=/usr/local/bin/navmesh-client -server navpn.navfirst.com -port 8880 -token navfirst@2020 -sncode test01 -type rain -sshPort 22 -webPort 7090 -webDomain qx.navfirst.com -remark 深圳工厂1号测试网关
 Restart=always
 RestartSec=10
 
@@ -704,10 +705,10 @@ WantedBy=multi-user.target
 第二阶段：设备接入与别名
 
 - 实现设备注册和每设备独立 Token 校验。
-- 实现 `sncode`、`deviceId`、`type`、`remark` 参数入库。
+- 实现 `sncode`、`type`、`remark` 参数入库。
 - 实现设备别名创建、绑定、全局唯一性校验。
 - 实现设备中文备注字段。
-- 实现按设备类型推导默认 Web 端口和默认映射域名。
+- 实现按 `DeviceGroup` 动态配置推导默认 Web 端口和默认映射域名。
 - 实现设备心跳和在线状态。
 - 实现设备列表和详情 API。
 
@@ -789,12 +790,14 @@ WantedBy=multi-user.target
 - 基础配置：`config.yaml` 只保留服务启动必需配置，域名、监听地址、默认映射域等运行期配置写入 `navmesh_settings`。
 - 自动建表：已创建设备、设备 Token、连接、心跳、SSH 入口、端口映射、自定义域名、会话、HTTP 访问日志、事件、审计、settings 等业务表；用户、角色、登录等系统表由 `nav-common-go-lib` 初始化。
 - 默认 settings：初始化 `public_domain`、`ssh_gateway_domain`、`http_mapping_domain`、`ssh_listen`、`tunnel_listen`、`device_register_token` 等配置项。
-- 设备注册：`POST /api/device/register`，支持 `sncode`、`deviceId`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、`groupGuid`、`tags` 入库。
-- 设备类型：内置 `ssh`、`radar`、`radar-one`、`rain`、`hipnames`、`dic`、`ppp`、`sag`、`data` 的默认 Web 端口和默认域名。
-- Token 校验：注册阶段使用 `device_register_token`，注册成功后写入设备 Token；心跳接口校验设备 Token。
-- 设备心跳：`POST /api/device/heartbeat`，更新在线状态、来源 IP、本机 IP、主机名、客户端版本和最后在线时间。
+- 设备注册：`POST /api/device/register`，支持 `sncode`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、`groupGuid`、`tags` 入库。
+- 设备类型：启动时初始化默认 `DeviceGroup` 数据，注册时从 `navmesh_device_groups` 读取启用状态、默认 Web 端口和默认域名，不再使用代码硬编码列表。
+- Token 校验：首次注册阶段使用 `device_register_token`，注册成功后服务端生成设备独立 Token 并返回给客户端；此时设备状态为 `registered`，表示已登记但未激活。已存在设备如果已有独立 Token，将拒绝继续使用全局注册 Token 接入。
+- 设备激活：只有使用设备独立 Token 完成 QUIC `hello` 或 `POST /api/device/heartbeat` 校验后，设备状态才更新为 `online` 并刷新最后在线时间。
+- 设备心跳：`POST /api/device/heartbeat` 使用设备独立 Token 更新在线状态、来源 IP、本机 IP、主机名、客户端版本和最后在线时间。
+- 离线兜底：正常 QUIC 断开会立即把设备标记为 `offline`；服务启动时会把上次进程残留的 `online` 状态清理为 `offline`，运行中也会按 `device_heartbeat_timeout` 扫描超时设备，避免异常退出后管理端长期显示假在线。
 - 管理接口：`GET /api/devices/list`、`GET /api/devices/:guid`、`DELETE /api/devices/:guid`、`GET /api/devices/types/defaults`。
-- 设备分组：已实现 `GET /api/device-groups/list`、`POST /api/device-groups`、`DELETE /api/device-groups/:guid`、`PUT /api/devices/:guid/group`；设备列表支持按 `groupGuid` 和 `tag` 过滤。
+- 设备分组/类型：已实现 `GET /api/device-groups/list`、`POST /api/device-groups`、`DELETE /api/device-groups/:guid`、`PUT /api/devices/:guid/group`；`device-groups/list` 默认分页，传 `all=true` 返回全部启用/匹配数据；设备列表支持按 `groupGuid` 和 `tag` 过滤。
 - Token 管理：已实现 `POST /api/devices/:guid/tokens` 新建设备 Token、`POST /api/devices/:guid/tokens/:tokenGuid/rotate` 轮换 Token、`POST /api/devices/:guid/tokens/:tokenGuid/enable` 启用 Token、`DELETE /api/devices/:guid/tokens/:tokenGuid` 禁用 Token。
 - Settings 接口：`GET /api/settings/list`、`PUT /api/settings/:key`。
 - QUIC 隧道入口：服务启动后根据 `navmesh_settings.tunnel_listen` 启动 QUIC Server，默认监听 `:3008/udp`。
@@ -806,8 +809,9 @@ WantedBy=multi-user.target
 - 隧道调试接口：`GET /api/tunnel/connections` 查询当前在线隧道连接。
 - SSH Gateway：已实现透明 TCP SSH Proxy，服务端不终止 SSH 协议、不保存 SSH 密码，用户最终仍由设备本机 SSHD 完成认证。
 - SSH 路由：根据 TCP 连接的本地目标 IP 查询 `navmesh_ssh_aliases` / `navmesh_ssh_entrypoints`，找到对应设备后通过 QUIC 隧道打开设备本机 `127.0.0.1:<sshPort>`。
+- SSH 自动映射：设备注册成功后自动创建或更新 `navmesh_ssh_aliases`，域名默认是 `<alias>.<public_domain>`；如果 `navmesh_ssh_entrypoints` 中存在可用未绑定入口 IP，会自动绑定到该设备。即使设备仍是未激活 `registered` 状态，也会提前生成 SSH 映射，等设备拿专属 Token 建立 QUIC 隧道后即可远程连接。
 - SSH 会话记录：建立 SSH 转发时写入 `navmesh_tunnel_sessions`，结束时记录字节数、结束时间和断开原因。
-- SSH 管理接口：`GET /api/ssh-entrypoints/list`、`POST /api/ssh-entrypoints`、`GET /api/ssh-aliases/list`、`POST /api/ssh-aliases`、`DELETE /api/ssh-aliases/:id`。
+- SSH 管理接口：`GET /api/ssh-entrypoints/list`、`POST /api/ssh-entrypoints`、`GET /api/ssh-aliases/list`、`POST /api/ssh-aliases`、`DELETE /api/ssh-aliases/:guid`。
 - SSH 启动配置：根据 `navmesh_settings.ssh_enabled` 和 `navmesh_settings.ssh_listen` 启动 SSH Gateway，生产默认 `:22`。
 - HTTP 映射网关：已实现独立 HTTP Gateway，根据 `navmesh_settings.http_mapping_enabled` 和 `navmesh_settings.http_listen` 启动，默认监听 `:8080`，用于接收 Caddy 反向代理后的请求。
 - HTTP 路由方式：按请求 Host 精确查询 `navmesh_port_mappings.public_host`，支持系统生成域名和用户自定义域名；第一版只做 Host 到设备本地端口的一对一映射，不做路径级转发、同域多映射和多证书绑定。
@@ -858,9 +862,11 @@ HTTP mapping gateway started on :8080
 - 客户端入口：`cmd/navmesh-client/main.go`。
 - 构建命令：`make client`，输出 `./navmesh-client`。
 - 启动方式：只使用命令行参数，不读取 YAML 配置文件。
-- 注册流程：启动后默认调用 `POST /api/device/register`，上报 `sncode`、`deviceId`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、主机名、本机 IP 和客户端版本。
-- 隧道连接：注册后连接中心 QUIC 隧道入口，发送 `hello` 帧完成设备 Token 校验。
-- 心跳保活：周期性发送 QUIC heartbeat，并调用 `POST /api/device/heartbeat` 更新设备在线状态。
+- 注册流程：首次启动使用 `-token` 中的全局注册令牌调用 `POST /api/device/register`，上报 `sncode`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、主机名、本机 IP 和客户端版本；服务端返回设备独立 Token，并自动生成 SSH alias/入口绑定信息，此时设备仍是未激活的 `registered` 状态。
+- Token 持久化：客户端把服务端返回的设备独立 Token 保存到 `-stateFile`，默认 `/var/lib/navmesh-client/<sncode>.json`，无权限时回退当前目录隐藏文件。
+- Token 恢复：如果本地 `-stateFile` 丢失，客户端可再次使用全局注册令牌注册；服务端会重置该设备的专属 Token，并把设备状态重新置为未激活 `registered`，客户端保存新 Token 后再建立隧道完成激活。
+- 隧道连接：注册后连接中心 QUIC 隧道入口，发送 `hello` 帧并使用设备独立 Token 完成校验。
+- 心跳保活：周期性发送 QUIC heartbeat，并使用设备独立 Token 调用 `POST /api/device/heartbeat` 更新设备在线状态。
 - 断线重连：注册失败、QUIC 连接失败、隧道断开后自动重连；重连等待使用指数退避，默认从 `5s` 增长到最大 `60s`。
 - 失败探测：连续心跳失败达到阈值后主动关闭当前 QUIC 连接并进入重连流程，避免设备侧长期停留在假在线状态。
 - 优雅退出：收到 `SIGTERM` 或 `Ctrl-C` 时停止心跳并关闭 QUIC 连接。
@@ -875,7 +881,6 @@ HTTP mapping gateway started on :8080
   -api https://navmesh-admin.navfirst.com \
   -token navfirst@2020 \
   -sncode test01 \
-  -deviceId 1050001 \
   -type rain \
   -sshPort 22 \
   -webPort 7090 \

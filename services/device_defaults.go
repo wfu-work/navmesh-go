@@ -1,36 +1,23 @@
 package services
 
-type DeviceTypeDefault struct {
-	Type      string `json:"type"`
-	WebPort   int    `json:"webPort"`
-	WebDomain string `json:"webDomain"`
-	Remark    string `json:"remark"`
+import (
+	"navmesh-go/domains"
+
+	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
+)
+
+var defaultDeviceGroups = []domains.DeviceGroup{
+	{BaseDataEntity: baseData("ssh"), Key: "ssh", Name: "SSH 接入", DefaultWebPort: 0, DefaultDomain: "", Sort: 10, Remark: "只启用SSH反向接入", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("radar"), Key: "radar", Name: "雷达设备", DefaultWebPort: 8888, DefaultDomain: "vpn-ipc.navfirst.com", Sort: 20, Remark: "雷达类设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("radar-one"), Key: "radar-one", Name: "单点雷达", DefaultWebPort: 8887, DefaultDomain: "vpn-one.navfirst.com", Sort: 30, Remark: "单点雷达类设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("rain"), Key: "rain", Name: "气象雨量", DefaultWebPort: 8889, DefaultDomain: "vpn-qx.navfirst.com", Sort: 40, Remark: "气象雨量类设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("hipnames"), Key: "hipnames", Name: "Hipnames 设备", DefaultWebPort: 8886, DefaultDomain: "vpn-hipnames.navfirst.com", Sort: 50, Remark: "Hipnames 设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("dic"), Key: "dic", Name: "DIC 设备", DefaultWebPort: 8885, DefaultDomain: "vpn-dic.navfirst.com", Sort: 60, Remark: "DIC 设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("ppp"), Key: "ppp", Name: "PPP 设备", DefaultWebPort: 8884, DefaultDomain: "vpn-ppp.navfirst.com", Sort: 70, Remark: "PPP 设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("sag"), Key: "sag", Name: "SAG 设备", DefaultWebPort: 8883, DefaultDomain: "vpn-sag.navfirst.com", Sort: 80, Remark: "SAG 设备", Status: int(domains.StatusEnabled)},
+	{BaseDataEntity: baseData("data"), Key: "data", Name: "数据服务", DefaultWebPort: 3002, DefaultDomain: "vpn-data.navfirst.com", Sort: 90, Remark: "数据服务类设备", Status: int(domains.StatusEnabled)},
 }
 
-var deviceTypeDefaults = map[string]DeviceTypeDefault{
-	"ssh":       {Type: "ssh", WebPort: 0, WebDomain: "", Remark: "只启用 SSH 反向接入"},
-	"radar":     {Type: "radar", WebPort: 8888, WebDomain: "vpn-ipc.navfirst.com", Remark: "雷达类设备"},
-	"radar-one": {Type: "radar-one", WebPort: 8887, WebDomain: "vpn-one.navfirst.com", Remark: "单点雷达类设备"},
-	"rain":      {Type: "rain", WebPort: 8889, WebDomain: "vpn-qx.navfirst.com", Remark: "气象/雨量类设备"},
-	"hipnames":  {Type: "hipnames", WebPort: 8886, WebDomain: "vpn-hipnames.navfirst.com", Remark: "Hipnames 设备"},
-	"dic":       {Type: "dic", WebPort: 8885, WebDomain: "vpn-dic.navfirst.com", Remark: "DIC 设备"},
-	"ppp":       {Type: "ppp", WebPort: 8884, WebDomain: "vpn-ppp.navfirst.com", Remark: "PPP 设备"},
-	"sag":       {Type: "sag", WebPort: 8883, WebDomain: "vpn-sag.navfirst.com", Remark: "SAG 设备"},
-	"data":      {Type: "data", WebPort: 3002, WebDomain: "vpn-data.navfirst.com", Remark: "数据服务类设备"},
-}
-
-func GetDeviceTypeDefault(deviceType string) (DeviceTypeDefault, bool) {
-	item, ok := deviceTypeDefaults[deviceType]
-	return item, ok
-}
-
-func ListDeviceTypeDefaults() []DeviceTypeDefault {
-	items := make([]DeviceTypeDefault, 0, len(deviceTypeDefaults))
-	order := []string{"ssh", "radar", "radar-one", "rain", "hipnames", "dic", "ppp", "sag", "data"}
-	for _, key := range order {
-		if item, ok := deviceTypeDefaults[key]; ok {
-			items = append(items, item)
-		}
-	}
-	return items
+func baseData(guid string) commonDomains.BaseDataEntity {
+	return commonDomains.BaseDataEntity{Guid: guid}
 }

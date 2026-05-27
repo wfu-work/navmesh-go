@@ -34,3 +34,4 @@ go.work.sum
 
 data/
 logback/
+/.navmesh-client-MAC001.json

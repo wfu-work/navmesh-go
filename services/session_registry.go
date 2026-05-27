@@ -11,6 +11,10 @@ type SessionCloser interface {
 	UnregisterSession(guid string)
 }
 
+type DeviceConnectionCloser interface {
+	CloseDevice(deviceGuid string, reason string) bool
+}
+
 type RuntimeSessionRegistry struct {
 	mu       sync.Mutex
 	sessions map[string][]io.Closer
@@ -63,3 +67,16 @@ func (r *RuntimeSessionRegistry) Stats() RuntimeSessionStats {
 }
 
 var DefaultSessionRegistry = NewRuntimeSessionRegistry()
+
+var runtimeDeviceConnectionCloser DeviceConnectionCloser
+
+func RegisterDeviceConnectionCloser(closer DeviceConnectionCloser) {
+	runtimeDeviceConnectionCloser = closer
+}
+
+func closeRuntimeDeviceConnection(deviceGuid string, reason string) bool {
+	if runtimeDeviceConnectionCloser == nil {
+		return false
+	}
+	return runtimeDeviceConnectionCloser.CloseDevice(deviceGuid, reason)
+}

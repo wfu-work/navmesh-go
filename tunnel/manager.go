@@ -45,7 +45,7 @@ func (m *Manager) Register(device domains.Device, conn *quic.Conn) {
 	now := domains.NowMilli()
 	info := DeviceConnectionInfo{
 		DeviceGuid:     device.Guid,
-		SnCode:         device.SnCode,
+		SnCode:         device.Sncode,
 		Alias:          device.Alias,
 		RemoteAddr:     conn.RemoteAddr().String(),
 		ConnectedTime:  now,
@@ -103,6 +103,31 @@ func (m *Manager) IsOnline(deviceGuid string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.connections[deviceGuid] != nil
+}
+
+func (m *Manager) CloseDevice(deviceGuid string, reason string) bool {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" {
+		return false
+	}
+	if reason == "" {
+		reason = "device connection closed"
+	}
+	m.mu.Lock()
+	item := m.connections[deviceGuid]
+	delete(m.connections, deviceGuid)
+	m.mu.Unlock()
+	if item == nil {
+		return false
+	}
+	if err := item.conn.CloseWithError(0, reason); err != nil {
+		global.NAV_LOG.Warn("close device tunnel connection failed", zap.String("deviceGuid", deviceGuid), zap.Error(err))
+	}
+	now := domains.NowMilli()
+	_ = global.NAV_DB.Model(&domains.DeviceConnection{}).
+		Where("device_guid = ? AND status = ?", deviceGuid, int(domains.StatusEnabled)).
+		Updates(map[string]any{"status": domains.StatusDisabled, "update_time": now}).Error
+	return true
 }
 
 func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost string, targetPort int) (io.ReadWriteCloser, error) {

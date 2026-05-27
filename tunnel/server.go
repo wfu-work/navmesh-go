@@ -117,7 +117,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 		return
 	}
 	s.manager.Register(*device, conn)
-	_ = writeFrame(stream, Frame{Type: FrameTypeHelloAck, OK: true, DeviceGuid: device.Guid, SnCode: device.SnCode})
+	_ = writeFrame(stream, Frame{Type: FrameTypeHelloAck, OK: true, DeviceGuid: device.Guid, SnCode: device.Sncode})
 	_ = stream.Close()
 	defer func() {
 		s.manager.Unregister(device.Guid)

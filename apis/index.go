@@ -21,7 +21,9 @@ type ApiGroup struct {
 var (
 	accessPolicyService = services.ServiceGroupApp.AccessPolicyService
 	auditService        = services.ServiceGroupApp.AuditService
+	customDomainService = services.ServiceGroupApp.CustomDomainService
 	deviceService       = services.ServiceGroupApp.DeviceService
+	deviceTokenService  = services.ServiceGroupApp.DeviceTokenService
 	eventService        = services.ServiceGroupApp.EventService
 	groupService        = services.ServiceGroupApp.GroupService
 	mappingService      = services.ServiceGroupApp.MappingService

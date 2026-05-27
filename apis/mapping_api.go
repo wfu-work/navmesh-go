@@ -57,7 +57,7 @@ func (m MappingApi) AccessLogs(c *gin.Context) {
 
 func (m MappingApi) CustomDomains(c *gin.Context) {
 	params := utils.QueryParams(c)
-	items, total, err := mappingService.CustomDomains(params)
+	items, total, err := customDomainService.List(params)
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
@@ -71,7 +71,7 @@ func (m MappingApi) SaveCustomDomain(c *gin.Context) {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
-	item, err := mappingService.SaveCustomDomain(req)
+	item, err := customDomainService.Save(req)
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
@@ -89,7 +89,7 @@ func (m MappingApi) VerifyCustomDomain(c *gin.Context) {
 		return
 	}
 	domain := c.Param("domain")
-	if err := mappingService.VerifyCustomDomain(domain, req.Token); err != nil {
+	if err := customDomainService.Verify(domain, req.Token); err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
@@ -99,7 +99,7 @@ func (m MappingApi) VerifyCustomDomain(c *gin.Context) {
 
 func (m MappingApi) DisableCustomDomain(c *gin.Context) {
 	domain := c.Param("domain")
-	if err := mappingService.DisableCustomDomain(domain); err != nil {
+	if err := customDomainService.Disable(domain); err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}

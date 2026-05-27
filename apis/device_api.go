@@ -60,9 +60,35 @@ func (d DeviceApi) Get(c *gin.Context) {
 	response.Ok(gin.H{"device": device, "tokens": tokens}, c)
 }
 
+func (d DeviceApi) Update(c *gin.Context) {
+	var req services.UpdateDeviceProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	guid := c.Param("guid")
+	device, err := deviceService.UpdateProfile(guid, req)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "update", Resource: "device", ResourceID: guid, Message: req.Alias, SourceIP: c.ClientIP()})
+	response.Ok(device, c)
+}
+
 func (d DeviceApi) Delete(c *gin.Context) {
 	guid := c.Param("guid")
 	if err := deviceService.Delete(guid); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "delete", Resource: "device", ResourceID: guid, SourceIP: c.ClientIP()})
+	response.Ok(true, c)
+}
+
+func (d DeviceApi) Disable(c *gin.Context) {
+	guid := c.Param("guid")
+	if err := deviceService.Disable(guid); err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
@@ -70,10 +96,20 @@ func (d DeviceApi) Delete(c *gin.Context) {
 	response.Ok(true, c)
 }
 
+func (d DeviceApi) Enable(c *gin.Context) {
+	guid := c.Param("guid")
+	if err := deviceService.Enable(guid); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "enable", Resource: "device", ResourceID: guid, SourceIP: c.ClientIP()})
+	response.Ok(true, c)
+}
+
 func (d DeviceApi) DisableToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")
-	if err := deviceService.DisableToken(guid, tokenGuid); err != nil {
+	if err := deviceTokenService.Disable(guid, tokenGuid); err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
@@ -88,7 +124,7 @@ func (d DeviceApi) CreateToken(c *gin.Context) {
 		return
 	}
 	guid := c.Param("guid")
-	result, err := deviceService.CreateToken(guid, req)
+	result, err := deviceTokenService.CreateToken(guid, req)
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
@@ -100,7 +136,7 @@ func (d DeviceApi) CreateToken(c *gin.Context) {
 func (d DeviceApi) RotateToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")
-	result, err := deviceService.RotateToken(guid, tokenGuid)
+	result, err := deviceTokenService.Rotate(guid, tokenGuid)
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
@@ -112,7 +148,7 @@ func (d DeviceApi) RotateToken(c *gin.Context) {
 func (d DeviceApi) EnableToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")
-	if err := deviceService.EnableToken(guid, tokenGuid); err != nil {
+	if err := deviceTokenService.Enable(guid, tokenGuid); err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}

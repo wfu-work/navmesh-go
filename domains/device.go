@@ -1,5 +1,7 @@
 package domains
 
+import commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
+
 const (
 	DeviceStatusRegistered = 1
 	DeviceStatusOnline     = 2
@@ -8,10 +10,8 @@ const (
 )
 
 type Device struct {
-	ID            uint   `json:"id" gorm:"primaryKey"`
-	Guid          string `json:"guid" gorm:"size:64;uniqueIndex;comment:设备唯一ID"`
-	SnCode        string `json:"sncode" gorm:"size:128;uniqueIndex;comment:设备序列号"`
-	DeviceID      string `json:"deviceId" gorm:"size:128;index;comment:业务系统设备ID"`
+	commonDomains.BaseDataEntity
+	Sncode        string `json:"sncode" gorm:"column:sn_code;size:128;uniqueIndex;comment:设备序列号"`
 	DeviceType    string `json:"deviceType" gorm:"size:64;index;comment:设备类型"`
 	Alias         string `json:"alias" gorm:"size:128;uniqueIndex;comment:全局唯一设备别名"`
 	Remark        string `json:"remark" gorm:"size:512;comment:中文备注"`
@@ -26,8 +26,10 @@ type Device struct {
 	Tags          string `json:"tags" gorm:"size:512;comment:设备标签，逗号分隔"`
 	Status        int    `json:"status" gorm:"index;comment:状态"`
 	LastSeenTime  int64  `json:"lastSeenTime" gorm:"index;comment:最后在线时间"`
-	CreateTime    int64  `json:"createTime" gorm:"comment:创建时间"`
-	UpdateTime    int64  `json:"updateTime" gorm:"comment:更新时间"`
 }
 
 func (Device) TableName() string { return "navmesh_devices" }
+
+func (s Device) GetBaseData() commonDomains.BaseDataEntity {
+	return s.BaseDataEntity
+}

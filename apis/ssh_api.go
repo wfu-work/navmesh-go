@@ -1,8 +1,6 @@
 package apis
 
 import (
-	"strconv"
-
 	"navmesh-go/services"
 
 	"github.com/gin-gonic/gin"
@@ -60,11 +58,11 @@ func (s SSHApi) SaveAlias(c *gin.Context) {
 }
 
 func (s SSHApi) DisableAlias(c *gin.Context) {
-	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
-	if err := sshService.DisableAlias(uint(id)); err != nil {
+	guid := c.Param("guid")
+	if err := sshService.DisableAlias(guid); err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "ssh_alias", ResourceID: c.Param("id"), SourceIP: c.ClientIP()})
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "ssh_alias", ResourceID: guid, SourceIP: c.ClientIP()})
 	response.Ok(true, c)
 }

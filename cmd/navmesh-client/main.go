@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,8 +34,9 @@ type clientConfig struct {
 	Port           int
 	API            string
 	Token          string
-	SnCode         string
-	DeviceID       string
+	DeviceToken    string
+	StateFile      string
+	Sncode         string
 	DeviceType     string
 	Alias          string
 	Remark         string
@@ -56,10 +59,36 @@ type registerResponse struct {
 	Code int `json:"code"`
 	Data struct {
 		Device struct {
-			Guid string `json:"guid"`
+			Guid   string `json:"guid"`
+			Alias  string `json:"alias"`
+			Remark string `json:"remark"`
 		} `json:"device"`
+		DeviceToken struct {
+			Token string `json:"token"`
+			Item  struct {
+				Guid string `json:"guid"`
+			} `json:"item"`
+		} `json:"deviceToken"`
+		SSH struct {
+			Alias struct {
+				Domain       string `json:"domain"`
+				EntrypointIP string `json:"entrypointIp"`
+			} `json:"alias"`
+			EntrypointIP string `json:"entrypointIp"`
+			Ready        bool   `json:"ready"`
+		} `json:"ssh"`
 	} `json:"data"`
 	Msg string `json:"msg"`
+}
+
+type clientState struct {
+	SnCode      string `json:"sncode"`
+	DeviceGuid  string `json:"deviceGuid"`
+	DeviceToken string `json:"deviceToken"`
+	TokenGuid   string `json:"tokenGuid"`
+	Alias       string `json:"alias"`
+	Remark      string `json:"remark"`
+	UpdateTime  int64  `json:"updateTime"`
 }
 
 func main() {
@@ -90,12 +119,13 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.Server, "server", "127.0.0.1", "NavMesh 隧道服务器地址")
 	flag.IntVar(&cfg.Port, "port", 3008, "NavMesh 隧道服务器 UDP 端口")
 	flag.StringVar(&cfg.API, "api", "", "NavMesh 管理 API 基础地址，默认 http://<server>:3007")
-	flag.StringVar(&cfg.Token, "token", "navfirst@2020", "设备注册和接入令牌")
-	flag.StringVar(&cfg.SnCode, "sncode", "MAC001", "设备 SN 编码，全局唯一")
-	flag.StringVar(&cfg.DeviceID, "deviceId", "20260502", "业务设备 ID")
+	flag.StringVar(&cfg.Token, "token", "navfirst@2020", "首次注册令牌；注册成功后客户端会保存并改用设备独立 Token")
+	flag.StringVar(&cfg.DeviceToken, "deviceToken", "", "设备独立 Token；状态文件丢失时可由管理端重新生成后填入")
+	flag.StringVar(&cfg.StateFile, "stateFile", "", "客户端状态文件路径，默认 /var/lib/navmesh-client/<sncode>.json，无法写入时回退当前目录")
+	flag.StringVar(&cfg.Sncode, "sncode", "MAC001", "设备 SN 编码，全局唯一")
 	flag.StringVar(&cfg.DeviceType, "type", "ssh", "设备类型")
-	flag.StringVar(&cfg.Alias, "alias", "Macos设备", "设备别名，默认使用 sncode")
-	flag.StringVar(&cfg.Remark, "remark", "Mac测试设备", "设备备注")
+	flag.StringVar(&cfg.Alias, "alias", "MacAir笔记本电脑", "设备别名，默认使用 sncode")
+	flag.StringVar(&cfg.Remark, "remark", "Mac Wfu测试设备", "设备备注")
 	flag.IntVar(&cfg.SSHPort, "sshPort", 22, "本机 SSH 服务端口")
 	flag.IntVar(&cfg.WebPort, "webPort", 0, "本机 Web 服务端口，0 表示不启用")
 	flag.StringVar(&cfg.WebDomain, "webDomain", "", "外部 Web 映射域名")
@@ -118,11 +148,16 @@ func parseFlags() clientConfig {
 
 	cfg.Server = strings.TrimSpace(cfg.Server)
 	cfg.API = strings.TrimRight(strings.TrimSpace(cfg.API), "/")
+	cfg.Token = strings.TrimSpace(cfg.Token)
+	cfg.DeviceToken = strings.TrimSpace(cfg.DeviceToken)
 	if cfg.API == "" {
 		cfg.API = "http://" + net.JoinHostPort(cfg.Server, "3007")
 	}
 	if cfg.Alias == "" {
-		cfg.Alias = cfg.SnCode
+		cfg.Alias = cfg.Sncode
+	}
+	if cfg.StateFile == "" {
+		cfg.StateFile = defaultStateFile(cfg.Sncode)
 	}
 	if cfg.HostIP == "" {
 		cfg.HostIP = detectOutboundIP()
@@ -146,16 +181,46 @@ func parseFlags() clientConfig {
 }
 
 func run(ctx context.Context, cfg clientConfig) error {
-	if cfg.SnCode == "" {
+	if cfg.Sncode == "" {
 		return fmt.Errorf("sncode required")
 	}
 	if cfg.Token == "" {
 		return fmt.Errorf("token required")
 	}
+	state, err := loadClientState(cfg.StateFile)
+	if err != nil {
+		log.Printf("load client state failed path=%s err=%v", cfg.StateFile, err)
+	}
+	if cfg.DeviceToken == "" && state.DeviceToken != "" && (state.SnCode == "" || state.SnCode == cfg.Sncode) {
+		cfg.DeviceToken = state.DeviceToken
+		log.Printf("loaded device token state path=%s sncode=%s", cfg.StateFile, cfg.Sncode)
+	} else if cfg.DeviceToken != "" {
+		log.Printf("using device token from command line sncode=%s stateFile=%s", cfg.Sncode, cfg.StateFile)
+	}
+	if state.SnCode == "" || state.SnCode == cfg.Sncode {
+		if strings.TrimSpace(state.Alias) != "" {
+			cfg.Alias = strings.TrimSpace(state.Alias)
+		}
+		if strings.TrimSpace(state.Remark) != "" {
+			cfg.Remark = strings.TrimSpace(state.Remark)
+		}
+	}
 	failures := 0
 	for {
 		if !cfg.SkipRegister {
-			if err := registerDevice(ctx, cfg); err != nil {
+			nextCfg, err := registerDevice(ctx, cfg)
+			if err != nil {
+				if shouldRetryWithRegisterToken(err, cfg) {
+					log.Printf("device token rejected, retrying register with default token: %v", err)
+					cfg.DeviceToken = ""
+					_ = saveClientState(cfg.StateFile, clientState{
+						SnCode:     cfg.Sncode,
+						Alias:      cfg.Alias,
+						Remark:     cfg.Remark,
+						UpdateTime: time.Now().UnixMilli(),
+					})
+					continue
+				}
 				log.Printf("register device failed: %v", err)
 				failures++
 				if err := waitReconnect(ctx, cfg, failures); err != nil {
@@ -163,6 +228,15 @@ func run(ctx context.Context, cfg clientConfig) error {
 				}
 				continue
 			}
+			cfg = nextCfg
+		}
+		if strings.TrimSpace(cfg.DeviceToken) == "" {
+			log.Printf("device registered and waiting for activation sncode=%s", cfg.Sncode)
+			failures++
+			if err := waitReconnect(ctx, cfg, failures); err != nil {
+				return err
+			}
+			continue
 		}
 		failures = 0
 		if err := connectAndServe(ctx, cfg); err != nil {
@@ -173,6 +247,16 @@ func run(ctx context.Context, cfg clientConfig) error {
 			return err
 		}
 	}
+}
+
+func shouldRetryWithRegisterToken(err error, cfg clientConfig) bool {
+	if err == nil || strings.TrimSpace(cfg.DeviceToken) == "" {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "invalid register token") ||
+		strings.Contains(msg, "invalid device token") ||
+		strings.Contains(msg, "device not found")
 }
 
 func waitReconnect(ctx context.Context, cfg clientConfig, failures int) error {
@@ -202,11 +286,10 @@ func backoffDelay(cfg clientConfig, failures int) time.Duration {
 	return delay
 }
 
-func registerDevice(ctx context.Context, cfg clientConfig) error {
+func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error) {
 	body := map[string]any{
-		"token":         cfg.Token,
-		"sncode":        cfg.SnCode,
-		"deviceId":      cfg.DeviceID,
+		"token":         cfg.authToken(),
+		"sncode":        cfg.Sncode,
 		"type":          cfg.DeviceType,
 		"alias":         cfg.Alias,
 		"remark":        cfg.Remark,
@@ -222,27 +305,54 @@ func registerDevice(ctx context.Context, cfg clientConfig) error {
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, cfg.API+"/api/device/register", bytes.NewReader(data))
 	if err != nil {
-		return err
+		return cfg, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return cfg, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("register status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return cfg, fmt.Errorf("register status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	var result registerResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
+		return cfg, err
 	}
 	if result.Code != 200 {
-		return fmt.Errorf("%s", result.Msg)
+		return cfg, fmt.Errorf("%s", result.Msg)
 	}
-	log.Printf("registered device sncode=%s guid=%s", cfg.SnCode, result.Data.Device.Guid)
-	return nil
+	if result.Data.DeviceToken.Token != "" {
+		cfg.DeviceToken = result.Data.DeviceToken.Token
+	}
+	if result.Data.Device.Alias != "" {
+		cfg.Alias = result.Data.Device.Alias
+	}
+	cfg.Remark = result.Data.Device.Remark
+	state := clientState{
+		SnCode:      cfg.Sncode,
+		DeviceGuid:  result.Data.Device.Guid,
+		DeviceToken: cfg.DeviceToken,
+		TokenGuid:   result.Data.DeviceToken.Item.Guid,
+		Alias:       cfg.Alias,
+		Remark:      cfg.Remark,
+		UpdateTime:  time.Now().UnixMilli(),
+	}
+	if state.DeviceToken != "" || state.Alias != "" || state.Remark != "" {
+		if err := saveClientState(cfg.StateFile, state); err != nil {
+			log.Printf("save client state failed path=%s err=%v", cfg.StateFile, err)
+		} else {
+			log.Printf("saved device state path=%s sncode=%s alias=%s", cfg.StateFile, cfg.Sncode, cfg.Alias)
+		}
+	}
+	if result.Data.SSH.Alias.Domain != "" {
+		log.Printf("registered device sncode=%s guid=%s ssh=%s ready=%t entrypoint=%s", cfg.Sncode, result.Data.Device.Guid, result.Data.SSH.Alias.Domain, result.Data.SSH.Ready, result.Data.SSH.EntrypointIP)
+	} else {
+		log.Printf("registered device sncode=%s guid=%s", cfg.Sncode, result.Data.Device.Guid)
+	}
+	return cfg, nil
 }
 
 func connectAndServe(ctx context.Context, cfg clientConfig) error {
@@ -263,7 +373,7 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 	if err := sendHello(ctx, conn, cfg); err != nil {
 		return err
 	}
-	log.Printf("tunnel connected server=%s sncode=%s", addr, cfg.SnCode)
+	log.Printf("tunnel connected server=%s sncode=%s", addr, cfg.Sncode)
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
@@ -310,8 +420,8 @@ func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
 	defer stream.Close()
 	frame := tunnel.Frame{
 		Type:          tunnel.FrameTypeHello,
-		Token:         cfg.Token,
-		SnCode:        cfg.SnCode,
+		Token:         cfg.authToken(),
+		SnCode:        cfg.Sncode,
 		HostIP:        cfg.HostIP,
 		Hostname:      cfg.Hostname,
 		ClientVersion: clientVersion,
@@ -364,14 +474,13 @@ func sendHeartbeat(ctx context.Context, conn *quic.Conn, cfg clientConfig) error
 		return err
 	}
 	defer stream.Close()
-	return writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeHeartbeat, SnCode: cfg.SnCode})
+	return writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeHeartbeat, SnCode: cfg.Sncode})
 }
 
 func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	body := map[string]any{
-		"token":         cfg.Token,
-		"sncode":        cfg.SnCode,
-		"deviceId":      cfg.DeviceID,
+		"token":         cfg.authToken(),
+		"sncode":        cfg.Sncode,
 		"hostIp":        cfg.HostIP,
 		"hostname":      cfg.Hostname,
 		"clientVersion": clientVersion,
@@ -394,6 +503,13 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		return fmt.Errorf("heartbeat status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+func (cfg clientConfig) authToken() string {
+	if strings.TrimSpace(cfg.DeviceToken) != "" {
+		return strings.TrimSpace(cfg.DeviceToken)
+	}
+	return strings.TrimSpace(cfg.Token)
 }
 
 func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
@@ -484,4 +600,64 @@ func detectOutboundIP() string {
 		return addr.IP.String()
 	}
 	return ""
+}
+
+func defaultStateFile(sncode string) string {
+	name := strings.TrimSpace(sncode)
+	if name == "" {
+		name = "device"
+	}
+	name = strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(name)
+	if canUseStateDir("/var/lib/navmesh-client") {
+		return filepath.Join("/var/lib/navmesh-client", name+".json")
+	}
+	return filepath.Join(".", ".navmesh-client-"+name+".json")
+}
+
+func canUseStateDir(dir string) bool {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false
+	}
+	test, err := os.CreateTemp(dir, ".write-test-*")
+	if err != nil {
+		return false
+	}
+	path := test.Name()
+	_ = test.Close()
+	_ = os.Remove(path)
+	return true
+}
+
+func loadClientState(path string) (clientState, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return clientState{}, nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return clientState{}, nil
+	}
+	if err != nil {
+		return clientState{}, err
+	}
+	var state clientState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return clientState{}, err
+	}
+	return state, nil
+}
+
+func saveClientState(path string, state clientState) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
 }

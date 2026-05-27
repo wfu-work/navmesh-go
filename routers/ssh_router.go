@@ -15,6 +15,6 @@ func (s *SSHRouter) InitSSHRouter(router *gin.RouterGroup) {
 	{
 		aliases.GET("list", sshApi.ListAliases)
 		aliases.POST("", sshApi.SaveAlias)
-		aliases.DELETE(":id", sshApi.DisableAlias)
+		aliases.DELETE(":guid", sshApi.DisableAlias)
 	}
 }

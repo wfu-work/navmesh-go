@@ -7,11 +7,19 @@ import (
 	"navmesh-go/domains"
 	"navmesh-go/utils"
 
-	"github.com/google/uuid"
-	"github.com/wfu-work/nav-common-go-lib/global"
+	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
+	commonServices "github.com/wfu-work/nav-common-go-lib/services"
+	"gorm.io/gorm"
 )
 
-type EventService struct{}
+type EventService struct {
+	commonServices.CrudService[domains.Event]
+}
+
+func (s EventService) WithDB(db *gorm.DB) EventService {
+	s.CrudService = *s.CrudService.WithDB(db)
+	return s
+}
 
 type EventInput struct {
 	DeviceGuid string
@@ -22,7 +30,7 @@ type EventInput struct {
 }
 
 func (s EventService) List(params map[string]string) ([]domains.Event, int64, error) {
-	db := global.NAV_DB.Model(&domains.Event{})
+	db := s.DB().Model(&domains.Event{})
 	if deviceGuid := strings.TrimSpace(params["deviceGuid"]); deviceGuid != "" {
 		db = db.Where("device_guid = ?", deviceGuid)
 	}
@@ -71,17 +79,15 @@ func (s EventService) Record(input EventInput) {
 		level = "info"
 	}
 	now := domains.NowMilli()
-	_ = global.NAV_DB.Create(&domains.Event{
-		Guid:       uuid.NewString(),
-		DeviceGuid: strings.TrimSpace(input.DeviceGuid),
-		EventType:  input.EventType,
-		Level:      level,
-		Title:      input.Title,
-		Message:    strings.TrimSpace(input.Message),
-		Status:     int(domains.StatusEnabled),
-		CreateTime: now,
-		UpdateTime: now,
-	}).Error
+	_ = s.Create(domains.Event{
+		BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: now, UpdateTime: now},
+		DeviceGuid:     strings.TrimSpace(input.DeviceGuid),
+		EventType:      input.EventType,
+		Level:          level,
+		Title:          input.Title,
+		Message:        strings.TrimSpace(input.Message),
+		Status:         int(domains.StatusEnabled),
+	})
 }
 
 func (s EventService) setStatus(guid string, status int) error {
@@ -89,7 +95,7 @@ func (s EventService) setStatus(guid string, status int) error {
 	if guid == "" {
 		return errors.New("guid required")
 	}
-	return global.NAV_DB.Model(&domains.Event{}).Where("guid = ?", guid).Updates(map[string]any{
+	return s.DB().Model(&domains.Event{}).Where("guid = ?", guid).Updates(map[string]any{
 		"status":      status,
 		"update_time": domains.NowMilli(),
 	}).Error
