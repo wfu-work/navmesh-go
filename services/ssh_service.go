@@ -205,7 +205,7 @@ func (s SSHService) deviceEntrypointIP(deviceGuid string) string {
 
 func sshAliasDomain(alias string) string {
 	alias = strings.TrimSpace(alias)
-	publicDomain := strings.TrimSpace(getSettingValue("public_domain", "navfirst.com"))
+	publicDomain := strings.TrimSpace(getSettingValue("ssh_gateway_domain", "ssh.navfirst.com"))
 	if publicDomain == "" {
 		return alias
 	}

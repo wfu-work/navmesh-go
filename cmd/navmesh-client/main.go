@@ -46,6 +46,8 @@ type clientConfig struct {
 	Hostname       string
 	HostIP         string
 	LocalHost      string
+	ProxyMode      bool
+	ProxyTarget    string
 	SkipRegister   bool
 	InsecureQUIC   bool
 	ReconnectWait  time.Duration
@@ -95,6 +97,12 @@ func main() {
 	cfg := parseFlags()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cfg.ProxyMode {
+		if err := runProxy(ctx, cfg); err != nil {
+			log.Fatalf("navmesh proxy stopped: %v", err)
+		}
+		return
+	}
 	if err := run(ctx, cfg); err != nil {
 		log.Fatalf("navmesh-client stopped: %v", err)
 	}
@@ -115,6 +123,7 @@ func parseFlags() clientConfig {
 		_, _ = fmt.Fprintln(out)
 		_, _ = fmt.Fprintln(out, "示例:")
 		_, _ = fmt.Fprintln(out, "  navmesh-client -server tunnel.navfirst.com -port 3008 -token navfirst@2020 -sncode test01 -type rain -sshPort 22 -webPort 7090 -remark 深圳工厂1号测试网关")
+		_, _ = fmt.Fprintln(out, "  ssh root@ignored -o 'ProxyCommand=navmesh-client -proxy -server ssh.navfirst.com -port 22 -target test01'")
 	}
 	flag.StringVar(&cfg.Server, "server", "127.0.0.1", "NavMesh 隧道服务器地址")
 	flag.IntVar(&cfg.Port, "port", 3008, "NavMesh 隧道服务器 UDP 端口")
@@ -132,6 +141,8 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.Hostname, "hostname", hostname, "上报的主机名")
 	flag.StringVar(&cfg.HostIP, "hostIp", "", "上报的主机 IP，默认自动探测")
 	flag.StringVar(&cfg.LocalHost, "localHost", "127.0.0.1", "服务端请求回环目标时使用的本机地址")
+	flag.BoolVar(&cfg.ProxyMode, "proxy", false, "作为 SSH ProxyCommand 使用")
+	flag.StringVar(&cfg.ProxyTarget, "target", "", "SSH ProxyCommand 目标设备 sncode、别名或 SSH 域名")
 	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过 HTTP 设备注册，直接建立隧道")
 	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过 QUIC 服务器证书校验")
 	flag.BoolVar(&showVersion, "v", false, "查看当前客户端版本")
@@ -232,8 +243,7 @@ func run(ctx context.Context, cfg clientConfig) error {
 		}
 		if strings.TrimSpace(cfg.DeviceToken) == "" {
 			log.Printf("device registered and waiting for activation sncode=%s", cfg.Sncode)
-			failures++
-			if err := waitReconnect(ctx, cfg, failures); err != nil {
+			if err := waitActivationPoll(ctx, cfg); err != nil {
 				return err
 			}
 			continue
@@ -257,6 +267,22 @@ func shouldRetryWithRegisterToken(err error, cfg clientConfig) bool {
 	return strings.Contains(msg, "invalid register token") ||
 		strings.Contains(msg, "invalid device token") ||
 		strings.Contains(msg, "device not found")
+}
+
+func waitActivationPoll(ctx context.Context, cfg clientConfig) error {
+	delay := cfg.ReconnectWait
+	if delay <= 0 || delay > 5*time.Second {
+		delay = 5 * time.Second
+	}
+	log.Printf("activation poll scheduled in %s sncode=%s", delay, cfg.Sncode)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func waitReconnect(ctx context.Context, cfg clientConfig, failures int) error {
@@ -512,6 +538,28 @@ func (cfg clientConfig) authToken() string {
 	return strings.TrimSpace(cfg.Token)
 }
 
+func runProxy(ctx context.Context, cfg clientConfig) error {
+	target := strings.TrimSpace(cfg.ProxyTarget)
+	if target == "" {
+		return fmt.Errorf("target required")
+	}
+	if cfg.Port <= 0 {
+		cfg.Port = 22
+	}
+	addr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "%s\n", target); err != nil {
+		return err
+	}
+	bridgeReadWriter(os.Stdin, os.Stdout, conn)
+	return nil
+}
+
 func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
 	defer stream.Close()
 	frame, err := readFrame(stream)
@@ -587,6 +635,24 @@ func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) {
 		done <- struct{}{}
 	}()
 	<-done
+	<-done
+}
+
+func bridgeReadWriter(in io.Reader, out io.Writer, conn net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(conn, in)
+		if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		} else {
+			_ = conn.Close()
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(out, conn)
+		done <- struct{}{}
+	}()
 	<-done
 }
 

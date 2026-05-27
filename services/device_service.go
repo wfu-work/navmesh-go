@@ -127,9 +127,9 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	device.WebDomain = req.WebDomain
 	device.GroupGuid = req.GroupGuid
 	device.Tags = normalizeTags(req.Tags)
-	if isBootstrapToken {
+	if isBootstrapToken && (isNewDevice || isDeletedDevice || !s.tokenService().HasEnabled(device.Guid)) {
 		device.Status = domains.DeviceStatusRegistered
-	} else {
+	} else if !isBootstrapToken {
 		device.Status = domains.DeviceStatusOnline
 		device.LastSeenTime = now
 	}
@@ -342,8 +342,10 @@ func (s DeviceService) Enable(guid string) error {
 	if err := s.DB().Where("guid = ?", guid).First(&device).Error; err != nil {
 		return errors.New("device not found")
 	}
-	if _, err := s.tokenService().CreateToken(device.Guid, CreateDeviceTokenRequest{Name: device.Sncode}); err != nil {
-		return err
+	if device.Status == domains.DeviceStatusRegistered || device.Status == domains.DeviceStatusDisabled {
+		if _, err := s.tokenService().CreateToken(device.Guid, CreateDeviceTokenRequest{Name: device.Sncode}); err != nil {
+			return err
+		}
 	}
 	return s.DB().Model(&domains.Device{}).
 		Where("guid = ? AND status IN ?", guid, []int{domains.DeviceStatusRegistered, domains.DeviceStatusDisabled}).

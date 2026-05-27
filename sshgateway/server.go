@@ -83,11 +83,15 @@ func (s *Server) acceptLoop(ctx context.Context) {
 
 func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	defer client.Close()
-	localIP := localAddrIP(client.LocalAddr())
 	sourceIP := remoteAddrIP(client.RemoteAddr())
-	route, err := findRouteByEntrypoint(localIP)
+	target, err := readProxyTarget(client)
 	if err != nil {
-		global.NAV_LOG.Warn("ssh route not found", zap.String("entrypointIp", localIP), zap.String("sourceIp", sourceIP), zap.Error(err))
+		global.NAV_LOG.Warn("ssh proxy target required", zap.String("sourceIp", sourceIP), zap.Error(err))
+		return
+	}
+	route, err := findRouteByTarget(target)
+	if err != nil {
+		global.NAV_LOG.Warn("ssh route not found", zap.String("target", target), zap.String("sourceIp", sourceIP), zap.Error(err))
 		return
 	}
 	if !services.ServiceGroupApp.AccessPolicyService.IsAllowed(route.Device.Guid, "", "ssh") {
@@ -119,7 +123,7 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 		SourceIP:    sourceIP,
 		TargetHost:  "127.0.0.1",
 		TargetPort:  targetPort,
-		PublicHost:  route.Alias.Domain,
+		PublicHost:  proxyPublicHost(route),
 		Status:      int(domains.StatusEnabled),
 		StartTime:   start,
 		CreateTime:  start,
@@ -159,6 +163,62 @@ type sshRoute struct {
 	Device domains.Device
 }
 
+func readProxyTarget(conn net.Conn) (string, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	buf := make([]byte, 0, 128)
+	one := make([]byte, 1)
+	for len(buf) < 255 {
+		n, err := conn.Read(one)
+		if err != nil {
+			return "", err
+		}
+		if n == 0 {
+			continue
+		}
+		if one[0] == '\n' {
+			break
+		}
+		buf = append(buf, one[0])
+	}
+	target := strings.TrimSpace(string(buf))
+	target = strings.TrimPrefix(target, "navmesh ")
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", errors.New("empty proxy target")
+	}
+	if len(target) > 255 {
+		return "", errors.New("proxy target too long")
+	}
+	return target, nil
+}
+
+func findRouteByTarget(target string) (*sshRoute, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil, errors.New("empty proxy target")
+	}
+	normalized := strings.TrimSuffix(target, ".")
+	var alias domains.SSHAlias
+	err := global.NAV_DB.
+		Where("(domain = ? OR alias = ?) AND status = ?", normalized, normalized, int(domains.StatusEnabled)).
+		First(&alias).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		hostLabel := strings.Split(normalized, ".")[0]
+		err = global.NAV_DB.
+			Where("(alias = ? OR domain = ?) AND status = ?", hostLabel, normalized, int(domains.StatusEnabled)).
+			First(&alias).Error
+	}
+	if err != nil {
+		return nil, err
+	}
+	var device domains.Device
+	if err := global.NAV_DB.Where("guid = ? AND status != ?", alias.DeviceGuid, domains.DeviceStatusDisabled).First(&device).Error; err != nil {
+		return nil, err
+	}
+	return &sshRoute{Alias: alias, Device: device}, nil
+}
+
 func findRouteByEntrypoint(entrypointIP string) (*sshRoute, error) {
 	if entrypointIP == "" {
 		return nil, errors.New("empty entrypoint ip")
@@ -180,6 +240,16 @@ func findRouteByEntrypoint(entrypointIP string) (*sshRoute, error) {
 		return nil, err
 	}
 	return &sshRoute{Alias: alias, Device: device}, nil
+}
+
+func proxyPublicHost(route *sshRoute) string {
+	if route == nil {
+		return ""
+	}
+	if strings.TrimSpace(route.Alias.Domain) != "" {
+		return route.Alias.Domain
+	}
+	return route.Device.Sncode
 }
 
 func localAddrIP(addr net.Addr) string {

@@ -40,8 +40,11 @@ func (s EventService) List(params map[string]string) ([]domains.Event, int64, er
 	if level := strings.TrimSpace(params["level"]); level != "" {
 		db = db.Where("level = ?", level)
 	}
-	if status := utils.Str2Int(params["status"]); status > 0 {
-		db = db.Where("status = ?", status)
+	if statusParam, ok := params["status"]; ok {
+		statusParam = strings.TrimSpace(statusParam)
+		if statusParam != "" {
+			db = db.Where("status = ?", utils.Str2Int(statusParam))
+		}
 	}
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
