@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,9 @@ import (
 	"navmesh-go/tunnel"
 
 	"github.com/quic-go/quic-go"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/shirou/gopsutil/v4/mem"
 )
 
 const clientVersion = "v0.1.0"
@@ -46,8 +50,6 @@ type clientConfig struct {
 	Hostname       string
 	HostIP         string
 	LocalHost      string
-	ProxyMode      bool
-	ProxyTarget    string
 	SkipRegister   bool
 	InsecureQUIC   bool
 	ReconnectWait  time.Duration
@@ -83,8 +85,13 @@ type registerResponse struct {
 	Msg string `json:"msg"`
 }
 
+type apiResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
 type clientState struct {
-	SnCode      string `json:"sncode"`
+	Sncode      string `json:"sncode"`
 	DeviceGuid  string `json:"deviceGuid"`
 	DeviceToken string `json:"deviceToken"`
 	TokenGuid   string `json:"tokenGuid"`
@@ -93,16 +100,24 @@ type clientState struct {
 	UpdateTime  int64  `json:"updateTime"`
 }
 
+type systemSnapshot struct {
+	OS          string
+	OSVersion   string
+	Kernel      string
+	Arch        string
+	MemoryTotal int64
+	MemoryUsed  int64
+	MemoryFree  int64
+	DiskTotal   int64
+	DiskUsed    int64
+	DiskFree    int64
+	DiskUsedPct float64
+}
+
 func main() {
 	cfg := parseFlags()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if cfg.ProxyMode {
-		if err := runProxy(ctx, cfg); err != nil {
-			log.Fatalf("navmesh proxy stopped: %v", err)
-		}
-		return
-	}
 	if err := run(ctx, cfg); err != nil {
 		log.Fatalf("navmesh-client stopped: %v", err)
 	}
@@ -123,7 +138,6 @@ func parseFlags() clientConfig {
 		_, _ = fmt.Fprintln(out)
 		_, _ = fmt.Fprintln(out, "示例:")
 		_, _ = fmt.Fprintln(out, "  navmesh-client -server tunnel.navfirst.com -port 3008 -token navfirst@2020 -sncode test01 -type rain -sshPort 22 -webPort 7090 -remark 深圳工厂1号测试网关")
-		_, _ = fmt.Fprintln(out, "  ssh root@ignored -o 'ProxyCommand=navmesh-client -proxy -server ssh.navfirst.com -port 22 -target test01'")
 	}
 	flag.StringVar(&cfg.Server, "server", "127.0.0.1", "NavMesh 隧道服务器地址")
 	flag.IntVar(&cfg.Port, "port", 3008, "NavMesh 隧道服务器 UDP 端口")
@@ -139,12 +153,10 @@ func parseFlags() clientConfig {
 	flag.IntVar(&cfg.WebPort, "webPort", 0, "本机 Web 服务端口，0 表示不启用")
 	flag.StringVar(&cfg.WebDomain, "webDomain", "", "外部 Web 映射域名")
 	flag.StringVar(&cfg.Hostname, "hostname", hostname, "上报的主机名")
-	flag.StringVar(&cfg.HostIP, "hostIp", "", "上报的主机 IP，默认自动探测")
+	flag.StringVar(&cfg.HostIP, "hostIp", "", "上报的主机IP，默认自动探测")
 	flag.StringVar(&cfg.LocalHost, "localHost", "127.0.0.1", "服务端请求回环目标时使用的本机地址")
-	flag.BoolVar(&cfg.ProxyMode, "proxy", false, "作为 SSH ProxyCommand 使用")
-	flag.StringVar(&cfg.ProxyTarget, "target", "", "SSH ProxyCommand 目标设备 sncode、别名或 SSH 域名")
-	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过 HTTP 设备注册，直接建立隧道")
-	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过 QUIC 服务器证书校验")
+	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过HTTP设备注册，直接建立隧道")
+	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过QUIC服务器证书校验")
 	flag.BoolVar(&showVersion, "v", false, "查看当前客户端版本")
 	flag.DurationVar(&cfg.ReconnectWait, "reconnectWait", 5*time.Second, "首次重连等待时间")
 	flag.DurationVar(&cfg.ReconnectMax, "reconnectMax", 60*time.Second, "指数退避最大重连等待时间")
@@ -198,17 +210,40 @@ func run(ctx context.Context, cfg clientConfig) error {
 	if cfg.Token == "" {
 		return fmt.Errorf("token required")
 	}
+	snapshot := collectSystemSnapshot()
+	log.Printf(
+		"navmesh-client starting version=%s sncode=%s type=%s server=%s port=%d api=%s hostname=%s hostIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s stateFile=%s skipRegister=%t",
+		clientVersion,
+		cfg.Sncode,
+		cfg.DeviceType,
+		cfg.Server,
+		cfg.Port,
+		cfg.API,
+		cfg.Hostname,
+		cfg.HostIP,
+		snapshot.OS,
+		snapshot.OSVersion,
+		snapshot.Kernel,
+		snapshot.Arch,
+		snapshot.MemoryTotal,
+		snapshot.DiskTotal,
+		cfg.SSHPort,
+		cfg.WebPort,
+		cfg.Heartbeat,
+		cfg.StateFile,
+		cfg.SkipRegister,
+	)
 	state, err := loadClientState(cfg.StateFile)
 	if err != nil {
 		log.Printf("load client state failed path=%s err=%v", cfg.StateFile, err)
 	}
-	if cfg.DeviceToken == "" && state.DeviceToken != "" && (state.SnCode == "" || state.SnCode == cfg.Sncode) {
+	if cfg.DeviceToken == "" && state.DeviceToken != "" && (state.Sncode == "" || state.Sncode == cfg.Sncode) {
 		cfg.DeviceToken = state.DeviceToken
 		log.Printf("loaded device token state path=%s sncode=%s", cfg.StateFile, cfg.Sncode)
 	} else if cfg.DeviceToken != "" {
 		log.Printf("using device token from command line sncode=%s stateFile=%s", cfg.Sncode, cfg.StateFile)
 	}
-	if state.SnCode == "" || state.SnCode == cfg.Sncode {
+	if state.Sncode == "" || state.Sncode == cfg.Sncode {
 		if strings.TrimSpace(state.Alias) != "" {
 			cfg.Alias = strings.TrimSpace(state.Alias)
 		}
@@ -225,7 +260,7 @@ func run(ctx context.Context, cfg clientConfig) error {
 					log.Printf("device token rejected, retrying register with default token: %v", err)
 					cfg.DeviceToken = ""
 					_ = saveClientState(cfg.StateFile, clientState{
-						SnCode:     cfg.Sncode,
+						Sncode:     cfg.Sncode,
 						Alias:      cfg.Alias,
 						Remark:     cfg.Remark,
 						UpdateTime: time.Now().UnixMilli(),
@@ -313,6 +348,23 @@ func backoffDelay(cfg clientConfig, failures int) time.Duration {
 }
 
 func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error) {
+	snapshot := collectSystemSnapshot()
+	log.Printf(
+		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s",
+		cfg.API,
+		cfg.Sncode,
+		cfg.DeviceType,
+		cfg.Alias,
+		cfg.Hostname,
+		cfg.HostIP,
+		snapshot.OS,
+		snapshot.Kernel,
+		snapshot.MemoryUsed,
+		snapshot.DiskUsed,
+		cfg.SSHPort,
+		cfg.WebPort,
+		cfg.authMode(),
+	)
 	body := map[string]any{
 		"token":         cfg.authToken(),
 		"sncode":        cfg.Sncode,
@@ -326,6 +378,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 		"webPort":       cfg.WebPort,
 		"webDomain":     cfg.WebDomain,
 	}
+	snapshot.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -358,7 +411,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 	}
 	cfg.Remark = result.Data.Device.Remark
 	state := clientState{
-		SnCode:      cfg.Sncode,
+		Sncode:      cfg.Sncode,
 		DeviceGuid:  result.Data.Device.Guid,
 		DeviceToken: cfg.DeviceToken,
 		TokenGuid:   result.Data.DeviceToken.Item.Guid,
@@ -383,6 +436,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 
 func connectAndServe(ctx context.Context, cfg clientConfig) error {
 	addr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
+	log.Printf("connecting tunnel server=%s sncode=%s insecure=%t heartbeat=%s", addr, cfg.Sncode, cfg.InsecureQUIC, cfg.Heartbeat)
 	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
 		InsecureSkipVerify: cfg.InsecureQUIC,
 		NextProtos:         []string{"navmesh-quic"},
@@ -399,7 +453,8 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 	if err := sendHello(ctx, conn, cfg); err != nil {
 		return err
 	}
-	log.Printf("tunnel connected server=%s sncode=%s", addr, cfg.Sncode)
+	snapshot := collectSystemSnapshot()
+	log.Printf("tunnel connected server=%s sncode=%s hostname=%s hostIp=%s %s", addr, cfg.Sncode, cfg.Hostname, cfg.HostIP, snapshot.logFields())
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
@@ -462,6 +517,7 @@ func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
 	if ack.Type != tunnel.FrameTypeHelloAck || !ack.OK {
 		return fmt.Errorf("hello rejected: %s", ack.Message)
 	}
+	log.Printf("hello accepted sncode=%s message=%s", cfg.Sncode, ack.Message)
 	return nil
 }
 
@@ -482,6 +538,8 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 				log.Printf("http heartbeat failed failures=%d err=%v", failures, err)
 			} else {
 				failures = 0
+				snapshot := collectSystemSnapshot()
+				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.Heartbeat, snapshot.logFields())
 			}
 			if failures >= cfg.HeartbeatFail {
 				select {
@@ -504,6 +562,7 @@ func sendHeartbeat(ctx context.Context, conn *quic.Conn, cfg clientConfig) error
 }
 
 func postHeartbeat(ctx context.Context, cfg clientConfig) error {
+	snapshot := collectSystemSnapshot()
 	body := map[string]any{
 		"token":         cfg.authToken(),
 		"sncode":        cfg.Sncode,
@@ -511,6 +570,7 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		"hostname":      cfg.Hostname,
 		"clientVersion": clientVersion,
 	}
+	snapshot.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -528,7 +588,115 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("heartbeat status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
+	var result apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if result.Code != 0 && result.Code != 200 {
+		return fmt.Errorf("heartbeat code %d: %s", result.Code, result.Msg)
+	}
 	return nil
+}
+
+func collectSystemSnapshot() systemSnapshot {
+	snapshot := systemSnapshot{
+		OS:   runtime.GOOS,
+		Arch: runtime.GOARCH,
+	}
+	if info, err := host.Info(); err == nil && info != nil {
+		snapshot.OS = firstNonEmpty(info.Platform, info.OS, snapshot.OS)
+		snapshot.OSVersion = firstNonEmpty(info.PlatformVersion, info.PlatformFamily)
+		snapshot.Kernel = strings.TrimSpace(info.KernelVersion)
+	}
+	if vm, err := mem.VirtualMemory(); err == nil && vm != nil {
+		snapshot.MemoryTotal = int64(vm.Total)
+		snapshot.MemoryUsed = int64(vm.Used)
+		snapshot.MemoryFree = int64(vm.Available)
+	}
+	if usage, err := disk.Usage(rootDiskPath()); err == nil && usage != nil {
+		snapshot.DiskTotal = int64(usage.Total)
+		snapshot.DiskUsed = int64(usage.Used)
+		snapshot.DiskFree = int64(usage.Free)
+		snapshot.DiskUsedPct = usage.UsedPercent
+	}
+	return snapshot
+}
+
+func (snapshot systemSnapshot) addTo(body map[string]any) {
+	body["os"] = snapshot.OS
+	body["osVersion"] = snapshot.OSVersion
+	body["kernel"] = snapshot.Kernel
+	body["arch"] = snapshot.Arch
+	body["memoryTotal"] = snapshot.MemoryTotal
+	body["memoryUsed"] = snapshot.MemoryUsed
+	body["memoryFree"] = snapshot.MemoryFree
+	body["diskTotal"] = snapshot.DiskTotal
+	body["diskUsed"] = snapshot.DiskUsed
+	body["diskFree"] = snapshot.DiskFree
+	body["diskUsedPct"] = snapshot.DiskUsedPct
+}
+
+func (snapshot systemSnapshot) logFields() string {
+	return fmt.Sprintf(
+		"os=%s osVersion=%s kernel=%s arch=%s memory=%s/%s freeMemory=%s disk=%s/%s freeDisk=%s diskUsedPct=%.1f%%",
+		valueOrDash(snapshot.OS),
+		valueOrDash(snapshot.OSVersion),
+		valueOrDash(snapshot.Kernel),
+		valueOrDash(snapshot.Arch),
+		formatBytes(snapshot.MemoryUsed),
+		formatBytes(snapshot.MemoryTotal),
+		formatBytes(snapshot.MemoryFree),
+		formatBytes(snapshot.DiskUsed),
+		formatBytes(snapshot.DiskTotal),
+		formatBytes(snapshot.DiskFree),
+		snapshot.DiskUsedPct,
+	)
+}
+
+func formatBytes(value int64) string {
+	if value <= 0 {
+		return "0B"
+	}
+	const unit = 1024
+	if value < unit {
+		return fmt.Sprintf("%dB", value)
+	}
+	if value < unit*unit {
+		return fmt.Sprintf("%.1fKB", float64(value)/unit)
+	}
+	if value < unit*unit*unit {
+		return fmt.Sprintf("%.1fMB", float64(value)/(unit*unit))
+	}
+	return fmt.Sprintf("%.1fGB", float64(value)/(unit*unit*unit))
+}
+
+func valueOrDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return strings.TrimSpace(value)
+}
+
+func rootDiskPath() string {
+	if runtime.GOOS == "windows" {
+		if volume := filepath.VolumeName(os.TempDir()); volume != "" {
+			return volume + `\`
+		}
+		if drive := strings.TrimSpace(os.Getenv("SystemDrive")); drive != "" {
+			return drive + `\`
+		}
+		return `C:\`
+	}
+	return "/"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (cfg clientConfig) authToken() string {
@@ -538,26 +706,11 @@ func (cfg clientConfig) authToken() string {
 	return strings.TrimSpace(cfg.Token)
 }
 
-func runProxy(ctx context.Context, cfg clientConfig) error {
-	target := strings.TrimSpace(cfg.ProxyTarget)
-	if target == "" {
-		return fmt.Errorf("target required")
+func (cfg clientConfig) authMode() string {
+	if strings.TrimSpace(cfg.DeviceToken) != "" {
+		return "device-token"
 	}
-	if cfg.Port <= 0 {
-		cfg.Port = 22
-	}
-	addr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "%s\n", target); err != nil {
-		return err
-	}
-	bridgeReadWriter(os.Stdin, os.Stdout, conn)
-	return nil
+	return "register-token"
 }
 
 func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
@@ -573,6 +726,7 @@ func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
 	}
 	targetHost := normalizeTargetHost(cfg, frame.TargetHost)
 	targetPort := frame.TargetPort
+	log.Printf("open tcp request requestId=%s target=%s:%d sncode=%s", frame.RequestID, targetHost, targetPort, cfg.Sncode)
 	if targetPort <= 0 {
 		_ = writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "invalid target port"})
 		return
@@ -590,7 +744,9 @@ func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
 		log.Printf("write open_tcp ack failed: %v", err)
 		return
 	}
+	log.Printf("open tcp connected requestId=%s target=%s:%d", frame.RequestID, targetHost, targetPort)
 	bridge(local, stream)
+	log.Printf("open tcp closed requestId=%s target=%s:%d", frame.RequestID, targetHost, targetPort)
 }
 
 func normalizeTargetHost(cfg clientConfig, targetHost string) string {
@@ -635,24 +791,6 @@ func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) {
 		done <- struct{}{}
 	}()
 	<-done
-	<-done
-}
-
-func bridgeReadWriter(in io.Reader, out io.Writer, conn net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(conn, in)
-		if closer, ok := conn.(interface{ CloseWrite() error }); ok {
-			_ = closer.CloseWrite()
-		} else {
-			_ = conn.Close()
-		}
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(out, conn)
-		done <- struct{}{}
-	}()
 	<-done
 }
 

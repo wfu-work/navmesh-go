@@ -29,28 +29,50 @@ func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
 }
 
 type RegisterDeviceRequest struct {
-	Token         string `json:"token"`
-	SnCode        string `json:"sncode"`
-	DeviceType    string `json:"type"`
-	Alias         string `json:"alias"`
-	Remark        string `json:"remark"`
-	Hostname      string `json:"hostname"`
-	HostIP        string `json:"hostIp"`
-	ClientVersion string `json:"clientVersion"`
-	SSHPort       int    `json:"sshPort"`
-	WebPort       int    `json:"webPort"`
-	WebDomain     string `json:"webDomain"`
-	GroupGuid     string `json:"groupGuid"`
-	Tags          string `json:"tags"`
+	Token         string  `json:"token"`
+	SnCode        string  `json:"sncode"`
+	DeviceType    string  `json:"type"`
+	Alias         string  `json:"alias"`
+	Remark        string  `json:"remark"`
+	Hostname      string  `json:"hostname"`
+	HostIP        string  `json:"hostIp"`
+	ClientVersion string  `json:"clientVersion"`
+	OS            string  `json:"os"`
+	OSVersion     string  `json:"osVersion"`
+	Kernel        string  `json:"kernel"`
+	Arch          string  `json:"arch"`
+	MemoryTotal   int64   `json:"memoryTotal"`
+	MemoryUsed    int64   `json:"memoryUsed"`
+	MemoryFree    int64   `json:"memoryFree"`
+	DiskTotal     int64   `json:"diskTotal"`
+	DiskUsed      int64   `json:"diskUsed"`
+	DiskFree      int64   `json:"diskFree"`
+	DiskUsedPct   float64 `json:"diskUsedPct"`
+	SSHPort       int     `json:"sshPort"`
+	WebPort       int     `json:"webPort"`
+	WebDomain     string  `json:"webDomain"`
+	GroupGuid     string  `json:"groupGuid"`
+	Tags          string  `json:"tags"`
 }
 
 type HeartbeatRequest struct {
-	Token         string `json:"token"`
-	SnCode        string `json:"sncode"`
-	Guid          string `json:"guid"`
-	HostIP        string `json:"hostIp"`
-	Hostname      string `json:"hostname"`
-	ClientVersion string `json:"clientVersion"`
+	Token         string  `json:"token"`
+	SnCode        string  `json:"sncode"`
+	Guid          string  `json:"guid"`
+	HostIP        string  `json:"hostIp"`
+	Hostname      string  `json:"hostname"`
+	ClientVersion string  `json:"clientVersion"`
+	OS            string  `json:"os"`
+	OSVersion     string  `json:"osVersion"`
+	Kernel        string  `json:"kernel"`
+	Arch          string  `json:"arch"`
+	MemoryTotal   int64   `json:"memoryTotal"`
+	MemoryUsed    int64   `json:"memoryUsed"`
+	MemoryFree    int64   `json:"memoryFree"`
+	DiskTotal     int64   `json:"diskTotal"`
+	DiskUsed      int64   `json:"diskUsed"`
+	DiskFree      int64   `json:"diskFree"`
+	DiskUsedPct   float64 `json:"diskUsedPct"`
 }
 
 type UpdateDeviceProfileRequest struct {
@@ -121,6 +143,17 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	device.Hostname = req.Hostname
 	device.HostIP = req.HostIP
 	device.ClientVersion = req.ClientVersion
+	device.OS = req.OS
+	device.OSVersion = req.OSVersion
+	device.Kernel = req.Kernel
+	device.Arch = req.Arch
+	device.MemoryTotal = req.MemoryTotal
+	device.MemoryUsed = req.MemoryUsed
+	device.MemoryFree = req.MemoryFree
+	device.DiskTotal = req.DiskTotal
+	device.DiskUsed = req.DiskUsed
+	device.DiskFree = req.DiskFree
+	device.DiskUsedPct = req.DiskUsedPct
 	device.SourceIP = sourceIP
 	device.SSHPort = req.SSHPort
 	device.WebPort = req.WebPort
@@ -209,6 +242,39 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	}
 	if strings.TrimSpace(req.ClientVersion) != "" {
 		updates["client_version"] = strings.TrimSpace(req.ClientVersion)
+	}
+	if strings.TrimSpace(req.OS) != "" {
+		updates["os"] = strings.TrimSpace(req.OS)
+	}
+	if strings.TrimSpace(req.OSVersion) != "" {
+		updates["os_version"] = strings.TrimSpace(req.OSVersion)
+	}
+	if strings.TrimSpace(req.Kernel) != "" {
+		updates["kernel"] = strings.TrimSpace(req.Kernel)
+	}
+	if strings.TrimSpace(req.Arch) != "" {
+		updates["arch"] = strings.TrimSpace(req.Arch)
+	}
+	if req.MemoryTotal > 0 {
+		updates["memory_total"] = req.MemoryTotal
+	}
+	if req.MemoryUsed > 0 {
+		updates["memory_used"] = req.MemoryUsed
+	}
+	if req.MemoryFree > 0 {
+		updates["memory_free"] = req.MemoryFree
+	}
+	if req.DiskTotal > 0 {
+		updates["disk_total"] = req.DiskTotal
+	}
+	if req.DiskUsed > 0 {
+		updates["disk_used"] = req.DiskUsed
+	}
+	if req.DiskFree > 0 {
+		updates["disk_free"] = req.DiskFree
+	}
+	if req.DiskUsedPct > 0 {
+		updates["disk_used_pct"] = req.DiskUsedPct
 	}
 	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", device.Guid).Updates(updates).Error; err != nil {
 		return nil, err
@@ -436,6 +502,10 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 	req.Hostname = strings.TrimSpace(req.Hostname)
 	req.HostIP = strings.TrimSpace(req.HostIP)
 	req.ClientVersion = strings.TrimSpace(req.ClientVersion)
+	req.OS = strings.TrimSpace(req.OS)
+	req.OSVersion = strings.TrimSpace(req.OSVersion)
+	req.Kernel = strings.TrimSpace(req.Kernel)
+	req.Arch = strings.TrimSpace(req.Arch)
 	req.WebDomain = strings.TrimSpace(req.WebDomain)
 	req.GroupGuid = strings.TrimSpace(req.GroupGuid)
 	req.Tags = normalizeTags(req.Tags)

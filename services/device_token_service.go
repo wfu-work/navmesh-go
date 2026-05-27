@@ -69,7 +69,7 @@ func (s DeviceTokenService) CreateToken(deviceGuid string, req CreateDeviceToken
 	if deviceGuid == "" {
 		return nil, errors.New("deviceGuid required")
 	}
-	if err := ensureDeviceExists(deviceGuid); err != nil {
+	if err := ensureDeviceRecordExists(deviceGuid); err != nil {
 		return nil, err
 	}
 	token, err := randomToken()
@@ -131,18 +131,22 @@ func (s DeviceTokenService) Rotate(deviceGuid, tokenGuid string) (*DeviceTokenRe
 }
 
 func (s DeviceTokenService) Validate(deviceGuid, token string) error {
-	var count int64
-	err := s.DB().Model(&domains.DeviceToken{}).
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	token = strings.TrimSpace(token)
+	var row domains.DeviceToken
+	err := s.DB().
 		Where("device_guid = ? AND token_hash = ? AND status = ?", deviceGuid, utils.HashToken(token), domains.DeviceTokenStatusEnabled).
 		Where("expire_time = 0 OR expire_time > ?", domains.NowMilli()).
-		Count(&count).Error
+		First(&row).Error
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("invalid device token")
+		}
 		return err
 	}
-	if count == 0 {
-		return errors.New("invalid device token")
-	}
-	return nil
+	return s.DB().Model(&domains.DeviceToken{}).
+		Where("guid = ?", row.Guid).
+		Update("last_used_at", domains.NowMilli()).Error
 }
 
 func (s DeviceTokenService) HasEnabled(deviceGuid string) bool {

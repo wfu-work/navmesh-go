@@ -14,6 +14,7 @@ type DeviceToken struct {
 	TokenHash  string `json:"-" gorm:"size:255;comment:Token Hash"`
 	Name       string `json:"name" gorm:"size:128;comment:名称"`
 	Status     int    `json:"status" gorm:"index;comment:状态"`
+	LastUsedAt int64  `json:"lastUsedAt" gorm:"index;comment:最后使用时间"`
 	ExpireTime int64  `json:"expireTime" gorm:"comment:过期时间"`
 }
 

@@ -1,8 +1,10 @@
 package sshgateway
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -84,22 +86,29 @@ func (s *Server) acceptLoop(ctx context.Context) {
 func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	defer client.Close()
 	sourceIP := remoteAddrIP(client.RemoteAddr())
-	target, err := readProxyTarget(client)
+	reader := bufio.NewReader(client)
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	target, requestedPort, err := readHTTPConnectTarget(reader)
+	_ = client.SetReadDeadline(time.Time{})
 	if err != nil {
-		global.NAV_LOG.Warn("ssh proxy target required", zap.String("sourceIp", sourceIP), zap.Error(err))
+		writeConnectError(client, 400, "Bad Request")
+		global.NAV_LOG.Warn("ssh http connect target required", zap.String("sourceIp", sourceIP), zap.Error(err))
 		return
 	}
 	route, err := findRouteByTarget(target)
 	if err != nil {
-		global.NAV_LOG.Warn("ssh route not found", zap.String("target", target), zap.String("sourceIp", sourceIP), zap.Error(err))
+		writeConnectError(client, 502, "Bad Gateway")
+		global.NAV_LOG.Warn("ssh route not found", zap.String("target", target), zap.Int("requestedPort", requestedPort), zap.String("sourceIp", sourceIP), zap.Error(err))
 		return
 	}
 	if !services.ServiceGroupApp.AccessPolicyService.IsAllowed(route.Device.Guid, "", "ssh") {
+		writeConnectError(client, 403, "Forbidden")
 		global.NAV_LOG.Warn("ssh access denied by policy", zap.String("deviceGuid", route.Device.Guid), zap.String("sourceIp", sourceIP))
 		return
 	}
 	permit, err := services.DefaultRuntimePolicy.Acquire(route.Device.Guid, sourceIP)
 	if err != nil {
+		writeConnectError(client, 429, "Too Many Requests")
 		global.NAV_LOG.Warn("ssh session rejected by runtime policy", zap.String("deviceGuid", route.Device.Guid), zap.String("sourceIp", sourceIP), zap.Error(err))
 		services.ServiceGroupApp.EventService.Record(services.EventInput{
 			DeviceGuid: route.Device.Guid,
@@ -135,6 +144,7 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	defer cancel()
 	upstream, err := s.manager.OpenTCPStream(streamCtx, route.Device.Guid, "127.0.0.1", targetPort)
 	if err != nil {
+		writeConnectError(client, 502, "Bad Gateway")
 		global.NAV_LOG.Warn("open ssh tunnel stream failed", zap.String("deviceGuid", route.Device.Guid), zap.Error(err))
 		services.ServiceGroupApp.EventService.Record(services.EventInput{
 			DeviceGuid: route.Device.Guid,
@@ -150,7 +160,21 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	services.DefaultSessionRegistry.RegisterSession(session.Guid, client, upstream)
 	defer services.DefaultSessionRegistry.UnregisterSession(session.Guid)
 
-	bytesIn, bytesOut := bridge(client, upstream, services.DefaultRuntimePolicy.IdleTimeout())
+	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		markSessionClosed(session.Guid, 0, 0, "write_connect_response_failed: "+err.Error())
+		return
+	}
+
+	global.NAV_LOG.Info(
+		"ssh http connect established",
+		zap.String("deviceGuid", route.Device.Guid),
+		zap.String("target", target),
+		zap.Int("requestedPort", requestedPort),
+		zap.Int("targetPort", targetPort),
+		zap.String("sourceIp", sourceIP),
+	)
+	clientConn := &bufferedConn{Conn: client, reader: reader}
+	bytesIn, bytesOut := bridge(clientConn, upstream, services.DefaultRuntimePolicy.IdleTimeout())
 	reason := "closed"
 	if isForceClosed(session.Guid) {
 		reason = "closed_by_admin"
@@ -163,34 +187,90 @@ type sshRoute struct {
 	Device domains.Device
 }
 
-func readProxyTarget(conn net.Conn) (string, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-	buf := make([]byte, 0, 128)
-	one := make([]byte, 1)
-	for len(buf) < 255 {
-		n, err := conn.Read(one)
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (conn *bufferedConn) Read(p []byte) (int, error) {
+	return conn.reader.Read(p)
+}
+
+func readHTTPConnectTarget(reader *bufio.Reader) (string, int, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", 0, err
+	}
+	if len(line) > 1024 {
+		return "", 0, errors.New("connect request line too long")
+	}
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) != 3 {
+		return "", 0, errors.New("invalid connect request line")
+	}
+	if !strings.EqualFold(fields[0], "CONNECT") {
+		return "", 0, fmt.Errorf("unsupported method %s", fields[0])
+	}
+	if !strings.HasPrefix(strings.ToUpper(fields[2]), "HTTP/") {
+		return "", 0, fmt.Errorf("invalid http version %s", fields[2])
+	}
+	host, port, err := parseConnectAuthority(fields[1])
+	if err != nil {
+		return "", 0, err
+	}
+	if port != 22 {
+		return "", 0, fmt.Errorf("only ssh connect port 22 is allowed, got %d", port)
+	}
+
+	total := len(line)
+	for {
+		header, err := reader.ReadString('\n')
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
-		if n == 0 {
-			continue
+		total += len(header)
+		if len(header) > 4096 || total > 16*1024 {
+			return "", 0, errors.New("connect headers too large")
 		}
-		if one[0] == '\n' {
+		if strings.TrimSpace(header) == "" {
 			break
 		}
-		buf = append(buf, one[0])
 	}
-	target := strings.TrimSpace(string(buf))
-	target = strings.TrimPrefix(target, "navmesh ")
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return "", errors.New("empty proxy target")
+	return host, port, nil
+}
+
+func parseConnectAuthority(authority string) (string, int, error) {
+	authority = strings.TrimSpace(authority)
+	if authority == "" {
+		return "", 0, errors.New("empty connect authority")
 	}
-	if len(target) > 255 {
-		return "", errors.New("proxy target too long")
+	host, portText, err := net.SplitHostPort(authority)
+	if err != nil {
+		if strings.Contains(authority, ":") {
+			return "", 0, err
+		}
+		host = authority
+		portText = "22"
 	}
-	return target, nil
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return "", 0, errors.New("empty connect host")
+	}
+	if len(host) > 255 {
+		return "", 0, errors.New("connect host too long")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 || port > 65535 {
+		return "", 0, fmt.Errorf("invalid connect port %s", portText)
+	}
+	return strings.TrimSuffix(host, "."), port, nil
+}
+
+func writeConnectError(conn net.Conn, status int, text string) {
+	if strings.TrimSpace(text) == "" {
+		text = "Proxy Error"
+	}
+	_, _ = fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", status, text)
 }
 
 func findRouteByTarget(target string) (*sshRoute, error) {
@@ -199,14 +279,15 @@ func findRouteByTarget(target string) (*sshRoute, error) {
 		return nil, errors.New("empty proxy target")
 	}
 	normalized := strings.TrimSuffix(target, ".")
+	normalizedLower := strings.ToLower(normalized)
 	var alias domains.SSHAlias
 	err := global.NAV_DB.
-		Where("(domain = ? OR alias = ?) AND status = ?", normalized, normalized, int(domains.StatusEnabled)).
+		Where("(LOWER(domain) = ? OR LOWER(alias) = ?) AND status = ?", normalizedLower, normalizedLower, int(domains.StatusEnabled)).
 		First(&alias).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		hostLabel := strings.Split(normalized, ".")[0]
+		hostLabel := strings.ToLower(strings.Split(normalized, ".")[0])
 		err = global.NAV_DB.
-			Where("(alias = ? OR domain = ?) AND status = ?", hostLabel, normalized, int(domains.StatusEnabled)).
+			Where("(LOWER(alias) = ? OR LOWER(domain) = ?) AND status = ?", hostLabel, normalizedLower, int(domains.StatusEnabled)).
 			First(&alias).Error
 	}
 	if err != nil {

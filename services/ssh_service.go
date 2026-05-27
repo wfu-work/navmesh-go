@@ -222,3 +222,14 @@ func ensureDeviceExists(guid string) error {
 	}
 	return nil
 }
+
+func ensureDeviceRecordExists(guid string) error {
+	var count int64
+	if err := ServiceGroupApp.DeviceService.DB().Model(&domains.Device{}).Where("guid = ?", guid).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("device not found")
+	}
+	return nil
+}
