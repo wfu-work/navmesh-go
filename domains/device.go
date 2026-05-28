@@ -17,6 +17,8 @@ type Device struct {
 	Remark        string  `json:"remark" gorm:"size:512;comment:中文备注"`
 	Hostname      string  `json:"hostname" gorm:"size:255;comment:主机名"`
 	HostIP        string  `json:"hostIp" gorm:"size:64;comment:设备本机IP"`
+	WanIP         string  `json:"wanIp" gorm:"size:64;comment:设备外网IP"`
+	Location      string  `json:"location" gorm:"size:255;comment:设备区域位置"`
 	ClientVersion string  `json:"clientVersion" gorm:"size:64;comment:客户端版本"`
 	SourceIP      string  `json:"sourceIp" gorm:"size:64;comment:来源IP"`
 	SSHPort       int     `json:"sshPort" gorm:"comment:本机SSH端口"`

@@ -49,6 +49,7 @@ type clientConfig struct {
 	WebDomain      string
 	Hostname       string
 	HostIP         string
+	WanIP          string
 	LocalHost      string
 	SkipRegister   bool
 	InsecureQUIC   bool
@@ -154,6 +155,7 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.WebDomain, "webDomain", "", "外部 Web 映射域名")
 	flag.StringVar(&cfg.Hostname, "hostname", hostname, "上报的主机名")
 	flag.StringVar(&cfg.HostIP, "hostIp", "", "上报的主机IP，默认自动探测")
+	flag.StringVar(&cfg.WanIP, "wanIp", "", "上报的外网IP，默认自动探测")
 	flag.StringVar(&cfg.LocalHost, "localHost", "127.0.0.1", "服务端请求回环目标时使用的本机地址")
 	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过HTTP设备注册，直接建立隧道")
 	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过QUIC服务器证书校验")
@@ -185,6 +187,10 @@ func parseFlags() clientConfig {
 	if cfg.HostIP == "" {
 		cfg.HostIP = detectOutboundIP()
 	}
+	cfg.WanIP = normalizeIP(cfg.WanIP)
+	if cfg.WanIP == "" {
+		cfg.WanIP = detectPublicIP(3 * time.Second)
+	}
 	if cfg.ReconnectWait <= 0 {
 		cfg.ReconnectWait = 5 * time.Second
 	}
@@ -212,7 +218,7 @@ func run(ctx context.Context, cfg clientConfig) error {
 	}
 	snapshot := collectSystemSnapshot()
 	log.Printf(
-		"navmesh-client starting version=%s sncode=%s type=%s server=%s port=%d api=%s hostname=%s hostIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s stateFile=%s skipRegister=%t",
+		"navmesh-client starting version=%s sncode=%s type=%s server=%s port=%d api=%s hostname=%s hostIp=%s wanIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s stateFile=%s skipRegister=%t",
 		clientVersion,
 		cfg.Sncode,
 		cfg.DeviceType,
@@ -221,6 +227,7 @@ func run(ctx context.Context, cfg clientConfig) error {
 		cfg.API,
 		cfg.Hostname,
 		cfg.HostIP,
+		cfg.WanIP,
 		snapshot.OS,
 		snapshot.OSVersion,
 		snapshot.Kernel,
@@ -350,13 +357,14 @@ func backoffDelay(cfg clientConfig, failures int) time.Duration {
 func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error) {
 	snapshot := collectSystemSnapshot()
 	log.Printf(
-		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s",
+		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s wanIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s",
 		cfg.API,
 		cfg.Sncode,
 		cfg.DeviceType,
 		cfg.Alias,
 		cfg.Hostname,
 		cfg.HostIP,
+		cfg.WanIP,
 		snapshot.OS,
 		snapshot.Kernel,
 		snapshot.MemoryUsed,
@@ -373,6 +381,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 		"remark":        cfg.Remark,
 		"hostname":      cfg.Hostname,
 		"hostIp":        cfg.HostIP,
+		"wanIp":         cfg.WanIP,
 		"clientVersion": clientVersion,
 		"sshPort":       cfg.SSHPort,
 		"webPort":       cfg.WebPort,
@@ -454,7 +463,7 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 		return err
 	}
 	snapshot := collectSystemSnapshot()
-	log.Printf("tunnel connected server=%s sncode=%s hostname=%s hostIp=%s %s", addr, cfg.Sncode, cfg.Hostname, cfg.HostIP, snapshot.logFields())
+	log.Printf("tunnel connected server=%s sncode=%s hostname=%s hostIp=%s wanIp=%s %s", addr, cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, snapshot.logFields())
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
@@ -504,6 +513,7 @@ func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
 		Token:         cfg.authToken(),
 		SnCode:        cfg.Sncode,
 		HostIP:        cfg.HostIP,
+		WanIP:         cfg.WanIP,
 		Hostname:      cfg.Hostname,
 		ClientVersion: clientVersion,
 	}
@@ -539,7 +549,7 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 			} else {
 				failures = 0
 				snapshot := collectSystemSnapshot()
-				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.Heartbeat, snapshot.logFields())
+				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat, snapshot.logFields())
 			}
 			if failures >= cfg.HeartbeatFail {
 				select {
@@ -567,6 +577,7 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		"token":         cfg.authToken(),
 		"sncode":        cfg.Sncode,
 		"hostIp":        cfg.HostIP,
+		"wanIp":         cfg.WanIP,
 		"hostname":      cfg.Hostname,
 		"clientVersion": clientVersion,
 	}
@@ -804,6 +815,68 @@ func detectOutboundIP() string {
 		return addr.IP.String()
 	}
 	return ""
+}
+
+func detectPublicIP(timeout time.Duration) string {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	client := http.Client{Timeout: timeout}
+	for _, endpoint := range []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 128))
+		_ = resp.Body.Close()
+		if readErr != nil || resp.StatusCode >= 300 {
+			continue
+		}
+		if ip := normalizeIP(string(data)); isPublicIP(ip) {
+			return ip
+		}
+	}
+	return ""
+}
+
+func normalizeIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.Trim(value, "[]")
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func isPublicIP(value string) bool {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil {
+		return false
+	}
+	return ip.IsGlobalUnicast() &&
+		!ip.IsPrivate() &&
+		!ip.IsLoopback() &&
+		!ip.IsUnspecified() &&
+		!ip.IsLinkLocalUnicast() &&
+		!ip.IsLinkLocalMulticast() &&
+		!ip.IsMulticast()
 }
 
 func defaultStateFile(sncode string) string {

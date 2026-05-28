@@ -108,6 +108,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 		frame.SnCode,
 		conn.RemoteAddr().String(),
 		frame.HostIP,
+		frame.WanIP,
 		frame.Hostname,
 		frame.ClientVersion,
 	)

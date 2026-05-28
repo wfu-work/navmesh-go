@@ -20,6 +20,7 @@ type Frame struct {
 	DeviceGuid    string `json:"deviceGuid,omitempty"`
 	SnCode        string `json:"sncode,omitempty"`
 	HostIP        string `json:"hostIp,omitempty"`
+	WanIP         string `json:"wanIp,omitempty"`
 	Hostname      string `json:"hostname,omitempty"`
 	ClientVersion string `json:"clientVersion,omitempty"`
 	TargetHost    string `json:"targetHost,omitempty"`

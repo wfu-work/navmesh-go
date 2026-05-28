@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"net"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/wfu-work/nav-common-go-lib/global"
 	commonServices "github.com/wfu-work/nav-common-go-lib/services"
 	commonUtils "github.com/wfu-work/nav-common-go-lib/utils"
+	"github.com/wfu-work/nav-common-go-lib/utils/ip2geo"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
@@ -36,6 +38,7 @@ type RegisterDeviceRequest struct {
 	Remark        string  `json:"remark"`
 	Hostname      string  `json:"hostname"`
 	HostIP        string  `json:"hostIp"`
+	WanIP         string  `json:"wanIp"`
 	ClientVersion string  `json:"clientVersion"`
 	OS            string  `json:"os"`
 	OSVersion     string  `json:"osVersion"`
@@ -60,6 +63,7 @@ type HeartbeatRequest struct {
 	SnCode        string  `json:"sncode"`
 	Guid          string  `json:"guid"`
 	HostIP        string  `json:"hostIp"`
+	WanIP         string  `json:"wanIp"`
 	Hostname      string  `json:"hostname"`
 	ClientVersion string  `json:"clientVersion"`
 	OS            string  `json:"os"`
@@ -90,6 +94,7 @@ type DeviceRegisterResult struct {
 
 func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*DeviceRegisterResult, error) {
 	req = normalizeRegisterRequest(req)
+	sourceIP = normalizeIP(sourceIP)
 	if req.SnCode == "" {
 		return nil, errors.New("sncode required")
 	}
@@ -142,6 +147,10 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	}
 	device.Hostname = req.Hostname
 	device.HostIP = req.HostIP
+	device.WanIP = resolveDeviceWanIP(req.WanIP, sourceIP)
+	if location := resolveDeviceLocation(device.WanIP); location != "" {
+		device.Location = location
+	}
 	device.ClientVersion = req.ClientVersion
 	device.OS = req.OS
 	device.OSVersion = req.OSVersion
@@ -182,7 +191,7 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 		}
 	}
 	if !isBootstrapToken {
-		if err := s.recordHeartbeat(device.Guid, sourceIP, req.HostIP, now); err != nil {
+		if err := s.recordHeartbeat(device.Guid, sourceIP, req.HostIP, device.WanIP, device.Location, now); err != nil {
 			return nil, err
 		}
 	}
@@ -197,6 +206,7 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 }
 
 func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domains.Device, error) {
+	sourceIP = normalizeIP(sourceIP)
 	req.SnCode = strings.TrimSpace(req.SnCode)
 	req.Guid = strings.TrimSpace(req.Guid)
 	token := strings.TrimSpace(utils.FirstNonEmpty(req.Token, ""))
@@ -233,6 +243,15 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 		"last_seen_time": now,
 		"source_ip":      sourceIP,
 		"update_time":    now,
+	}
+	wanIP := resolveDeviceWanIP(req.WanIP, sourceIP)
+	location := ""
+	if wanIP != "" {
+		updates["wan_ip"] = wanIP
+		location = resolveDeviceLocation(wanIP)
+		if location != "" {
+			updates["location"] = location
+		}
 	}
 	if strings.TrimSpace(req.HostIP) != "" {
 		updates["host_ip"] = strings.TrimSpace(req.HostIP)
@@ -279,7 +298,7 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", device.Guid).Updates(updates).Error; err != nil {
 		return nil, err
 	}
-	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), now); err != nil {
+	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, now); err != nil {
 		return nil, err
 	}
 	_ = s.DB().Where("guid = ?", device.Guid).First(&device).Error
@@ -426,12 +445,13 @@ func (s DeviceService) TypeDefaults() []domains.DeviceGroup {
 	return items
 }
 
-func (s DeviceService) Authenticate(token, guid, sncode, sourceIP, hostIP, hostname, clientVersion string) (*domains.Device, error) {
+func (s DeviceService) Authenticate(token, guid, sncode, sourceIP, hostIP, wanIP, hostname, clientVersion string) (*domains.Device, error) {
 	req := HeartbeatRequest{
 		Token:         strings.TrimSpace(token),
 		Guid:          strings.TrimSpace(guid),
 		SnCode:        strings.TrimSpace(sncode),
 		HostIP:        strings.TrimSpace(hostIP),
+		WanIP:         strings.TrimSpace(wanIP),
 		Hostname:      strings.TrimSpace(hostname),
 		ClientVersion: strings.TrimSpace(clientVersion),
 	}
@@ -501,6 +521,7 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 	req.Remark = strings.TrimSpace(req.Remark)
 	req.Hostname = strings.TrimSpace(req.Hostname)
 	req.HostIP = strings.TrimSpace(req.HostIP)
+	req.WanIP = normalizeIP(req.WanIP)
 	req.ClientVersion = strings.TrimSpace(req.ClientVersion)
 	req.OS = strings.TrimSpace(req.OS)
 	req.OSVersion = strings.TrimSpace(req.OSVersion)
@@ -526,6 +547,51 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 		}
 	}
 	return req
+}
+
+func resolveDeviceWanIP(wanIP, sourceIP string) string {
+	if ip := normalizeIP(wanIP); ip != "" {
+		return ip
+	}
+	return normalizeIP(sourceIP)
+}
+
+func normalizeIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.Trim(value, "[]")
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func resolveDeviceLocation(ip string) string {
+	ip = normalizeIP(ip)
+	if ip == "" {
+		return ""
+	}
+	domestic, province, globalLocation, err := ip2geo.GetIpLocation(ip)
+	if err != nil {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	for _, value := range []string{globalLocation, province, domestic} {
+		value = strings.TrimSpace(value)
+		if value == "" || value == "0" || value == "未知" {
+			continue
+		}
+		if len(parts) == 0 || parts[len(parts)-1] != value {
+			parts = append(parts, value)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func randomToken() (string, error) {
@@ -583,11 +649,13 @@ func (s DeviceService) tokenService() DeviceTokenService {
 	return ServiceGroupApp.DeviceTokenService.WithDB(s.DB())
 }
 
-func (s DeviceService) recordHeartbeat(deviceGuid, sourceIP, hostIP string, now int64) error {
+func (s DeviceService) recordHeartbeat(deviceGuid, sourceIP, hostIP, wanIP, location string, now int64) error {
 	return s.DB().Create(&domains.DeviceHeartbeat{
 		DeviceGuid: deviceGuid,
 		SourceIP:   sourceIP,
 		HostIP:     hostIP,
+		WanIP:      wanIP,
+		Location:   location,
 		CreateTime: now,
 	}).Error
 }
