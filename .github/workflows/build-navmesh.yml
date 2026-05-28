@@ -44,7 +44,8 @@ jobs:
             archive_ext: zip
           - goos: windows
             goarch: arm64
-            runner: windows-11-arm
+            runner: ubuntu-24.04
+            cc: "zig cc -target aarch64-windows-gnu"
             ext: ".exe"
             archive_ext: zip
 
@@ -58,22 +59,49 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install Linux musl toolchain
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Setup Zig for Windows ARM64 cgo
+        if: matrix.goos == 'windows' && matrix.goarch == 'arm64'
+        uses: mlugg/setup-zig@v2
+
       - name: Build navmesh-server and navmesh-client
         env:
           CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
         shell: bash
         run: |
           mkdir -p dist
+
+          ldflags="-s -w"
+          tags=()
+          if [ "${GOOS}" = "linux" ]; then
+            export CC=musl-gcc
+            ldflags='-s -w -linkmode external -extldflags "-static"'
+            tags=(-tags "netgo osusergo")
+          fi
+          if [ "${GOOS}-${GOARCH}" = "windows-arm64" ]; then
+            export CC="${CC}"
+            export CXX="${CC}"
+          fi
+
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            "${tags[@]}" \
+            -ldflags="${ldflags}" \
             -o "dist/navmesh-server-${GOOS}-${GOARCH}${{ matrix.ext }}" \
             ./
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            "${tags[@]}" \
+            -ldflags="${ldflags}" \
             -o "dist/navmesh-client-${GOOS}-${GOARCH}${{ matrix.ext }}" \
             ./cmd/navmesh-client
 
