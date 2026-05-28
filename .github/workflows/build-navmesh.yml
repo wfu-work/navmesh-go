@@ -12,33 +12,39 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.goos }}-${{ matrix.goarch }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - goos: linux
             goarch: amd64
+            runner: ubuntu-24.04
             ext: ""
             archive_ext: tar.gz
           - goos: linux
             goarch: arm64
+            runner: ubuntu-24.04-arm
             ext: ""
             archive_ext: tar.gz
           - goos: darwin
             goarch: amd64
+            runner: macos-13
             ext: ""
             archive_ext: tar.gz
           - goos: darwin
             goarch: arm64
+            runner: macos-14
             ext: ""
             archive_ext: tar.gz
           - goos: windows
             goarch: amd64
+            runner: windows-2022
             ext: ".exe"
             archive_ext: zip
           - goos: windows
             goarch: arm64
+            runner: windows-11-arm
             ext: ".exe"
             archive_ext: zip
 
@@ -54,9 +60,10 @@ jobs:
 
       - name: Build navmesh-server and navmesh-client
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+        shell: bash
         run: |
           mkdir -p dist
           go build \
@@ -71,13 +78,25 @@ jobs:
             ./cmd/navmesh-client
 
       - name: Package binaries
+        shell: bash
         run: |
           mkdir -p release
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            cd dist
-            zip "../release/navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.zip" \
-              "navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" \
-              "navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+            python - <<'PY'
+import pathlib
+import zipfile
+
+dist = pathlib.Path("dist")
+archive = pathlib.Path("release") / "navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
+files = [
+    dist / "navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}",
+    dist / "navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}",
+]
+archive.parent.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for file in files:
+        zf.write(file, file.name)
+PY
           else
             tar -czf "release/navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
               -C dist \
