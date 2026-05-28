@@ -22,20 +22,6 @@ type RouterGroup struct {
 	TunnelRouter
 }
 
-func (r *RouterGroup) InitRouters(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
-	r.InitAccessPolicyRouter(privateGroup)
-	r.InitAuditRouter(privateGroup)
-	r.InitDeviceRouter(publicGroup, privateGroup)
-	r.InitEventRouter(privateGroup)
-	r.InitGroupRouter(privateGroup)
-	r.InitMappingRouter(privateGroup)
-	r.InitMaintenanceRouter(privateGroup)
-	r.InitSessionRouter(privateGroup)
-	r.InitSettingRouter(privateGroup)
-	r.InitSSHRouter(privateGroup)
-	r.InitTunnelRouter(privateGroup)
-}
-
 var (
 	accessPolicyApi = apis.ApiGroupApp.AccessPolicyApi
 	auditApi        = apis.ApiGroupApp.AuditApi
@@ -49,3 +35,17 @@ var (
 	sshApi          = apis.ApiGroupApp.SSHApi
 	tunnelApi       = apis.ApiGroupApp.TunnelApi
 )
+
+func (r *RouterGroup) InitRouters(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
+	r.InitAccessPolicyRouter(privateGroup)
+	r.InitAuditRouter(privateGroup)
+	r.InitDeviceRouter(publicGroup, privateGroup)
+	r.InitEventRouter(privateGroup)
+	r.InitGroupRouter(privateGroup)
+	r.InitMappingRouter(privateGroup)
+	r.InitMaintenanceRouter(privateGroup)
+	r.InitSessionRouter(privateGroup)
+	r.InitSettingRouter(privateGroup)
+	r.InitSSHRouter(privateGroup)
+	r.InitTunnelRouter(privateGroup)
+}

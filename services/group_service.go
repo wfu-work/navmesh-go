@@ -25,6 +25,7 @@ type SaveDeviceGroupRequest struct {
 	Guid           string `json:"guid"`
 	Key            string `json:"key"`
 	Name           string `json:"name"`
+	Icon           string `json:"icon"`
 	DefaultWebPort int    `json:"defaultWebPort"`
 	DefaultDomain  string `json:"defaultDomain"`
 	Sort           int    `json:"sort"`
@@ -73,6 +74,7 @@ func (s GroupService) Save(req SaveDeviceGroupRequest) (*domains.DeviceGroup, er
 	req.Guid = strings.TrimSpace(req.Guid)
 	req.Key = strings.TrimSpace(req.Key)
 	req.Name = strings.TrimSpace(req.Name)
+	req.Icon = strings.TrimSpace(req.Icon)
 	req.DefaultDomain = strings.TrimSpace(req.DefaultDomain)
 	req.Remark = strings.TrimSpace(req.Remark)
 	if req.Key == "" {
@@ -109,6 +111,7 @@ func (s GroupService) Save(req SaveDeviceGroupRequest) (*domains.DeviceGroup, er
 	}
 	row.Key = req.Key
 	row.Name = req.Name
+	row.Icon = req.Icon
 	row.DefaultWebPort = req.DefaultWebPort
 	row.DefaultDomain = req.DefaultDomain
 	row.Sort = req.Sort
@@ -181,10 +184,23 @@ func (s GroupService) SeedDefaults() {
 		item.UpdateTime = now
 		_ = s.Create(item)
 	}
+	s.backfillGroupIcons()
 }
 
 func (s GroupService) backfillGroupKeys() {
 	_ = s.DB().Model(&domains.DeviceGroup{}).Where("group_key = '' OR group_key IS NULL").Update("group_key", gorm.Expr("guid")).Error
+}
+
+func (s GroupService) backfillGroupIcons() {
+	now := domains.NowMilli()
+	for _, item := range defaultDeviceGroups {
+		if strings.TrimSpace(item.Icon) == "" {
+			continue
+		}
+		_ = s.DB().Model(&domains.DeviceGroup{}).
+			Where("(group_key = ? OR guid = ?) AND (icon = '' OR icon IS NULL)", item.Key, item.Guid).
+			Updates(map[string]any{"icon": item.Icon, "update_time": now}).Error
+	}
 }
 
 func (s GroupService) ensureKeyAvailable(key string, currentGuid string) error {

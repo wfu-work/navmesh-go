@@ -2,12 +2,16 @@ package inits
 
 import (
 	"context"
+	_ "embed"
+	"fmt"
 	"navmesh-go/domains"
 	"navmesh-go/httpgateway"
 	"navmesh-go/routers"
 	"navmesh-go/services"
 	"navmesh-go/sshgateway"
 	"navmesh-go/tunnel"
+	"navmesh-go/utils"
+	"navmesh-go/webs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +29,14 @@ var httpMappingServer *httpgateway.Server
 var maintenanceCancel context.CancelFunc
 var deviceOfflineCancel context.CancelFunc
 
+//go:embed config.yaml
+var defaultConfig []byte
+
 func Init() {
+	if err := utils.NewDefaultConfigManager(defaultConfig).Ensure(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "prepare config failed: %v\n", err)
+		os.Exit(1)
+	}
 	sysInit := commonInits.SysInit{}
 	sysInit.OnTableInit(registerTables)
 	sysInit.OnRouterInit(func(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
@@ -33,6 +44,9 @@ func Init() {
 	})
 	sysInit.OnOtherInit(startBackgroundServers)
 	sysInit.OnShutInit(stopBackgroundServers)
+	sysInit.OnWebInit(func(router *gin.Engine) {
+		_ = webs.InitStatic(router)
+	})
 	sysInit.Init()
 }
 

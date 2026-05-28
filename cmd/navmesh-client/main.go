@@ -31,7 +31,7 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
-const clientVersion = "v0.1.0"
+const clientVersion = "v0.0.1"
 
 type clientConfig struct {
 	Server         string
@@ -146,7 +146,7 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.DeviceToken, "deviceToken", "", "设备独立 Token；状态文件丢失时可由管理端重新生成后填入")
 	flag.StringVar(&cfg.StateFile, "stateFile", "", "客户端状态文件路径，默认 /var/lib/navmesh-client/<sncode>.json，无法写入时回退当前目录")
 	flag.StringVar(&cfg.Sncode, "sncode", "MAC001", "设备 SN 编码，全局唯一")
-	flag.StringVar(&cfg.DeviceType, "type", "ssh", "设备类型")
+	flag.StringVar(&cfg.DeviceType, "type", "rain", "设备类型")
 	flag.StringVar(&cfg.Alias, "alias", "MacAir笔记本电脑", "设备别名，默认使用 sncode")
 	flag.StringVar(&cfg.Remark, "remark", "Mac Wfu测试设备", "设备备注")
 	flag.IntVar(&cfg.SSHPort, "sshPort", 22, "本机 SSH 服务端口")

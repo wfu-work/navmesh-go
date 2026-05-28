@@ -6,6 +6,7 @@ type DeviceGroup struct {
 	commonDomains.BaseDataEntity
 	Key            string `json:"key" gorm:"column:group_key;size:64;uniqueIndex;comment:唯一标识"`
 	Name           string `json:"name" gorm:"size:128;comment:分组名称"`
+	Icon           string `json:"icon" gorm:"size:64;comment:图标"`
 	DefaultWebPort int    `json:"defaultWebPort" gorm:"comment:默认 Web 端口"`
 	DefaultDomain  string `json:"defaultDomain" gorm:"size:255;comment:默认映射域名"`
 	Sort           int    `json:"sort" gorm:"index;comment:排序"`
