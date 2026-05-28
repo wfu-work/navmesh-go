@@ -160,7 +160,7 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	services.DefaultSessionRegistry.RegisterSession(session.Guid, client, upstream)
 	defer services.DefaultSessionRegistry.UnregisterSession(session.Guid)
 
-	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(client, "HTTP/1.0 200 Connection established\r\nProxy-agent: navmesh\r\n\r\n"); err != nil {
 		markSessionClosed(session.Guid, 0, 0, "write_connect_response_failed: "+err.Error())
 		return
 	}
