@@ -439,32 +439,34 @@ sqlite:
 navmesh:
   data-dir: ./data/navmesh
   heartbeat-timeout: 90s
-  session-idle-timeout: 30m
-  audit-retention-days: 90
   device-register-token: "navfirst@2020"
-  default-target-host: "127.0.0.1"
-  default-target-port: 22
 ```
 
 管理页面可配置项写入 `settings` 表，初期建议包括：
 
 | 配置项 | 示例值 | 说明 |
 | --- | --- | --- |
-| `public_domain` | `navfirst.com` | 系统主域名 |
 | `ssh_gateway_domain` | `ssh.navfirst.com` | SSH 网关域名 |
-| `http_mapping_domain` | `qx.navfirst.com` | 系统默认 HTTP 映射域 |
 | `ssh_listen` | `:22` | SSH Gateway 生产监听地址 |
+| `ssh_enabled` | `true` | 是否启动 SSH Gateway |
 | `http_listen` | `:8080` | HTTP Gateway 监听地址，Caddy 反代到这里 |
-| `https_listen` | `:8443` | 可选 HTTPS Gateway 监听地址，使用 Caddy 时可关闭 |
+| `http_mapping_enabled` | `true` | 是否启动 HTTP 映射网关 |
 | `tunnel_listen` | `:3008` | QUIC 隧道监听地址 |
-| `allow_custom_domain` | `true` | 是否允许用户绑定自定义域名 |
-| `default_ssh_port` | `22` | 默认设备本机 SSH 端口 |
+| `tunnel_enabled` | `true` | 是否启动 QUIC 隧道服务 |
+| `device_register_token` | `navfirst@2020` | 设备首次注册使用的全局 Token |
 | `device_heartbeat_timeout` | `90s` | 设备超过该时间没有心跳/隧道活动后自动标记离线 |
 | `device_offline_check_interval` | `30s` | 后台离线状态扫描间隔 |
 | `session_idle_timeout` | `30m` | 会话空闲超时 |
 | `max_concurrent_sessions` | `0` | 全局最大并发会话数，`0` 表示不限制 |
 | `max_device_sessions` | `0` | 单设备最大并发会话数，`0` 表示不限制 |
 | `rate_limit_per_minute` | `0` | 单来源 IP 每分钟最大新建会话数，`0` 表示不限制 |
+| `retention_cleanup_enabled` | `true` | 是否启用后台保留策略清理 |
+| `retention_cleanup_interval` | `24h` | 后台保留策略清理间隔 |
+| `audit_retention_days` | `90` | 审计日志保留天数 |
+| `http_access_retention_days` | `30` | HTTP 访问日志保留天数 |
+| `session_retention_days` | `90` | 隧道会话保留天数 |
+| `heartbeat_retention_days` | `7` | 设备心跳保留天数 |
+| `device_connection_retention_days` | `30` | 设备连接记录保留天数 |
 
 这些配置需要支持页面修改、保存、审计和必要的服务重载。监听端口类配置修改后，第一版可以要求重启服务生效；域名、默认映射域、自定义域名开关等配置应尽量运行期生效。
 
@@ -789,7 +791,7 @@ WantedBy=multi-user.target
 - 服务启动：`main.go` 调用 `inits.Init()`，通过 `nav-common-go-lib/inits.SysInit` 读取 `config.yaml`、初始化日志、SQLite、系统表和 Gin HTTP 服务。
 - 基础配置：`config.yaml` 只保留服务启动必需配置，域名、监听地址、默认映射域等运行期配置写入 `navmesh_settings`。
 - 自动建表：已创建设备、设备 Token、连接、心跳、SSH 入口、端口映射、自定义域名、会话、HTTP 访问日志、事件、审计、settings 等业务表；用户、角色、登录等系统表由 `nav-common-go-lib` 初始化。
-- 默认 settings：初始化 `public_domain`、`ssh_gateway_domain`、`http_mapping_domain`、`ssh_listen`、`tunnel_listen`、`device_register_token` 等配置项。
+- 默认 settings：初始化 `ssh_gateway_domain`、`ssh_listen`、`http_listen`、`tunnel_listen`、`device_register_token` 等配置项。
 - 设备注册：`POST /api/device/register`，支持 `sncode`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、`groupGuid`、`tags` 入库。
 - 设备类型：启动时初始化默认 `DeviceGroup` 数据，注册时从 `navmesh_device_groups` 读取启用状态、默认 Web 端口和默认域名，不再使用代码硬编码列表。
 - Token 校验：首次注册阶段使用 `device_register_token`，注册成功后服务端生成设备独立 Token 并返回给客户端；此时设备状态为 `registered`，表示已登记但未激活。已存在设备如果已有独立 Token，将拒绝继续使用全局注册 Token 接入。
@@ -809,7 +811,7 @@ WantedBy=multi-user.target
 - 隧道调试接口：`GET /api/tunnel/connections` 查询当前在线隧道连接。
 - SSH Gateway：已实现透明 TCP SSH Proxy，服务端不终止 SSH 协议、不保存 SSH 密码，用户最终仍由设备本机 SSHD 完成认证。
 - SSH 路由：根据 TCP 连接的本地目标 IP 查询 `navmesh_ssh_aliases` / `navmesh_ssh_entrypoints`，找到对应设备后通过 QUIC 隧道打开设备本机 `127.0.0.1:<sshPort>`。
-- SSH 自动映射：设备注册成功后自动创建或更新 `navmesh_ssh_aliases`，域名默认是 `<alias>.<public_domain>`；如果 `navmesh_ssh_entrypoints` 中存在可用未绑定入口 IP，会自动绑定到该设备。即使设备仍是未激活 `registered` 状态，也会提前生成 SSH 映射，等设备拿专属 Token 建立 QUIC 隧道后即可远程连接。
+- SSH 自动映射：设备注册成功后自动创建或更新 `navmesh_ssh_aliases`，域名默认是 `<alias>.<ssh_gateway_domain>`；如果 `navmesh_ssh_entrypoints` 中存在可用未绑定入口 IP，会自动绑定到该设备。即使设备仍是未激活 `registered` 状态，也会提前生成 SSH 映射，等设备拿专属 Token 建立 QUIC 隧道后即可远程连接。
 - SSH 会话记录：建立 SSH 转发时写入 `navmesh_tunnel_sessions`，结束时记录字节数、结束时间和断开原因。
 - SSH 管理接口：`GET /api/ssh-entrypoints/list`、`POST /api/ssh-entrypoints`、`GET /api/ssh-aliases/list`、`POST /api/ssh-aliases`、`DELETE /api/ssh-aliases/:guid`。
 - SSH 启动配置：根据 `navmesh_settings.ssh_enabled` 和 `navmesh_settings.ssh_listen` 启动 SSH Gateway，生产默认 `:22`。
