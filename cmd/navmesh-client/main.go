@@ -563,12 +563,52 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 }
 
 func sendHeartbeat(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
-	stream, err := conn.OpenStreamSync(ctx)
+	timeout := heartbeatRoundTripTimeout(cfg)
+	hbCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	stream, err := conn.OpenStreamSync(hbCtx)
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
-	return writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeHeartbeat, SnCode: cfg.Sncode})
+	_ = stream.SetDeadline(time.Now().Add(timeout))
+
+	requestID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeHeartbeat, SnCode: cfg.Sncode, RequestID: requestID}); err != nil {
+		return err
+	}
+	ack, err := readFrame(stream)
+	if err != nil {
+		return err
+	}
+	if ack.Type != tunnel.FrameTypePong || !ack.OK {
+		return fmt.Errorf("heartbeat rejected: type=%s ok=%t message=%s", ack.Type, ack.OK, ack.Message)
+	}
+	if ack.RequestID != "" && ack.RequestID != requestID {
+		return fmt.Errorf("heartbeat response request mismatch: want=%s got=%s", requestID, ack.RequestID)
+	}
+	return nil
+}
+
+func heartbeatRoundTripTimeout(cfg clientConfig) time.Duration {
+	timeout := cfg.RequestTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	if cfg.Heartbeat > 0 {
+		limit := cfg.Heartbeat / 2
+		if limit <= 0 {
+			limit = cfg.Heartbeat
+		}
+		if timeout > limit {
+			timeout = limit
+		}
+	}
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
 }
 
 func postHeartbeat(ctx context.Context, cfg clientConfig) error {
