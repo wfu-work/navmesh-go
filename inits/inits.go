@@ -109,8 +109,8 @@ func ensureDataDirs() error {
 func seedDefaultSettings() {
 	defaults := map[string]string{
 		"public_domain":                    "navfirst.com",
-		"ssh_gateway_domain":               "ssh.navfirst.com",
-		"http_mapping_domain":              "http.navfirst.com",
+		"ssh_gateway_domain":               "sshd.navfirst.com",
+		"http_mapping_domain":              "httpd.navfirst.com",
 		"ssh_listen":                       ":22",
 		"ssh_enabled":                      "true",
 		"http_listen":                      ":8080",
