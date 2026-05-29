@@ -1,8 +1,8 @@
 package httpgateway
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"html/template"
 	"io"
 	"net"
@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"navmesh-go/domains"
@@ -22,9 +23,10 @@ import (
 )
 
 type Server struct {
-	addr    string
-	server  *http.Server
-	manager *tunnel.Manager
+	addr      string
+	server    *http.Server
+	manager   *tunnel.Manager
+	transport *http.Transport
 }
 
 func NewServer(addr string, manager *tunnel.Manager) *Server {
@@ -35,6 +37,7 @@ func NewServer(addr string, manager *tunnel.Manager) *Server {
 		manager = tunnel.DefaultManager
 	}
 	s := &Server{addr: addr, manager: manager}
+	s.transport = newTunnelHTTPTransport(manager)
 	s.server = &http.Server{
 		Addr:         addr,
 		Handler:      s,
@@ -55,6 +58,9 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop(ctx context.Context) {
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
 	if s.server != nil {
 		_ = s.server.Shutdown(ctx)
 	}
@@ -118,13 +124,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer services.DefaultRuntimePolicy.Release(permit)
-	proxy := newHTTPReverseProxy(s.manager, mapping, device, host, r.RemoteAddr, requestPath, r.Method, start, bytesIn)
+	proxy := newHTTPReverseProxy(s.transport, mapping, device, host, r.RemoteAddr)
 	proxy.ServeHTTP(w, r)
 }
 
 func sanitizeHopByHopRequestHeaders(header http.Header) {
 	removeHopByHopHeaders(header)
-	header.Set("Connection", "close")
 }
 
 func removeHopByHopHeaders(header http.Header) {
@@ -147,34 +152,23 @@ type httpReverseProxy struct {
 	proxy *httputil.ReverseProxy
 }
 
-func newHTTPReverseProxy(manager *tunnel.Manager, mapping domains.PortMapping, device domains.Device, host, remoteAddr, requestPath, method string, start time.Time, bytesIn int64) *httpReverseProxy {
-	tracker := &httpMappingTracker{
-		manager:     manager,
-		mapping:     mapping,
-		device:      device,
-		host:        host,
-		remoteAddr:  remoteAddr,
-		requestPath: requestPath,
-		method:      method,
-		start:       start,
-		bytesIn:     bytesIn,
-	}
-	targetHostPort := net.JoinHostPort(mapping.TargetHost, intToString(mapping.TargetPort))
+func newHTTPReverseProxy(transport *http.Transport, mapping domains.PortMapping, device domains.Device, host, remoteAddr string) *httpReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"
-			req.URL.Host = targetHostPort
+			req.URL.Host = proxyPoolHost(mapping)
 			req.Host = mapping.PublicHost
-			req.Close = true
+			req.Close = false
 			sanitizeHopByHopRequestHeaders(req.Header)
 		},
-		Transport: tracker,
-		ModifyResponse: func(resp *http.Response) error {
-			tracker.statusCode = resp.StatusCode
-			return nil
+		Transport: &httpMappingRoundTripper{
+			base:       transport,
+			mapping:    mapping,
+			device:     device,
+			host:       host,
+			remoteAddr: remoteAddr,
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
-			tracker.fail("proxy_error: " + err.Error())
 			title := "目标服务暂时不可用"
 			subtitle := "网关暂时无法连接现场设备的目标服务。"
 			hint := "请稍后刷新重试；如果持续出现，请检查设备客户端和本地 Web 服务是否正常运行。"
@@ -202,6 +196,255 @@ func newHTTPReverseProxy(manager *tunnel.Manager, mapping domains.PortMapping, d
 func (p *httpReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.proxy.ServeHTTP(w, r)
 }
+
+type httpMappingContextKey struct{}
+
+type httpMappingContext struct {
+	Mapping    domains.PortMapping
+	Device     domains.Device
+	Host       string
+	RemoteAddr string
+}
+
+type httpMappingRoundTripper struct {
+	base       http.RoundTripper
+	mapping    domains.PortMapping
+	device     domains.Device
+	host       string
+	remoteAddr string
+}
+
+func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	requestPath := req.URL.RequestURI()
+	requestMethod := req.Method
+	source := sourceIP(rt.remoteAddr)
+	var bytesIn int64
+	var bytesOut int64
+	statusCode := 0
+	finishOnce := sync.Once{}
+	finish := func(reason string) {
+		finishOnce.Do(func() {
+			writeAccessLog(mappingLogInput{
+				Mapping:      rt.mapping,
+				Device:       rt.device,
+				Host:         rt.host,
+				Method:       requestMethod,
+				Path:         requestPath,
+				SourceIP:     source,
+				StatusCode:   statusCodeOrDefault(statusCode),
+				DurationMs:   time.Since(start).Milliseconds(),
+				BytesIn:      bytesIn,
+				BytesOut:     atomic.LoadInt64(&bytesOut),
+				ErrorMessage: strings.TrimSpace(reason),
+			})
+		})
+	}
+	if req.Body != nil && req.Body != http.NoBody {
+		req.Body = &countingReadCloser{
+			ReadCloser: req.Body,
+			onRead: func(n int) {
+				atomic.AddInt64(&bytesIn, int64(n))
+			},
+		}
+	}
+	ctx := context.WithValue(req.Context(), httpMappingContextKey{}, httpMappingContext{
+		Mapping:    rt.mapping,
+		Device:     rt.device,
+		Host:       rt.host,
+		RemoteAddr: rt.remoteAddr,
+	})
+	req = req.WithContext(ctx)
+	resp, err := rt.base.RoundTrip(req)
+	if err != nil {
+		finish("proxy_error: " + err.Error())
+		var dialErr *tunnelDialError
+		if errors.As(err, &dialErr) {
+			recordHTTPGatewayOpenFailed(rt.device.Guid, dialErr.Unwrap())
+		}
+		return nil, err
+	}
+	statusCode = resp.StatusCode
+	if resp.Body == nil {
+		finish("closed")
+		return resp, nil
+	}
+	resp.Body = &countingResponseBody{
+		ReadCloser: resp.Body,
+		onRead: func(n int) {
+			atomic.AddInt64(&bytesOut, int64(n))
+		},
+		onClose: func() {
+			finish("closed")
+		},
+	}
+	return resp, nil
+}
+
+func newTunnelHTTPTransport(manager *tunnel.Manager) *http.Transport {
+	if manager == nil {
+		manager = tunnel.DefaultManager
+	}
+	return &http.Transport{
+		Proxy:                 nil,
+		DialContext:           tunnelDialContext(manager),
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   64,
+		MaxConnsPerHost:       128,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		DisableCompression:    false,
+	}
+}
+
+func tunnelDialContext(manager *tunnel.Manager) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		info, ok := ctx.Value(httpMappingContextKey{}).(httpMappingContext)
+		if !ok {
+			return nil, net.InvalidAddrError("missing http mapping context")
+		}
+		streamCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		upstream, err := manager.OpenTCPStream(streamCtx, info.Device.Guid, info.Mapping.TargetHost, info.Mapping.TargetPort)
+		if err != nil {
+			return nil, &tunnelDialError{err: err}
+		}
+		session := createHTTPSession(info.Mapping, info.Device, info.Host, sourceIP(info.RemoteAddr))
+		conn := &tunnelHTTPConn{
+			ReadWriteCloser: upstream,
+			sessionGuid:     session.Guid,
+			sourceIP:        sourceIP(info.RemoteAddr),
+		}
+		applyIdleDeadline(conn, services.DefaultRuntimePolicy.IdleTimeout())
+		services.DefaultSessionRegistry.RegisterSession(session.Guid, conn)
+		return conn, nil
+	}
+}
+
+func proxyPoolHost(mapping domains.PortMapping) string {
+	key := strings.TrimSpace(mapping.Guid)
+	if key == "" {
+		key = strings.TrimSpace(mapping.PublicHost)
+	}
+	if key == "" {
+		key = strings.TrimSpace(mapping.DeviceGuid)
+	}
+	if key == "" {
+		key = "mapping"
+	}
+	return net.JoinHostPort(key+".navmesh-http.local", intToString(mapping.TargetPort))
+}
+
+type tunnelDialError struct {
+	err error
+}
+
+func (e *tunnelDialError) Error() string {
+	if e == nil || e.err == nil {
+		return "open tunnel tcp stream failed"
+	}
+	return e.err.Error()
+}
+
+func (e *tunnelDialError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func recordHTTPGatewayOpenFailed(deviceGuid string, err error) {
+	if err == nil {
+		return
+	}
+	services.ServiceGroupApp.EventService.Record(services.EventInput{
+		DeviceGuid: deviceGuid,
+		EventType:  "open_tcp_failed",
+		Level:      "error",
+		Title:      "open http target failed",
+		Message:    err.Error(),
+	})
+}
+
+type tunnelHTTPConn struct {
+	io.ReadWriteCloser
+	sessionGuid string
+	sourceIP    string
+	bytesIn     atomic.Int64
+	bytesOut    atomic.Int64
+	closed      atomic.Bool
+}
+
+func (c *tunnelHTTPConn) Read(p []byte) (int, error) {
+	n, err := c.ReadWriteCloser.Read(p)
+	if n > 0 {
+		c.bytesOut.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *tunnelHTTPConn) Write(p []byte) (int, error) {
+	n, err := c.ReadWriteCloser.Write(p)
+	if n > 0 {
+		c.bytesIn.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *tunnelHTTPConn) Close() error {
+	if c.closed.Swap(true) {
+		return nil
+	}
+	reason := "closed"
+	if isForceClosed(c.sessionGuid) {
+		reason = "closed_by_admin"
+	}
+	if c.sessionGuid != "" {
+		services.DefaultSessionRegistry.UnregisterSession(c.sessionGuid)
+		closeHTTPSession(c.sessionGuid, c.bytesIn.Load(), c.bytesOut.Load(), reason)
+	}
+	return c.ReadWriteCloser.Close()
+}
+
+func (c *tunnelHTTPConn) LocalAddr() net.Addr {
+	return tunnelHTTPAddr("navmesh-http-gateway")
+}
+
+func (c *tunnelHTTPConn) RemoteAddr() net.Addr {
+	if strings.TrimSpace(c.sourceIP) != "" {
+		return tunnelHTTPAddr(c.sourceIP)
+	}
+	return tunnelHTTPAddr("navmesh-device")
+}
+
+func (c *tunnelHTTPConn) SetDeadline(t time.Time) error {
+	if deadliner, ok := c.ReadWriteCloser.(interface{ SetDeadline(time.Time) error }); ok {
+		return deadliner.SetDeadline(t)
+	}
+	return nil
+}
+
+func (c *tunnelHTTPConn) SetReadDeadline(t time.Time) error {
+	if deadliner, ok := c.ReadWriteCloser.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return deadliner.SetReadDeadline(t)
+	}
+	return c.SetDeadline(t)
+}
+
+func (c *tunnelHTTPConn) SetWriteDeadline(t time.Time) error {
+	if deadliner, ok := c.ReadWriteCloser.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return deadliner.SetWriteDeadline(t)
+	}
+	return c.SetDeadline(t)
+}
+
+type tunnelHTTPAddr string
+
+func (a tunnelHTTPAddr) Network() string { return "navmesh-tunnel" }
+
+func (a tunnelHTTPAddr) String() string { return string(a) }
 
 type gatewayErrorPage struct {
 	StatusCode  int
@@ -399,120 +642,6 @@ func displayMappingName(mapping domains.PortMapping) string {
 		return value
 	}
 	return strings.TrimSpace(mapping.PublicHost)
-}
-
-type httpMappingTracker struct {
-	manager     *tunnel.Manager
-	mapping     domains.PortMapping
-	device      domains.Device
-	host        string
-	remoteAddr  string
-	requestPath string
-	method      string
-	start       time.Time
-	bytesIn     int64
-	bytesOut    int64
-	statusCode  int
-	upstream    io.Closer
-	sessionGuid string
-	once        sync.Once
-}
-
-func (t *httpMappingTracker) RoundTrip(req *http.Request) (*http.Response, error) {
-	streamCtx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
-	defer cancel()
-	upstream, err := t.manager.OpenTCPStream(streamCtx, t.device.Guid, t.mapping.TargetHost, t.mapping.TargetPort)
-	if err != nil {
-		t.fail(err.Error())
-		services.ServiceGroupApp.EventService.Record(services.EventInput{
-			DeviceGuid: t.device.Guid,
-			EventType:  "open_tcp_failed",
-			Level:      "error",
-			Title:      "open http target failed",
-			Message:    err.Error(),
-		})
-		return nil, err
-	}
-	t.upstream = upstream
-	applyIdleDeadline(upstream, services.DefaultRuntimePolicy.IdleTimeout())
-	session := createHTTPSession(t.mapping, t.device, t.requestPath, sourceIP(t.remoteAddr))
-	t.sessionGuid = session.Guid
-	services.DefaultSessionRegistry.RegisterSession(session.Guid, upstream)
-
-	reqBody := req.Body
-	if reqBody != nil && reqBody != http.NoBody {
-		req.Body = &countingReadCloser{
-			ReadCloser: reqBody,
-			onRead: func(n int) {
-				t.bytesIn += int64(n)
-			},
-		}
-	}
-	sanitizeHopByHopRequestHeaders(req.Header)
-	req.Close = true
-	req.URL.Scheme = "http"
-	req.URL.Host = net.JoinHostPort(t.mapping.TargetHost, intToString(t.mapping.TargetPort))
-	req.Host = t.mapping.PublicHost
-
-	if err := req.Write(upstream); err != nil {
-		t.fail("write_upstream_failed: " + err.Error())
-		return nil, err
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
-	if err != nil {
-		t.fail("read_upstream_failed: " + err.Error())
-		return nil, err
-	}
-	resp.Body = &countingResponseBody{
-		ReadCloser: resp.Body,
-		onRead: func(n int) {
-			t.bytesOut += int64(n)
-		},
-		onClose: func() {
-			t.statusCode = resp.StatusCode
-			reason := "closed"
-			if isForceClosed(t.sessionGuid) {
-				reason = "closed_by_admin"
-			}
-			t.finish(reason)
-		},
-	}
-	if t.statusCode == 0 {
-		t.statusCode = resp.StatusCode
-	}
-	return resp, nil
-}
-
-func (t *httpMappingTracker) fail(reason string) {
-	t.finish(reason)
-}
-
-func (t *httpMappingTracker) finish(reason string) {
-	if t == nil {
-		return
-	}
-	t.once.Do(func() {
-		if t.upstream != nil {
-			_ = t.upstream.Close()
-		}
-		if t.sessionGuid != "" {
-			services.DefaultSessionRegistry.UnregisterSession(t.sessionGuid)
-			closeHTTPSession(t.sessionGuid, t.bytesIn, t.bytesOut, reason)
-		}
-		writeAccessLog(mappingLogInput{
-			Mapping:      t.mapping,
-			Device:       t.device,
-			Host:         t.host,
-			Method:       t.method,
-			Path:         t.requestPath,
-			SourceIP:     sourceIP(t.remoteAddr),
-			StatusCode:   statusCodeOrDefault(t.statusCode),
-			DurationMs:   time.Since(t.start).Milliseconds(),
-			BytesIn:      t.bytesIn,
-			BytesOut:     t.bytesOut,
-			ErrorMessage: strings.TrimSpace(reason),
-		})
-	})
 }
 
 func statusCodeOrDefault(value int) int {
