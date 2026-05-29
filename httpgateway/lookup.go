@@ -3,6 +3,7 @@ package httpgateway
 import (
 	"errors"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -40,6 +41,73 @@ func sourceIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+func requestSourceIP(r *http.Request) string {
+	remote := sourceIP(r.RemoteAddr)
+	if !trustedForwardedSource(remote) {
+		return remote
+	}
+	for _, header := range []string{"CF-Connecting-IP", "True-Client-IP", "X-Real-IP"} {
+		if ip := firstHeaderIP(r.Header.Get(header)); ip != "" {
+			return ip
+		}
+	}
+	if ip := firstHeaderIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+		return ip
+	}
+	if ip := firstForwardedForIP(r.Header.Get("Forwarded")); ip != "" {
+		return ip
+	}
+	return remote
+}
+
+func trustedForwardedSource(remote string) bool {
+	ip := net.ParseIP(strings.TrimSpace(remote))
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+func firstHeaderIP(value string) string {
+	for _, item := range strings.Split(value, ",") {
+		if ip := normalizeHeaderIP(item); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+func firstForwardedForIP(value string) string {
+	for _, group := range strings.Split(value, ",") {
+		for _, part := range strings.Split(group, ";") {
+			key, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "for") {
+				continue
+			}
+			if ip := normalizeHeaderIP(raw); ip != "" {
+				return ip
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeHeaderIP(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), `"`)
+	if value == "" || strings.EqualFold(value, "unknown") {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.Trim(value, "[]")
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 func intToString(value int) string {

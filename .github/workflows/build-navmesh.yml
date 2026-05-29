@@ -21,33 +21,27 @@ jobs:
             goarch: amd64
             runner: ubuntu-24.04
             ext: ""
-            archive_ext: tar.gz
           - goos: linux
             goarch: arm64
             runner: ubuntu-24.04-arm
             ext: ""
-            archive_ext: tar.gz
           - goos: darwin
             goarch: amd64
             runner: macos-13
             ext: ""
-            archive_ext: tar.gz
           - goos: darwin
             goarch: arm64
             runner: macos-14
             ext: ""
-            archive_ext: tar.gz
           - goos: windows
             goarch: amd64
             runner: windows-2022
             ext: ".exe"
-            archive_ext: zip
           - goos: windows
             goarch: arm64
             runner: ubuntu-24.04
             cc: "zig cc -target aarch64-windows-gnu"
             ext: ".exe"
-            archive_ext: zip
 
     steps:
       - name: Checkout
@@ -105,24 +99,13 @@ jobs:
             -o "dist/navmesh-client-${GOOS}-${GOARCH}${{ matrix.ext }}" \
             ./cmd/navmesh-client
 
-      - name: Package binaries
-        shell: bash
-        run: |
-          mkdir -p release
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            python -c 'import pathlib, zipfile; dist = pathlib.Path("dist"); archive = pathlib.Path("release") / "navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.zip"; files = [dist / "navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}", dist / "navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"]; archive.parent.mkdir(parents=True, exist_ok=True); zf = zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED); [zf.write(file, file.name) for file in files]; zf.close()'
-          else
-            tar -czf "release/navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
-              -C dist \
-              "navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}" \
-              "navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}"
-          fi
-
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: navmesh-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: release/navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive_ext }}
+          path: |
+            dist/navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            dist/navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
           archive: false
 
@@ -130,5 +113,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: release/navmesh-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive_ext }}
+          files: |
+            dist/navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            dist/navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           overwrite_files: true

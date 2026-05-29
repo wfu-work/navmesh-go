@@ -5,11 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-StateDirectory=navmesh-client
-ExecStart=navmesh-client -api https://navmesh.navfirst.com -server navmesh.navfirst.com -port 3008 -token navfirst@2020 -sncode WHQX02 -type rain -sshPort 22 -webPort 8889 -webDomain whqx02.httpd.navfirst.com -alias 武汉八分山气象站  -remark 武汉八分山北斗降雨测试
-WorkingDirectory=/mnt/navfirst/navmesh
+WorkingDirectory=/opt/navmesh
+ExecStart=/opt/navmesh/navmesh-client -api https://navmesh.navfirst.com -server navmesh.navfirst.com -port 3008 -token navfirst@2020
 Restart=always
-RestartSec=10
+RestartSec=5
 LimitNOFILE=65535
 
 [Install]

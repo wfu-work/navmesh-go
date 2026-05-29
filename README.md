@@ -137,11 +137,11 @@ Go SSH Gateway 根据本地目标 IP 2400:xxxx::1001 找到设备 test01
 
 设备侧组件首次启动后：
 
-- 使用命令行参数中的 `-server`、`-port`、`-token` 连接中心服务。
-- 上报设备信息，例如 `-sncode`、`-type`、本机 IP 和客户端版本。
-- 绑定或申请设备别名，默认使用 `-sncode`，例如 `test01`。
-- 填写设备备注，例如 `-remark 深圳工厂1号测试网关`。
+- 使用命令行参数中的 `-server`、`-api`、`-port`、`-token` 连接中心服务。
+- 首次可只传全局注册 Token，客户端自动生成 `sncode`，并上报设备类型、本机 IP、外网 IP、主机名和客户端版本。
+- `sncode`、`alias`、`remark`、`type` 都可在管理端在线修改，设备侧不要求手动填写。
 - 服务端保存设备 GUID、别名、Token 状态和最近在线时间。
+- 使用全局注册 Token 进来的设备处于未激活状态；拿管理端生成的设备专属 Token 接入后，才进入激活在线状态。
 
 ### 2. 设备保持反向隧道
 
@@ -560,18 +560,17 @@ Go Gateway 监听这些入口地址的 22 端口，并通过连接的本地目�
 └── README.md
 ```
 
-后续如果在同仓库提供服务端和设备侧连接组件，可以增加：
+同仓库同时提供服务端和设备侧连接组件：
 
 ```text
 cmd/
-├── server/
-└── client/
+└── navmesh-client/
 ```
 
 其中：
 
-- `cmd/server`：中心服务，包含管理 API、隧道入口、SSH 网关。
-- `cmd/client`：设备侧连接组件，负责主动连接中心并桥接本机 SSHD。
+- 根目录服务端：中心服务，包含管理 API、隧道入口、SSH 网关和 HTTP 映射网关。
+- `cmd/navmesh-client`：设备侧连接组件，负责主动连接中心并桥接本机 SSHD 和本机 Web 服务。
 
 ## 开发流程
 
@@ -624,42 +623,51 @@ make build
 - 连接本机自定义服务，例如 `127.0.0.1:7090`。
 - 在中心网关和设备本地服务之间转发 TCP 流。
 
-推荐 Linux 安装目录：
+推荐 Linux 一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wfu-work/navmesh-go/main/deploy/install-client.sh | sudo sh -s -- \
+  --server navmesh.navfirst.com \
+  --api https://navmesh.navfirst.com \
+  --token navfirst@2020
+```
+
+默认 Linux 安装目录：
 
 ```text
-/usr/local/bin/navmesh-client              # 设备侧连接组件
-/var/lib/navmesh-client/                   # 本地状态、设备 ID
-/var/log/navmesh-client/                   # 日志
+/opt/navmesh/navmesh-client                # 设备侧连接组件
+/opt/navmesh/navmesh-client.json           # 本地状态、设备独立 Token
+/usr/local/bin/navmesh-client              # 指向 /opt/navmesh/navmesh-client 的快捷软链接
 /etc/systemd/system/navmesh-client.service # systemd 服务文件
 ```
 
-边缘客户端不使用 YAML 配置文件，采用带参数启动。参数设计参考：
+边缘客户端不使用 YAML 配置文件，默认可直接用全局注册 Token 启动。`sncode`、`alias`、`remark`、`type` 都不是必填项，首次启动会自动生成稳定 `sncode` 并把设备置为未激活状态；管理端生成设备专属 Token 后，客户端保存到同级目录 `navmesh-client.json`，后续用专属 Token 接入并变为激活在线设备。
+
+手动启动参考：
 
 ```bash
 ./navmesh-client \
-  -server navpn.navfirst.com \
-  -port 8880 \
+  -server navmesh.navfirst.com \
+  -api https://navmesh.navfirst.com \
+  -port 3008 \
   -token navfirst@2020 \
-  -sncode test01 \
-  -type rain \
-  -sshPort 22 \
-  -webPort 7090 \
-  -webDomain qx.navfirst.com \
-  -remark 深圳工厂1号测试网关
+  -sshPort 22
 ```
 
 参数说明：
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `-server` | 否 | `navpn.navfirst.com` | 中心隧道服务地址 |
-| `-port` | 否 | `8880` | 中心隧道服务端口 |
+| `-server` | 否 | `navmesh.navfirst.com` | 中心隧道服务地址 |
+| `-api` | 否 | `https://navmesh.navfirst.com` | 中心管理 API 地址 |
+| `-port` | 否 | `3008` | 中心隧道服务端口 |
 | `-token` | 否 | `navfirst@2020` | 首次注册令牌；注册成功后客户端保存并改用设备独立 Token |
 | `-deviceToken` | 否 | 空 | 设备独立 Token；状态文件丢失时可由管理端重新生成后填入 |
-| `-stateFile` | 否 | `/var/lib/navmesh-client/<sncode>.json` | 保存设备独立 Token 的状态文件；无权限时回退当前目录 |
-| `-sncode` | 是 | 无 | 设备序列号，默认作为全局唯一设备别名 |
-| `-type` | 是 | `radar` | 设备类型，例如 `ssh`、`radar`、`rain`、`data` |
-| `-remark` | 否 | 空 | 中文备注，例如设备位置、用途 |
+| `-stateFile` | 否 | 程序同级目录 `navmesh-client.json` | 保存设备独立 Token 和本地设备状态 |
+| `-sncode` | 否 | 自动生成 | 设备序列号，可在管理端在线修改 |
+| `-type` | 否 | `ssh` | 设备类型，必须存在于设备组中，可在管理端在线修改 |
+| `-alias` | 否 | 空 | 设备别名，可在管理端在线修改 |
+| `-remark` | 否 | 空 | 中文备注，可在管理端在线修改 |
 | `-sshPort` | 否 | `22` | 设备本机 SSH 端口 |
 | `-webPort` | 否 | 按设备类型推导 | 设备本机 Web 服务端口 |
 | `-webDomain` | 按场景 | 按设备类型推导 | 外部 Web 映射域名，例如 `qx.navfirst.com` |
@@ -667,11 +675,10 @@ make build
 示例含义：
 
 ```text
-sncode:    test01
-type:      rain
-remark:   深圳工厂1号测试网关
-ssh:       ssh root@test01.navfirst.com
-web:       https://test01.qx.navfirst.com -> 127.0.0.1:7090
+install:   /opt/navmesh/navmesh-client
+state:     /opt/navmesh/navmesh-client.json
+ssh:       管理端自动创建 SSH 映射，设备激活后可远程连接
+web:       设置 webPort/webDomain 后可映射到设备本地 Web 服务
 ```
 
 systemd 服务示例：
@@ -684,7 +691,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/navmesh-client -server navpn.navfirst.com -port 8880 -token navfirst@2020 -sncode test01 -type rain -sshPort 22 -webPort 7090 -webDomain qx.navfirst.com -remark 深圳工厂1号测试网关
+WorkingDirectory=/opt/navmesh
+ExecStart=/opt/navmesh/navmesh-client -server navmesh.navfirst.com -api https://navmesh.navfirst.com -port 3008 -token navfirst@2020
 Restart=always
 RestartSec=10
 
@@ -692,7 +700,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-安装脚本后续只需要写入带参数的 `ExecStart`，不生成 `/etc/navmesh-client/config.yaml`。
+安装脚本只写入带参数的 `ExecStart`，不生成 `/etc/navmesh-client/config.yaml`。
 
 ## 实现顺序建议
 
@@ -864,8 +872,9 @@ HTTP mapping gateway started on :8080
 - 客户端入口：`cmd/navmesh-client/main.go`。
 - 构建命令：`make client`，输出 `./navmesh-client`。
 - 启动方式：只使用命令行参数，不读取 YAML 配置文件。
-- 注册流程：首次启动使用 `-token` 中的全局注册令牌调用 `POST /api/device/register`，上报 `sncode`、`type`、`remark`、`sshPort`、`webPort`、`webDomain`、主机名、本机 IP 和客户端版本；服务端返回设备独立 Token，并自动生成 SSH alias/入口绑定信息，此时设备仍是未激活的 `registered` 状态。
-- Token 持久化：客户端把服务端返回的设备独立 Token 保存到 `-stateFile`，默认 `/var/lib/navmesh-client/<sncode>.json`，无权限时回退当前目录隐藏文件。
+- 一键安装：`deploy/install-client.sh` 会直接下载 GitHub Release 中对应平台的裸二进制，例如 `navmesh-client-linux-amd64`，默认安装到 `/opt/navmesh/navmesh-client`，创建 `/usr/local/bin/navmesh-client` 软链接和 `navmesh-client.service`。
+- 注册流程：首次启动使用 `-token` 中的全局注册令牌调用 `POST /api/device/register`，上报自动生成或手动传入的 `sncode`、`type`、`alias`、`remark`、`sshPort`、`webPort`、`webDomain`、主机名、本机 IP、外网 IP 和客户端版本；服务端返回设备独立 Token，并自动生成 SSH alias/入口绑定信息，此时设备仍是未激活的 `registered` 状态。
+- Token 持久化：客户端把服务端返回的设备独立 Token 保存到 `-stateFile`，默认程序同级目录 `navmesh-client.json`；使用安装脚本时就是 `/opt/navmesh/navmesh-client.json`。
 - Token 恢复：如果本地 `-stateFile` 丢失，客户端可再次使用全局注册令牌注册；服务端会重置该设备的专属 Token，并把设备状态重新置为未激活 `registered`，客户端保存新 Token 后再建立隧道完成激活。
 - 隧道连接：注册后连接中心 QUIC 隧道入口，发送 `hello` 帧并使用设备独立 Token 完成校验。
 - 心跳保活：周期性发送 QUIC heartbeat，并使用设备独立 Token 调用 `POST /api/device/heartbeat` 更新设备在线状态。
@@ -882,8 +891,6 @@ HTTP mapping gateway started on :8080
   -port 3008 \
   -api https://navmesh-admin.navfirst.com \
   -token navfirst@2020 \
-  -sncode test01 \
-  -type rain \
   -sshPort 22 \
   -webPort 7090 \
   -webDomain qx.navfirst.com \
@@ -908,8 +915,8 @@ HTTP mapping gateway started on :8080
 本地联调已验证：
 
 ```bash
-./navmesh-client -server 127.0.0.1 -port 3008 -api http://127.0.0.1:3007 -token navfirst@2020 -sncode test-client-01 -type ssh -remark 本地联调设备
+./navmesh-client -server 127.0.0.1 -port 3008 -api http://127.0.0.1:3007 -token navfirst@2020
 GET /api/tunnel/connections
 ```
 
-下一步建议进入联调完善阶段：补充真实 SSHD 和本地 Web 服务端到端测试脚本、客户端安装脚本、客户端日志轮转、断网重连压测和多实例部署下的分布式会话控制。
+下一步建议进入联调完善阶段：补充真实 SSHD 和本地 Web 服务端到端测试脚本、客户端日志轮转、断网重连压测和多实例部署下的分布式会话控制。

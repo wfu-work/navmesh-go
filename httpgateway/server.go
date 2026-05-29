@@ -70,6 +70,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	host := normalizeHost(r.Host)
 	requestPath := r.URL.RequestURI()
+	clientIP := requestSourceIP(r)
 	bytesIn := r.ContentLength
 	if bytesIn < 0 {
 		bytesIn = 0
@@ -84,7 +85,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Path:       requestPath,
 			Hint:       "请确认域名是否填写正确，或在管理后台检查映射配置是否已启用。",
 		})
-		writeAccessLog(mappingLogInput{Host: host, Method: r.Method, Path: requestPath, SourceIP: sourceIP(r.RemoteAddr), StatusCode: http.StatusNotFound, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: err.Error()})
+		writeAccessLog(mappingLogInput{Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusNotFound, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: err.Error()})
 		return
 	}
 	if !services.ServiceGroupApp.AccessPolicyService.IsAllowed(device.Guid, mapping.Guid, mapping.Protocol) {
@@ -98,10 +99,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			MappingName: displayMappingName(mapping),
 			Hint:        "如需访问，请在管理后台调整访问策略后再重试。",
 		})
-		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: sourceIP(r.RemoteAddr), StatusCode: http.StatusForbidden, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: "access policy denied"})
+		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusForbidden, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: "access policy denied"})
 		return
 	}
-	permit, err := services.DefaultRuntimePolicy.Acquire(device.Guid, sourceIP(r.RemoteAddr))
+	permit, err := services.DefaultRuntimePolicy.Acquire(device.Guid, clientIP)
 	if err != nil {
 		renderGatewayErrorPage(w, gatewayErrorPage{
 			StatusCode:  http.StatusTooManyRequests,
@@ -120,11 +121,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Title:      "http session rejected",
 			Message:    err.Error(),
 		})
-		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: sourceIP(r.RemoteAddr), StatusCode: http.StatusTooManyRequests, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: err.Error()})
+		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusTooManyRequests, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: err.Error()})
 		return
 	}
 	defer services.DefaultRuntimePolicy.Release(permit)
-	proxy := newHTTPReverseProxy(s.transport, mapping, device, host, r.RemoteAddr)
+	proxy := newHTTPReverseProxy(s.transport, mapping, device, host, clientIP)
 	proxy.ServeHTTP(w, r)
 }
 
@@ -152,21 +153,21 @@ type httpReverseProxy struct {
 	proxy *httputil.ReverseProxy
 }
 
-func newHTTPReverseProxy(transport *http.Transport, mapping domains.PortMapping, device domains.Device, host, remoteAddr string) *httpReverseProxy {
+func newHTTPReverseProxy(transport *http.Transport, mapping domains.PortMapping, device domains.Device, host, clientIP string) *httpReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"
 			req.URL.Host = proxyPoolHost(mapping)
 			req.Host = mapping.PublicHost
-			req.Close = false
 			sanitizeHopByHopRequestHeaders(req.Header)
+			req.Close = true
 		},
 		Transport: &httpMappingRoundTripper{
-			base:       transport,
-			mapping:    mapping,
-			device:     device,
-			host:       host,
-			remoteAddr: remoteAddr,
+			base:     transport,
+			mapping:  mapping,
+			device:   device,
+			host:     host,
+			sourceIP: clientIP,
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			title := "目标服务暂时不可用"
@@ -200,25 +201,25 @@ func (p *httpReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type httpMappingContextKey struct{}
 
 type httpMappingContext struct {
-	Mapping    domains.PortMapping
-	Device     domains.Device
-	Host       string
-	RemoteAddr string
+	Mapping  domains.PortMapping
+	Device   domains.Device
+	Host     string
+	SourceIP string
 }
 
 type httpMappingRoundTripper struct {
-	base       http.RoundTripper
-	mapping    domains.PortMapping
-	device     domains.Device
-	host       string
-	remoteAddr string
+	base     http.RoundTripper
+	mapping  domains.PortMapping
+	device   domains.Device
+	host     string
+	sourceIP string
 }
 
 func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	requestPath := req.URL.RequestURI()
 	requestMethod := req.Method
-	source := sourceIP(rt.remoteAddr)
+	source := rt.sourceIP
 	var bytesIn int64
 	var bytesOut int64
 	statusCode := 0
@@ -249,10 +250,10 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		}
 	}
 	ctx := context.WithValue(req.Context(), httpMappingContextKey{}, httpMappingContext{
-		Mapping:    rt.mapping,
-		Device:     rt.device,
-		Host:       rt.host,
-		RemoteAddr: rt.remoteAddr,
+		Mapping:  rt.mapping,
+		Device:   rt.device,
+		Host:     rt.host,
+		SourceIP: rt.sourceIP,
 	})
 	req = req.WithContext(ctx)
 	resp, err := rt.base.RoundTrip(req)
@@ -289,6 +290,7 @@ func newTunnelHTTPTransport(manager *tunnel.Manager) *http.Transport {
 		Proxy:                 nil,
 		DialContext:           tunnelDialContext(manager),
 		ForceAttemptHTTP2:     false,
+		DisableKeepAlives:     true,
 		MaxIdleConns:          512,
 		MaxIdleConnsPerHost:   64,
 		MaxConnsPerHost:       128,
@@ -311,11 +313,11 @@ func tunnelDialContext(manager *tunnel.Manager) func(context.Context, string, st
 		if err != nil {
 			return nil, &tunnelDialError{err: err}
 		}
-		session := createHTTPSession(info.Mapping, info.Device, info.Host, sourceIP(info.RemoteAddr))
+		session := createHTTPSession(info.Mapping, info.Device, info.Host, info.SourceIP)
 		conn := &tunnelHTTPConn{
 			ReadWriteCloser: upstream,
 			sessionGuid:     session.Guid,
-			sourceIP:        sourceIP(info.RemoteAddr),
+			sourceIP:        info.SourceIP,
 		}
 		applyIdleDeadline(conn, services.DefaultRuntimePolicy.IdleTimeout())
 		services.DefaultSessionRegistry.RegisterSession(session.Guid, conn)
@@ -467,149 +469,195 @@ var gatewayErrorTemplate = template.Must(template.New("gateway-error").Parse(`<!
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #f6f8fb;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #667085;
-      --line: #d9e1ec;
-      --brand: #2563eb;
+      --bg: #eef3fb;
+      --panel: #fbfcff;
+      --text: #1d2736;
+      --muted: #627086;
+      --line: #d6deeb;
+      --line-strong: #b9c6d8;
+      --brand: #255fe8;
+      --brand-strong: #1747bf;
       --brand-text: #ffffff;
-      --soft: #eef4ff;
-      --soft-text: #1d4ed8;
-      --shadow: 0 20px 60px rgba(15, 23, 42, .12);
+      --soft: #e8f0ff;
+      --soft-text: #1747bf;
+      --warn: #f59e0b;
+      --shadow: 0 30px 90px rgba(31, 45, 68, .16);
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #0f141b;
-        --panel: #171d26;
-        --text: #edf2f7;
-        --muted: #a2adbd;
-        --line: #2a3442;
-        --brand: #60a5fa;
-        --brand-text: #06111f;
-        --soft: #13243a;
-        --soft-text: #9cc8ff;
-        --shadow: 0 22px 70px rgba(0, 0, 0, .34);
+        --bg: #111821;
+        --panel: #18212d;
+        --text: #edf3fb;
+        --muted: #aab6c6;
+        --line: #2d3a4a;
+        --line-strong: #415165;
+        --brand: #78a6ff;
+        --brand-strong: #a5c2ff;
+        --brand-text: #0d1420;
+        --soft: #20314c;
+        --soft-text: #b9d1ff;
+        --warn: #fbbf24;
+        --shadow: 0 30px 90px rgba(0, 0, 0, .38);
       }
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 32px 18px;
-      background:
-        radial-gradient(circle at 20% 8%, rgba(37, 99, 235, .12), transparent 28%),
-        linear-gradient(180deg, var(--bg), color-mix(in srgb, var(--bg) 92%, #2563eb));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: clamp(24px, 6vw, 72px) 18px;
+      background: linear-gradient(145deg, var(--bg), color-mix(in srgb, var(--bg) 82%, #d7e2f5));
       color: var(--text);
       font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
     main {
-      width: min(680px, 100%);
+      position: relative;
+      width: min(760px, 100%);
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 14px;
+      border-radius: 8px;
       box-shadow: var(--shadow);
-      padding: 34px;
+      overflow: hidden;
+    }
+    main::before {
+      content: "";
+      display: block;
+      height: 6px;
+      background: linear-gradient(90deg, var(--brand), var(--warn));
+    }
+    .content {
+      padding: clamp(28px, 5vw, 48px);
+    }
+    .topline {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 22px;
     }
     .badge {
       display: inline-flex;
       align-items: center;
-      height: 28px;
-      padding: 0 10px;
+      height: 30px;
+      padding: 0 12px;
       border-radius: 999px;
       background: var(--soft);
       color: var(--soft-text);
+      font-weight: 800;
+      letter-spacing: .03em;
+    }
+    .brand {
+      color: var(--muted);
       font-weight: 700;
-      letter-spacing: .02em;
     }
     h1 {
-      margin: 18px 0 8px;
-      font-size: clamp(26px, 5vw, 38px);
-      line-height: 1.15;
+      margin: 0;
+      max-width: 11em;
+      font-size: clamp(34px, 6vw, 56px);
+      line-height: 1.05;
       letter-spacing: 0;
     }
     p { margin: 0; }
     .subtitle {
+      margin-top: 14px;
+      max-width: 34em;
       color: var(--muted);
-      font-size: 16px;
+      font-size: clamp(16px, 2vw, 18px);
+      font-weight: 650;
     }
     dl {
       display: grid;
-      grid-template-columns: 92px minmax(0, 1fr);
-      gap: 10px 14px;
-      margin: 26px 0;
-      padding: 18px;
+      grid-template-columns: minmax(92px, max-content) minmax(0, 1fr);
+      gap: 12px 26px;
+      margin: 32px 0 0;
+      padding: 22px 24px;
       border: 1px solid var(--line);
-      border-radius: 10px;
-      background: color-mix(in srgb, var(--panel) 88%, var(--bg));
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--panel) 76%, var(--bg));
     }
     dt {
       color: var(--muted);
       white-space: nowrap;
+      font-weight: 750;
     }
     dd {
       margin: 0;
       min-width: 0;
       word-break: break-word;
       color: var(--text);
+      font-weight: 700;
     }
     .hint {
-      margin-top: 4px;
+      margin-top: 28px;
       color: var(--muted);
+      font-size: 15px;
     }
     .actions {
       display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 28px;
+      margin-top: 30px;
     }
-    a, button {
-      height: 40px;
-      border-radius: 20px;
-      padding: 0 18px;
-      border: 1px solid var(--line);
+    a {
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 0 22px;
       font: inherit;
-      font-weight: 700;
+      font-weight: 800;
       cursor: pointer;
       text-decoration: none;
     }
     .primary {
-      display: inline-flex;
-      align-items: center;
       background: var(--brand);
       border-color: var(--brand);
       color: var(--brand-text);
+      box-shadow: 0 12px 26px color-mix(in srgb, var(--brand) 24%, transparent);
+      transition: transform .16s ease, background-color .16s ease, box-shadow .16s ease;
     }
-    button {
-      background: transparent;
-      color: var(--text);
+    .primary:hover {
+      background: var(--brand-strong);
+      transform: translateY(-1px);
+      box-shadow: 0 16px 32px color-mix(in srgb, var(--brand) 30%, transparent);
+    }
+    .primary:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--brand) 28%, transparent);
+      outline-offset: 3px;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .primary { transition: none; }
+      .primary:hover { transform: none; }
     }
     @media (max-width: 520px) {
-      main { padding: 26px 20px; }
+      body { align-items: stretch; }
+      .content { padding: 26px 20px 30px; }
       dl { grid-template-columns: 1fr; gap: 4px; }
       dt { font-size: 12px; }
-      .actions { flex-direction: column; }
-      a, button { width: 100%; text-align: center; justify-content: center; }
+      .actions { display: block; }
+      a { width: 100%; }
     }
   </style>
 </head>
 <body>
   <main>
-    <span class="badge">HTTP {{.StatusCode}}</span>
-    <h1>{{.Title}}</h1>
-    <p class="subtitle">{{.Subtitle}}</p>
-    <dl>
-      <dt>访问域名</dt><dd>{{.Host}}</dd>
-      <dt>请求路径</dt><dd>{{.Path}}</dd>
-      {{if .DeviceName}}<dt>现场设备</dt><dd>{{.DeviceName}}</dd>{{end}}
-      {{if .MappingName}}<dt>映射名称</dt><dd>{{.MappingName}}</dd>{{end}}
-    </dl>
-    {{if .Hint}}<p class="hint">{{.Hint}}</p>{{end}}
-    <div class="actions">
-      <a class="primary" href="javascript:location.reload()">刷新重试</a>
-      <button type="button" onclick="history.length > 1 ? history.back() : location.href='/'">返回上一页</button>
+    <div class="content">
+      <div class="topline">
+        <span class="badge">HTTP {{.StatusCode}}</span>
+        <span class="brand">NavMesh Gateway</span>
+      </div>
+      <h1>{{.Title}}</h1>
+      <p class="subtitle">{{.Subtitle}}</p>
+      <dl>
+        <dt>访问域名</dt><dd>{{.Host}}</dd>
+        <dt>请求路径</dt><dd>{{.Path}}</dd>
+        {{if .DeviceName}}<dt>现场设备</dt><dd>{{.DeviceName}}</dd>{{end}}
+        {{if .MappingName}}<dt>映射名称</dt><dd>{{.MappingName}}</dd>{{end}}
+      </dl>
+      {{if .Hint}}<p class="hint">{{.Hint}}</p>{{end}}
+      <div class="actions">
+        <a class="primary" href="javascript:location.reload()">刷新重试</a>
+      </div>
     </div>
   </main>
 </body>
