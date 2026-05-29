@@ -9,6 +9,7 @@ func (d *DeviceRouter) InitDeviceRouter(publicGroup *gin.RouterGroup, privateGro
 	{
 		devicePublic.POST("register", deviceApi.Register)
 		devicePublic.POST("heartbeat", deviceApi.Heartbeat)
+		devicePublic.POST("upgrade/report", deviceApi.ReportUpgrade)
 	}
 
 	devices := privateGroup.Group("devices")
@@ -24,5 +25,7 @@ func (d *DeviceRouter) InitDeviceRouter(publicGroup *gin.RouterGroup, privateGro
 		devices.POST(":guid/tokens/:tokenGuid/rotate", deviceApi.RotateToken)
 		devices.POST(":guid/tokens/:tokenGuid/enable", deviceApi.EnableToken)
 		devices.DELETE(":guid/tokens/:tokenGuid", deviceApi.DisableToken)
+		devices.GET(":guid/upgrades", deviceApi.ListUpgradeTasks)
+		devices.POST(":guid/upgrades", deviceApi.CreateUpgradeTask)
 	}
 }

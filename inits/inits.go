@@ -57,6 +57,8 @@ func registerTables() {
 	err := global.NAV_DB.AutoMigrate(
 		domains.Device{},
 		domains.DeviceToken{},
+		domains.ClientRelease{},
+		domains.DeviceUpgradeTask{},
 		domains.DeviceConnection{},
 		domains.DeviceHeartbeat{},
 		domains.SSHAlias{},
@@ -87,7 +89,13 @@ func ensureDataDirs() error {
 			dataDir = value
 		}
 	}
-	for _, dir := range []string{"./data", dataDir, filepath.Join(dataDir, "audit"), filepath.Join(dataDir, "cache")} {
+	ossDir := "./data/oss"
+	if global.NAV_VIPER != nil {
+		if value := strings.TrimSpace(global.NAV_VIPER.GetString("local.oss-path")); value != "" {
+			ossDir = value
+		}
+	}
+	for _, dir := range []string{"./data", dataDir, filepath.Join(dataDir, "audit"), filepath.Join(dataDir, "cache"), filepath.Join(ossDir, "navmesh-client")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -129,6 +137,8 @@ func seedDefaultSettings() {
 		"session_retention_days":           "90",
 		"heartbeat_retention_days":         "7",
 		"device_connection_retention_days": "30",
+		"client_download_base":             "",
+		"client_upgrade_enabled":           "true",
 	}
 	now := domains.NowMilli()
 	for key, value := range defaults {

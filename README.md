@@ -115,8 +115,8 @@ curl -fsSL https://github.com/wfu-work/navmesh-go/releases/latest/download/insta
 如果设备无法稳定访问 GitHub，可以把 `install-client.sh` 和对应平台二进制，例如 `navmesh-client-linux-arm64`，同步到自己的下载域名：
 
 ```bash
-curl -fsSL https://navmesh.navfirst.com/download/install-client.sh | sudo sh -s -- \
-  --download-base https://navmesh.navfirst.com/download \
+curl -fsSL https://navmesh.navfirst.com/api/downloads/install-client.sh | sudo sh -s -- \
+  --download-base https://navmesh.navfirst.com/api/downloads \
   --server navmesh.navfirst.com \
   --api https://navmesh.navfirst.com \
   --port 3008 \
@@ -147,6 +147,46 @@ NavMesh 将“首次注册”和“激活接入”分开处理。
 5. 设备使用专属 Token 重新接入后变为激活在线状态。
 
 如果设备本地状态文件丢失，客户端可以再次使用全局 Token 注册。服务端会重置该设备 Token，并把设备重新置为未激活状态。
+
+## 客户端在线升级
+
+NavMesh 支持由管理端上传 `navmesh-client` 二进制，并通过设备心跳下发升级任务。
+
+基本流程：
+
+1. 管理端上传客户端二进制，例如 `navmesh-client-linux-arm64`。
+2. 服务端保存文件、计算 SHA256，并生成可下载地址。
+3. 管理端为指定设备创建升级任务。
+4. 设备心跳返回升级命令。
+5. 客户端下载二进制、校验 SHA256、备份旧文件并替换当前程序。
+6. 客户端上报升级结果，并通过 systemd 重启 `navmesh-client` 服务。
+
+如果设备无法访问 GitHub，可以把安装脚本的 `--download-base` 指向 NavMesh 后端下载接口：
+
+```bash
+curl -fsSL https://navmesh.navfirst.com/api/downloads/install-client.sh | sudo sh -s -- \
+  --download-base https://navmesh.navfirst.com/api/downloads \
+  --server navmesh.navfirst.com \
+  --api https://navmesh.navfirst.com \
+  --port 3008 \
+  --token xxxxxx
+```
+
+后台上传的客户端二进制默认保存在 `local.oss-path/navmesh-client` 下。运行期配置 `client_download_base` 可指定公开下载域名，例如：
+
+```text
+https://navmesh.navfirst.com/api/downloads
+```
+
+上传接口示例：
+
+```bash
+curl -F file=@navmesh-client-linux-arm64 \
+  -F version=v0.0.2 \
+  -F os=linux \
+  -F arch=arm64 \
+  https://navmesh.navfirst.com/api/client-releases/upload
+```
 
 ## 构建
 
@@ -233,6 +273,8 @@ navmesh:
 | `http_listen` | `:3009` | HTTP 映射网关监听地址 |
 | `device_register_token` | `xxxxxx` | 设备首次注册 Token |
 | `device_heartbeat_timeout` | `90s` | 设备离线判定超时时间 |
+| `client_upgrade_enabled` | `true` | 是否允许心跳下发客户端升级任务 |
+| `client_download_base` | 空 | 客户端二进制公开下载地址前缀 |
 
 生产环境请务必修改默认 JWT 密钥和设备注册 Token。
 
@@ -256,6 +298,12 @@ navmesh:
 | `GET /api/events/list` | 事件列表 |
 | `GET /api/audit-logs/list` | 审计日志 |
 | `GET /api/settings/list` | 运行期配置 |
+| `GET /api/client-releases/list` | 客户端二进制列表 |
+| `POST /api/client-releases/upload` | 上传客户端二进制 |
+| `GET /api/downloads/:fileName` | 下载客户端二进制 |
+| `GET /api/devices/:guid/upgrades` | 设备升级任务列表 |
+| `POST /api/devices/:guid/upgrades` | 创建设备升级任务 |
+| `POST /api/device/upgrade/report` | 客户端上报升级结果 |
 
 管理端认证由 `nav-common-go-lib` 提供。
 

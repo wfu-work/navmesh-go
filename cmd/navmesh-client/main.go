@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -60,6 +62,7 @@ type clientConfig struct {
 	Heartbeat      time.Duration
 	HeartbeatFail  int
 	RequestTimeout time.Duration
+	ServiceName    string
 }
 
 type registerResponse struct {
@@ -94,12 +97,24 @@ type apiResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
-		Guid       string `json:"guid"`
-		Sncode     string `json:"sncode"`
-		DeviceType string `json:"deviceType"`
-		Alias      string `json:"alias"`
-		Remark     string `json:"remark"`
+		Guid       string                `json:"guid"`
+		Sncode     string                `json:"sncode"`
+		DeviceType string                `json:"deviceType"`
+		Alias      string                `json:"alias"`
+		Remark     string                `json:"remark"`
+		Upgrade    *clientUpgradeCommand `json:"upgrade"`
 	} `json:"data"`
+}
+
+type clientUpgradeCommand struct {
+	TaskGuid    string `json:"taskGuid"`
+	Version     string `json:"version"`
+	OS          string `json:"os"`
+	Arch        string `json:"arch"`
+	FileName    string `json:"fileName"`
+	DownloadURL string `json:"downloadUrl"`
+	Sha256      string `json:"sha256"`
+	Size        int64  `json:"size"`
 }
 
 type clientState struct {
@@ -126,6 +141,11 @@ type systemSnapshot struct {
 	DiskFree    int64
 	DiskUsedPct float64
 }
+
+var upgradeState = struct {
+	sync.Mutex
+	taskGuid string
+}{}
 
 func main() {
 	cfg := parseFlags()
@@ -177,6 +197,7 @@ func parseFlags() clientConfig {
 	flag.DurationVar(&cfg.Heartbeat, "heartbeat", 30*time.Second, "QUIC 和 HTTP 心跳间隔")
 	flag.IntVar(&cfg.HeartbeatFail, "heartbeatFail", 3, "连续心跳失败多少次后主动断开并重连")
 	flag.DurationVar(&cfg.RequestTimeout, "requestTimeout", 10*time.Second, "HTTP 请求和本地端口连接超时时间")
+	flag.StringVar(&cfg.ServiceName, "serviceName", "navmesh-client", "systemd 服务名称，用于客户端在线升级后重启")
 	flag.Parse()
 	if showVersion {
 		_, _ = fmt.Fprintln(flag.CommandLine.Output(), clientVersion)
@@ -704,7 +725,197 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 			log.Printf("save heartbeat state failed path=%s err=%v", cfg.StateFile, err)
 		}
 	}
+	if result.Data.Upgrade != nil {
+		startClientUpgrade(cfg, *result.Data.Upgrade)
+	}
 	return nil
+}
+
+func startClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) {
+	upgrade.TaskGuid = strings.TrimSpace(upgrade.TaskGuid)
+	upgrade.DownloadURL = strings.TrimSpace(upgrade.DownloadURL)
+	if upgrade.TaskGuid == "" || upgrade.DownloadURL == "" {
+		return
+	}
+	upgradeState.Lock()
+	if upgradeState.taskGuid != "" {
+		upgradeState.Unlock()
+		return
+	}
+	upgradeState.taskGuid = upgrade.TaskGuid
+	upgradeState.Unlock()
+	go func() {
+		defer func() {
+			upgradeState.Lock()
+			upgradeState.taskGuid = ""
+			upgradeState.Unlock()
+		}()
+		if err := performClientUpgrade(cfg, upgrade); err != nil {
+			log.Printf("client upgrade failed task=%s version=%s err=%v", upgrade.TaskGuid, upgrade.Version, err)
+			_ = reportClientUpgrade(context.Background(), cfg, upgrade, "failed", "", err.Error())
+		}
+	}()
+}
+
+func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) error {
+	log.Printf("client upgrade started task=%s version=%s url=%s", upgrade.TaskGuid, upgrade.Version, upgrade.DownloadURL)
+	_ = reportClientUpgrade(context.Background(), cfg, upgrade, "running", "downloading client binary", "")
+	if err := validateUpgradePlatform(upgrade); err != nil {
+		return err
+	}
+	currentPath, err := currentExecutablePath()
+	if err != nil {
+		return err
+	}
+	tmpPath := currentPath + ".new"
+	backupPath := currentPath + ".bak"
+	if err := downloadUpgradeBinary(cfg, upgrade, tmpPath); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		return err
+	}
+	_ = os.Remove(backupPath)
+	if err := os.Rename(currentPath, backupPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, currentPath); err != nil {
+		_ = os.Rename(backupPath, currentPath)
+		return err
+	}
+	_ = reportClientUpgrade(context.Background(), cfg, upgrade, "success", "client binary replaced", firstNonEmpty(upgrade.Version, clientVersion))
+	log.Printf("client upgrade installed task=%s current=%s backup=%s", upgrade.TaskGuid, currentPath, backupPath)
+	restartClientService(cfg)
+	return nil
+}
+
+func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targetPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	url := upgrade.DownloadURL
+	if strings.HasPrefix(url, "/") {
+		url = strings.TrimRight(cfg.API, "/") + url
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("download status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	size, copyErr := io.Copy(io.MultiWriter(out, hash), resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(targetPath)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(targetPath)
+		return closeErr
+	}
+	if upgrade.Size > 0 && size != upgrade.Size {
+		_ = os.Remove(targetPath)
+		return fmt.Errorf("download size mismatch want=%d got=%d", upgrade.Size, size)
+	}
+	if upgrade.Sha256 != "" {
+		got := hex.EncodeToString(hash.Sum(nil))
+		if !strings.EqualFold(got, upgrade.Sha256) {
+			_ = os.Remove(targetPath)
+			return fmt.Errorf("sha256 mismatch want=%s got=%s", upgrade.Sha256, got)
+		}
+	}
+	return nil
+}
+
+func reportClientUpgrade(ctx context.Context, cfg clientConfig, upgrade clientUpgradeCommand, status, message, detail string) error {
+	body := map[string]any{
+		"token":         cfg.authToken(),
+		"taskGuid":      upgrade.TaskGuid,
+		"deviceGuid":    cfg.DeviceGuid,
+		"sncode":        cfg.Sncode,
+		"status":        status,
+		"message":       message,
+		"errorMessage":  detail,
+		"clientVersion": clientVersion,
+	}
+	if status == "success" {
+		body["clientVersion"] = firstNonEmpty(upgrade.Version, clientVersion)
+	}
+	data, _ := json.Marshal(body)
+	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, cfg.API+"/api/device/upgrade/report", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("upgrade report status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if result.Code != 0 && result.Code != 200 {
+		return fmt.Errorf("upgrade report code %d: %s", result.Code, result.Msg)
+	}
+	return nil
+}
+
+func validateUpgradePlatform(upgrade clientUpgradeCommand) error {
+	if upgrade.OS = strings.ToLower(strings.TrimSpace(upgrade.OS)); upgrade.OS != "" && upgrade.OS != runtime.GOOS {
+		return fmt.Errorf("upgrade os mismatch want=%s current=%s", upgrade.OS, runtime.GOOS)
+	}
+	if upgrade.Arch = strings.ToLower(strings.TrimSpace(upgrade.Arch)); upgrade.Arch != "" && upgrade.Arch != runtime.GOARCH {
+		return fmt.Errorf("upgrade arch mismatch want=%s current=%s", upgrade.Arch, runtime.GOARCH)
+	}
+	return nil
+}
+
+func restartClientService(cfg clientConfig) {
+	serviceName := strings.TrimSpace(cfg.ServiceName)
+	if serviceName != "" && runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("systemctl"); err == nil {
+			cmd := exec.Command("systemctl", "restart", serviceName)
+			if err := cmd.Start(); err == nil {
+				return
+			}
+		}
+	}
+	log.Printf("client upgrade completed, exiting for supervisor restart")
+	os.Exit(0)
+}
+
+func currentExecutablePath() (string, error) {
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolvedPath
+	}
+	return execPath, nil
 }
 
 func collectSystemSnapshot() systemSnapshot {

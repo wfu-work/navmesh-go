@@ -1,8 +1,10 @@
 package apis
 
 import (
+	"encoding/json"
 	"navmesh-go/services"
 	"navmesh-go/utils"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/wfu-work/nav-common-go-lib/response"
@@ -38,7 +40,16 @@ func (d DeviceApi) Heartbeat(c *gin.Context) {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
-	response.Ok(device, c)
+	payload := map[string]any{}
+	if data, err := json.Marshal(device); err == nil {
+		_ = json.Unmarshal(data, &payload)
+	}
+	if strings.ToLower(settingService.Value("client_upgrade_enabled", "true")) != "false" {
+		if upgrade, err := deviceUpgradeService.PendingCommand(device.Guid); err == nil && upgrade != nil {
+			payload["upgrade"] = upgrade
+		}
+	}
+	response.Ok(payload, c)
 }
 
 func (d DeviceApi) List(c *gin.Context) {
@@ -158,4 +169,51 @@ func (d DeviceApi) EnableToken(c *gin.Context) {
 
 func (d DeviceApi) TypeDefaults(c *gin.Context) {
 	response.Ok(deviceService.TypeDefaults(), c)
+}
+
+func (d DeviceApi) CreateUpgradeTask(c *gin.Context) {
+	var req services.CreateDeviceUpgradeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	guid := c.Param("guid")
+	release, err := clientReleaseService.GetEnabled(req.ReleaseGuid)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	task, err := deviceUpgradeService.CreateTask(guid, req, publicDownloadURL(c, release.FileName))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "create", Resource: "device_upgrade", ResourceID: task.Guid, Message: guid, SourceIP: c.ClientIP()})
+	response.Ok(task, c)
+}
+
+func (d DeviceApi) ListUpgradeTasks(c *gin.Context) {
+	params := utils.QueryParams(c)
+	items, total, err := deviceUpgradeService.List(c.Param("guid"), params)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(services.PageResult(items, total, params), c)
+}
+
+func (d DeviceApi) ReportUpgrade(c *gin.Context) {
+	var req services.DeviceUpgradeReportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	if req.Token == "" {
+		req.Token = utils.BearerToken(c)
+	}
+	if err := deviceUpgradeService.Report(req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(true, c)
 }
