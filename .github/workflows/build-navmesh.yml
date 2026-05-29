@@ -99,13 +99,19 @@ jobs:
             -o "dist/navmesh-client-${GOOS}-${GOARCH}${{ matrix.ext }}" \
             ./cmd/navmesh-client
 
-      - name: Upload artifact
+      - name: Upload navmesh-server artifact
         uses: actions/upload-artifact@v7
         with:
-          name: navmesh-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            dist/navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
-            dist/navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/navmesh-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+          archive: false
+
+      - name: Upload navmesh-client artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/navmesh-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
           archive: false
 
