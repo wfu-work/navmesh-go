@@ -32,6 +32,7 @@ func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
 
 type RegisterDeviceRequest struct {
 	Token         string  `json:"token"`
+	Guid          string  `json:"guid"`
 	SnCode        string  `json:"sncode"`
 	DeviceType    string  `json:"type"`
 	Alias         string  `json:"alias"`
@@ -80,8 +81,10 @@ type HeartbeatRequest struct {
 }
 
 type UpdateDeviceProfileRequest struct {
-	Alias  string `json:"alias"`
-	Remark string `json:"remark"`
+	SnCode     string `json:"sncode"`
+	DeviceType string `json:"type"`
+	Alias      string `json:"alias"`
+	Remark     string `json:"remark"`
 }
 
 type DeviceRegisterResult struct {
@@ -95,28 +98,40 @@ type DeviceRegisterResult struct {
 func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*DeviceRegisterResult, error) {
 	req = normalizeRegisterRequest(req)
 	sourceIP = normalizeIP(sourceIP)
-	if req.SnCode == "" {
-		return nil, errors.New("sncode required")
-	}
-	if req.DeviceType == "" {
-		return nil, errors.New("type required")
-	}
 	if req.Token == "" {
 		return nil, errors.New("token required")
 	}
-	typeDefault, err := ServiceGroupApp.GroupService.GetEnabled(req.DeviceType)
+	now := domains.NowMilli()
+	var device domains.Device
+	query := s.DB().Unscoped()
+	if req.Guid != "" {
+		query = query.Where("guid = ?", req.Guid)
+	} else if req.SnCode != "" {
+		query = query.Where("sn_code = ?", req.SnCode)
+	} else {
+		return nil, errors.New("sncode or guid required")
+	}
+	err := query.First(&device).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	isNewDevice := errors.Is(err, gorm.ErrRecordNotFound)
+	if isNewDevice && req.SnCode == "" {
+		return nil, errors.New("sncode required")
+	}
+	deviceType := req.DeviceType
+	if !isNewDevice && strings.TrimSpace(device.DeviceType) != "" {
+		deviceType = device.DeviceType
+	}
+	if deviceType == "" {
+		deviceType = "ssh"
+	}
+	typeDefault, err := ServiceGroupApp.GroupService.GetEnabled(deviceType)
 	if err != nil {
 		return nil, errors.New("unsupported device group")
 	}
 	req.DeviceType = typeDefault.Key
 	req.GroupGuid = typeDefault.Key
-	now := domains.NowMilli()
-	var device domains.Device
-	err = s.DB().Unscoped().Where("sn_code = ?", req.SnCode).First(&device).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
-	}
-	isNewDevice := errors.Is(err, gorm.ErrRecordNotFound)
 	if isNewDevice && req.Token != registerToken() {
 		return nil, errors.New("device not found")
 	}
@@ -139,8 +154,12 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 		}
 	}
 
-	device.DeviceType = req.DeviceType
+	if isNewDevice || isDeletedDevice || strings.TrimSpace(device.DeviceType) == "" {
+		device.DeviceType = req.DeviceType
+		device.GroupGuid = req.GroupGuid
+	}
 	if isNewDevice || isDeletedDevice {
+		device.Sncode = req.SnCode
 		device.Alias = req.Alias
 		device.Remark = req.Remark
 		device.DeletedTime.Valid = false
@@ -167,7 +186,6 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	device.SSHPort = req.SSHPort
 	device.WebPort = req.WebPort
 	device.WebDomain = req.WebDomain
-	device.GroupGuid = req.GroupGuid
 	device.Tags = normalizeTags(req.Tags)
 	if isBootstrapToken && (isNewDevice || isDeletedDevice || !s.tokenService().HasEnabled(device.Guid)) {
 		device.Status = domains.DeviceStatusRegistered
@@ -307,28 +325,48 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 
 func (s DeviceService) UpdateProfile(guid string, req UpdateDeviceProfileRequest) (*domains.Device, error) {
 	guid = strings.TrimSpace(guid)
+	req.SnCode = strings.TrimSpace(req.SnCode)
+	req.DeviceType = strings.TrimSpace(req.DeviceType)
 	req.Alias = strings.TrimSpace(req.Alias)
 	req.Remark = strings.TrimSpace(req.Remark)
 	if guid == "" {
 		return nil, errors.New("guid required")
 	}
-	if req.Alias == "" {
-		return nil, errors.New("alias required")
+	updates := map[string]any{"update_time": domains.NowMilli()}
+	if req.SnCode != "" {
+		if err := ensureSncodeAvailable(req.SnCode, guid); err != nil {
+			return nil, err
+		}
+		updates["sn_code"] = req.SnCode
 	}
-	if err := ensureAliasAvailable(req.Alias, guid); err != nil {
-		return nil, err
+	if req.DeviceType != "" {
+		group, err := ServiceGroupApp.GroupService.GetEnabled(req.DeviceType)
+		if err != nil {
+			return nil, err
+		}
+		updates["device_type"] = group.Key
+		updates["group_guid"] = group.Key
 	}
-	now := domains.NowMilli()
-	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", guid).Updates(map[string]any{
-		"alias":       req.Alias,
-		"remark":      req.Remark,
-		"update_time": now,
-	}).Error; err != nil {
+	if req.Alias != "" {
+		if err := ensureAliasAvailable(req.Alias, guid); err != nil {
+			return nil, err
+		}
+		updates["alias"] = req.Alias
+	}
+	if req.Remark != "" {
+		updates["remark"] = req.Remark
+	}
+	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", guid).Updates(updates).Error; err != nil {
 		return nil, err
 	}
 	var device domains.Device
 	if err := s.DB().Where("guid = ?", guid).First(&device).Error; err != nil {
 		return nil, err
+	}
+	if req.SnCode != "" {
+		if _, err := ServiceGroupApp.SSHService.EnsureDeviceAlias(device); err != nil {
+			global.NAV_LOG.Warn("refresh ssh alias after sncode update failed", zap.String("deviceGuid", guid), zap.Error(err))
+		}
 	}
 	return &device, nil
 }
@@ -515,6 +553,7 @@ func (s DeviceService) StartOfflineCleaner(ctx context.Context) {
 
 func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 	req.Token = strings.TrimSpace(req.Token)
+	req.Guid = strings.TrimSpace(req.Guid)
 	req.SnCode = strings.TrimSpace(req.SnCode)
 	req.DeviceType = strings.TrimSpace(req.DeviceType)
 	req.Alias = strings.TrimSpace(req.Alias)
@@ -616,6 +655,24 @@ func ensureAliasAvailable(alias, currentGuid string) error {
 	}
 	if existing.Guid != currentGuid {
 		return errors.New("alias already exists")
+	}
+	return nil
+}
+
+func ensureSncodeAvailable(sncode, currentGuid string) error {
+	if sncode == "" {
+		return errors.New("sncode required")
+	}
+	var existing domains.Device
+	err := ServiceGroupApp.DeviceService.DB().Where("sn_code = ?", sncode).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Guid != currentGuid {
+		return errors.New("sncode already exists")
 	}
 	return nil
 }

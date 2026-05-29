@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -39,6 +41,7 @@ type clientConfig struct {
 	Token          string
 	DeviceToken    string
 	StateFile      string
+	DeviceGuid     string
 	Sncode         string
 	DeviceType     string
 	Alias          string
@@ -63,9 +66,11 @@ type registerResponse struct {
 	Code int `json:"code"`
 	Data struct {
 		Device struct {
-			Guid   string `json:"guid"`
-			Alias  string `json:"alias"`
-			Remark string `json:"remark"`
+			Guid       string `json:"guid"`
+			Sncode     string `json:"sncode"`
+			DeviceType string `json:"deviceType"`
+			Alias      string `json:"alias"`
+			Remark     string `json:"remark"`
 		} `json:"device"`
 		DeviceToken struct {
 			Token string `json:"token"`
@@ -88,10 +93,18 @@ type registerResponse struct {
 type apiResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
+	Data struct {
+		Guid       string `json:"guid"`
+		Sncode     string `json:"sncode"`
+		DeviceType string `json:"deviceType"`
+		Alias      string `json:"alias"`
+		Remark     string `json:"remark"`
+	} `json:"data"`
 }
 
 type clientState struct {
 	Sncode      string `json:"sncode"`
+	DeviceType  string `json:"deviceType"`
 	DeviceGuid  string `json:"deviceGuid"`
 	DeviceToken string `json:"deviceToken"`
 	TokenGuid   string `json:"tokenGuid"`
@@ -137,17 +150,17 @@ func parseFlags() clientConfig {
 		flag.PrintDefaults()
 		_, _ = fmt.Fprintln(out)
 		_, _ = fmt.Fprintln(out, "示例:")
-		_, _ = fmt.Fprintln(out, "  navmesh-client -server tunnel.navfirst.com -port 3008 -token navfirst@2020 -sncode test01 -type rain -sshPort 22 -webPort 7090 -remark 深圳工厂1号测试网关")
+		_, _ = fmt.Fprintln(out, "  navmesh-client -server tunnel.navfirst.com -port 3008 -token navfirst@2020")
 	}
 	flag.StringVar(&cfg.Server, "server", "navmesh.navfirst.com", "NavMesh 隧道服务器地址")
 	flag.IntVar(&cfg.Port, "port", 3008, "NavMesh 隧道服务器 UDP 端口")
 	flag.StringVar(&cfg.API, "api", "https://navmesh.navfirst.com", "NavMesh 管理 API 基础地址，默认 http://<server>:3007")
 	flag.StringVar(&cfg.Token, "token", "navfirst@2020", "首次注册令牌；注册成功后客户端会保存并改用设备独立 Token")
 	flag.StringVar(&cfg.DeviceToken, "deviceToken", "", "设备独立 Token；状态文件丢失时可由管理端重新生成后填入")
-	flag.StringVar(&cfg.StateFile, "stateFile", "", "客户端状态文件路径，默认 /var/lib/navmesh-client/<sncode>.json，无法写入时回退当前目录")
+	flag.StringVar(&cfg.StateFile, "stateFile", "", "客户端状态文件路径，默认 navmesh-client 同级目录 navmesh-client.json")
 	flag.StringVar(&cfg.Sncode, "sncode", "", "设备 SN 编码，全局唯一")
-	flag.StringVar(&cfg.DeviceType, "type", "ssh", "设备类型")
-	flag.StringVar(&cfg.Alias, "alias", "", "设备别名，默认使用 sncode")
+	flag.StringVar(&cfg.DeviceType, "type", "ssh", "设备类型，默认 ssh；注册后可在管理端修改")
+	flag.StringVar(&cfg.Alias, "alias", "", "设备别名，默认由服务端使用 sncode")
 	flag.StringVar(&cfg.Remark, "remark", "", "设备备注")
 	flag.IntVar(&cfg.SSHPort, "sshPort", 22, "本机 SSH 服务端口")
 	flag.IntVar(&cfg.WebPort, "webPort", 0, "本机 Web 服务端口，0 表示不启用")
@@ -177,11 +190,8 @@ func parseFlags() clientConfig {
 	if cfg.API == "" {
 		cfg.API = "http://" + net.JoinHostPort(cfg.Server, "3007")
 	}
-	if cfg.Alias == "" {
-		cfg.Alias = cfg.Sncode
-	}
 	if cfg.StateFile == "" {
-		cfg.StateFile = defaultStateFile(cfg.Sncode)
+		cfg.StateFile = defaultStateFile()
 	}
 	if cfg.HostIP == "" {
 		cfg.HostIP = detectOutboundIP()
@@ -209,18 +219,58 @@ func parseFlags() clientConfig {
 }
 
 func run(ctx context.Context, cfg clientConfig) error {
-	if cfg.Sncode == "" {
-		return fmt.Errorf("sncode required")
-	}
 	if cfg.Token == "" {
 		return fmt.Errorf("token required")
 	}
+	state, err := loadClientState(cfg.StateFile)
+	if err != nil {
+		log.Printf("load client state failed path=%s err=%v", cfg.StateFile, err)
+	}
+	if cfg.Sncode == "" {
+		cfg.Sncode = strings.TrimSpace(state.Sncode)
+	}
+	if cfg.Sncode == "" {
+		cfg.Sncode = generateSncode(cfg.Hostname)
+	}
+	if cfg.DeviceType == "" {
+		cfg.DeviceType = strings.TrimSpace(state.DeviceType)
+	}
+	if cfg.DeviceType == "" {
+		cfg.DeviceType = "ssh"
+	}
+	if cfg.DeviceGuid == "" {
+		cfg.DeviceGuid = strings.TrimSpace(state.DeviceGuid)
+	}
+	if cfg.DeviceToken == "" && state.DeviceToken != "" {
+		cfg.DeviceToken = state.DeviceToken
+		log.Printf("loaded device token state path=%s sncode=%s", cfg.StateFile, cfg.Sncode)
+	} else if cfg.DeviceToken != "" {
+		log.Printf("using device token from command line sncode=%s stateFile=%s", cfg.Sncode, cfg.StateFile)
+	}
+	if cfg.Alias == "" && strings.TrimSpace(state.Alias) != "" {
+		cfg.Alias = strings.TrimSpace(state.Alias)
+	}
+	if cfg.Remark == "" && strings.TrimSpace(state.Remark) != "" {
+		cfg.Remark = strings.TrimSpace(state.Remark)
+	}
+	if strings.TrimSpace(state.Sncode) == "" {
+		_ = saveClientState(cfg.StateFile, clientState{
+			Sncode:      cfg.Sncode,
+			DeviceType:  cfg.DeviceType,
+			DeviceGuid:  cfg.DeviceGuid,
+			DeviceToken: cfg.DeviceToken,
+			Alias:       cfg.Alias,
+			Remark:      cfg.Remark,
+			UpdateTime:  time.Now().UnixMilli(),
+		})
+	}
 	snapshot := collectSystemSnapshot()
 	log.Printf(
-		"navmesh-client starting version=%s sncode=%s type=%s server=%s port=%d api=%s hostname=%s hostIp=%s wanIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s stateFile=%s skipRegister=%t",
+		"navmesh-client starting version=%s sncode=%s type=%s guid=%s server=%s port=%d api=%s hostname=%s hostIp=%s wanIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s stateFile=%s skipRegister=%t",
 		clientVersion,
 		cfg.Sncode,
 		cfg.DeviceType,
+		cfg.DeviceGuid,
 		cfg.Server,
 		cfg.Port,
 		cfg.API,
@@ -239,24 +289,6 @@ func run(ctx context.Context, cfg clientConfig) error {
 		cfg.StateFile,
 		cfg.SkipRegister,
 	)
-	state, err := loadClientState(cfg.StateFile)
-	if err != nil {
-		log.Printf("load client state failed path=%s err=%v", cfg.StateFile, err)
-	}
-	if cfg.DeviceToken == "" && state.DeviceToken != "" && (state.Sncode == "" || state.Sncode == cfg.Sncode) {
-		cfg.DeviceToken = state.DeviceToken
-		log.Printf("loaded device token state path=%s sncode=%s", cfg.StateFile, cfg.Sncode)
-	} else if cfg.DeviceToken != "" {
-		log.Printf("using device token from command line sncode=%s stateFile=%s", cfg.Sncode, cfg.StateFile)
-	}
-	if state.Sncode == "" || state.Sncode == cfg.Sncode {
-		if strings.TrimSpace(state.Alias) != "" {
-			cfg.Alias = strings.TrimSpace(state.Alias)
-		}
-		if strings.TrimSpace(state.Remark) != "" {
-			cfg.Remark = strings.TrimSpace(state.Remark)
-		}
-	}
 	failures := 0
 	for {
 		if !cfg.SkipRegister {
@@ -267,6 +299,8 @@ func run(ctx context.Context, cfg clientConfig) error {
 					cfg.DeviceToken = ""
 					_ = saveClientState(cfg.StateFile, clientState{
 						Sncode:     cfg.Sncode,
+						DeviceType: cfg.DeviceType,
+						DeviceGuid: cfg.DeviceGuid,
 						Alias:      cfg.Alias,
 						Remark:     cfg.Remark,
 						UpdateTime: time.Now().UnixMilli(),
@@ -374,6 +408,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 	)
 	body := map[string]any{
 		"token":         cfg.authToken(),
+		"guid":          cfg.DeviceGuid,
 		"sncode":        cfg.Sncode,
 		"type":          cfg.DeviceType,
 		"alias":         cfg.Alias,
@@ -414,25 +449,33 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 	if result.Data.DeviceToken.Token != "" {
 		cfg.DeviceToken = result.Data.DeviceToken.Token
 	}
+	if result.Data.Device.Guid != "" {
+		cfg.DeviceGuid = result.Data.Device.Guid
+	}
+	if result.Data.Device.Sncode != "" {
+		cfg.Sncode = result.Data.Device.Sncode
+	}
+	if result.Data.Device.DeviceType != "" {
+		cfg.DeviceType = result.Data.Device.DeviceType
+	}
 	if result.Data.Device.Alias != "" {
 		cfg.Alias = result.Data.Device.Alias
 	}
 	cfg.Remark = result.Data.Device.Remark
 	state := clientState{
 		Sncode:      cfg.Sncode,
-		DeviceGuid:  result.Data.Device.Guid,
+		DeviceType:  cfg.DeviceType,
+		DeviceGuid:  cfg.DeviceGuid,
 		DeviceToken: cfg.DeviceToken,
 		TokenGuid:   result.Data.DeviceToken.Item.Guid,
 		Alias:       cfg.Alias,
 		Remark:      cfg.Remark,
 		UpdateTime:  time.Now().UnixMilli(),
 	}
-	if state.DeviceToken != "" || state.Alias != "" || state.Remark != "" {
-		if err := saveClientState(cfg.StateFile, state); err != nil {
-			log.Printf("save client state failed path=%s err=%v", cfg.StateFile, err)
-		} else {
-			log.Printf("saved device state path=%s sncode=%s alias=%s", cfg.StateFile, cfg.Sncode, cfg.Alias)
-		}
+	if err := saveClientState(cfg.StateFile, state); err != nil {
+		log.Printf("save client state failed path=%s err=%v", cfg.StateFile, err)
+	} else {
+		log.Printf("saved device state path=%s sncode=%s alias=%s", cfg.StateFile, cfg.Sncode, cfg.Alias)
 	}
 	if result.Data.SSH.Alias.Domain != "" {
 		log.Printf("registered device sncode=%s guid=%s ssh=%s ready=%t entrypoint=%s", cfg.Sncode, result.Data.Device.Guid, result.Data.SSH.Alias.Domain, result.Data.SSH.Ready, result.Data.SSH.EntrypointIP)
@@ -510,6 +553,7 @@ func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
 	frame := tunnel.Frame{
 		Type:          tunnel.FrameTypeHello,
 		Token:         cfg.authToken(),
+		DeviceGuid:    cfg.DeviceGuid,
 		SnCode:        cfg.Sncode,
 		HostIP:        cfg.HostIP,
 		WanIP:         cfg.WanIP,
@@ -614,6 +658,7 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	snapshot := collectSystemSnapshot()
 	body := map[string]any{
 		"token":         cfg.authToken(),
+		"guid":          cfg.DeviceGuid,
 		"sncode":        cfg.Sncode,
 		"hostIp":        cfg.HostIP,
 		"wanIp":         cfg.WanIP,
@@ -644,6 +689,20 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	}
 	if result.Code != 0 && result.Code != 200 {
 		return fmt.Errorf("heartbeat code %d: %s", result.Code, result.Msg)
+	}
+	if result.Data.Guid != "" || result.Data.Sncode != "" || result.Data.DeviceType != "" || result.Data.Alias != "" || result.Data.Remark != "" {
+		state := clientState{
+			Sncode:      firstNonEmpty(result.Data.Sncode, cfg.Sncode),
+			DeviceType:  firstNonEmpty(result.Data.DeviceType, cfg.DeviceType),
+			DeviceGuid:  firstNonEmpty(result.Data.Guid, cfg.DeviceGuid),
+			DeviceToken: cfg.DeviceToken,
+			Alias:       firstNonEmpty(result.Data.Alias, cfg.Alias),
+			Remark:      firstNonEmpty(result.Data.Remark, cfg.Remark),
+			UpdateTime:  time.Now().UnixMilli(),
+		}
+		if err := saveClientState(cfg.StateFile, state); err != nil {
+			log.Printf("save heartbeat state failed path=%s err=%v", cfg.StateFile, err)
+		}
 	}
 	return nil
 }
@@ -938,30 +997,45 @@ func isPublicIP(value string) bool {
 		!ip.IsMulticast()
 }
 
-func defaultStateFile(sncode string) string {
-	name := strings.TrimSpace(sncode)
-	if name == "" {
-		name = "device"
+func defaultStateFile() string {
+	dir, err := executableDir()
+	if err != nil {
+		dir = "."
 	}
-	name = strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(name)
-	if canUseStateDir("/var/lib/navmesh-client") {
-		return filepath.Join("/var/lib/navmesh-client", name+".json")
-	}
-	return filepath.Join(".", ".navmesh-client-"+name+".json")
+	return filepath.Join(dir, "navmesh-client.json")
 }
 
-func canUseStateDir(dir string) bool {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return false
+func executableDir() (string, error) {
+	execPath, err := os.Executable()
+	if err == nil {
+		if resolvedPath, resolveErr := filepath.EvalSymlinks(execPath); resolveErr == nil {
+			execPath = resolvedPath
+		}
+		return filepath.Dir(execPath), nil
 	}
-	test, err := os.CreateTemp(dir, ".write-test-*")
-	if err != nil {
-		return false
+	return os.Getwd()
+}
+
+func generateSncode(hostname string) string {
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		return "nmc-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	path := test.Name()
-	_ = test.Close()
-	_ = os.Remove(path)
-	return true
+	prefix := strings.ToLower(strings.TrimSpace(hostname))
+	prefix = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, prefix)
+	prefix = strings.Trim(prefix, "-")
+	if prefix == "" {
+		prefix = "device"
+	}
+	if len(prefix) > 24 {
+		prefix = prefix[:24]
+	}
+	return "nmc-" + prefix + "-" + hex.EncodeToString(buf)
 }
 
 func loadClientState(path string) (clientState, error) {
