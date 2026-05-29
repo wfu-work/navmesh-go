@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"strings"
@@ -164,7 +164,7 @@ func (s *Server) handleStream(ctx context.Context, deviceGuid string, stream *qu
 }
 
 func readFrame(stream *quic.Stream) (Frame, error) {
-	line, err := bufio.NewReader(stream).ReadBytes('\n')
+	line, err := readFrameLine(stream)
 	if err != nil {
 		return Frame{}, err
 	}
@@ -173,6 +173,26 @@ func readFrame(stream *quic.Stream) (Frame, error) {
 		return Frame{}, err
 	}
 	return frame, nil
+}
+
+func readFrameLine(r io.Reader) ([]byte, error) {
+	line := make([]byte, 0, 256)
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			line = append(line, buf[0])
+			if buf[0] == '\n' {
+				return line, nil
+			}
+			if len(line) > 64*1024 {
+				return nil, errors.New("frame too large")
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 func writeFrame(stream *quic.Stream, frame Frame) error {

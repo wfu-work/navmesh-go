@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -809,7 +808,7 @@ func normalizeTargetHost(cfg clientConfig, targetHost string) string {
 }
 
 func readFrame(r io.Reader) (tunnel.Frame, error) {
-	line, err := bufio.NewReader(r).ReadBytes('\n')
+	line, err := readFrameLine(r)
 	if err != nil {
 		return tunnel.Frame{}, err
 	}
@@ -818,6 +817,26 @@ func readFrame(r io.Reader) (tunnel.Frame, error) {
 		return tunnel.Frame{}, err
 	}
 	return frame, nil
+}
+
+func readFrameLine(r io.Reader) ([]byte, error) {
+	line := make([]byte, 0, 256)
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			line = append(line, buf[0])
+			if buf[0] == '\n' {
+				return line, nil
+			}
+			if len(line) > 64*1024 {
+				return nil, errors.New("frame too large")
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 func writeFrame(w io.Writer, frame tunnel.Frame) error {
