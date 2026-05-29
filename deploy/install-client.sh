@@ -10,6 +10,7 @@ API="https://navmesh.navfirst.com"
 PORT="3008"
 TOKEN="navfirst@2020"
 EXTRA_ARGS=""
+DOWNLOAD_BASE=""
 
 usage() {
   cat <<'EOF'
@@ -28,10 +29,17 @@ Options:
   --port PORT                NavMesh tunnel UDP port, default 3008
   --token TOKEN              Bootstrap register token, default navfirst@2020
   --extra-args "ARGS"        Extra navmesh-client arguments
+  --download-base URL        Custom binary download base URL, for private mirror/CDN
   -h, --help                 Show help
 
 Example:
-  curl -fsSL https://raw.githubusercontent.com/wfu-work/navmesh-go/main/deploy/install-client.sh | sudo sh -s -- \
+  curl -fsSL https://github.com/wfu-work/navmesh-go/releases/latest/download/install-client.sh | sudo sh -s -- \
+    --server navmesh.navfirst.com \
+    --api https://navmesh.navfirst.com \
+    --token navfirst@2020
+
+  curl -fsSL https://navmesh.navfirst.com/download/install-client.sh | sudo sh -s -- \
+    --download-base https://navmesh.navfirst.com/download \
     --server navmesh.navfirst.com \
     --api https://navmesh.navfirst.com \
     --token navfirst@2020
@@ -89,6 +97,10 @@ while [ "$#" -gt 0 ]; do
       EXTRA_ARGS="${2:-}"
       shift 2
       ;;
+    --download-base)
+      DOWNLOAD_BASE="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -137,7 +149,9 @@ need_cmd install
 need_cmd systemctl
 
 ASSET="navmesh-client-${GOOS}-${GOARCH}"
-if [ "$VERSION" = "latest" ]; then
+if [ -n "$DOWNLOAD_BASE" ]; then
+  DOWNLOAD_URL="${DOWNLOAD_BASE%/}/${ASSET}"
+elif [ "$VERSION" = "latest" ]; then
   DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 else
   DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
