@@ -57,6 +57,8 @@ type clientConfig struct {
 	LocalHost      string
 	SkipRegister   bool
 	InsecureQUIC   bool
+	Transport      string
+	DataChannels   int
 	ReconnectWait  time.Duration
 	ReconnectMax   time.Duration
 	Heartbeat      time.Duration
@@ -191,6 +193,8 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.LocalHost, "localHost", "127.0.0.1", "服务端请求回环目标时使用的本机地址")
 	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过HTTP设备注册，直接建立隧道")
 	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过QUIC服务器证书校验")
+	flag.StringVar(&cfg.Transport, "transport", tunnel.TransportQUIC, "隧道传输协议：quic 或 tcp")
+	flag.IntVar(&cfg.DataChannels, "dataChannels", 4, "TCP 隧道数据连接池大小")
 	flag.BoolVar(&showVersion, "v", false, "查看当前客户端版本")
 	flag.DurationVar(&cfg.ReconnectWait, "reconnectWait", 5*time.Second, "首次重连等待时间")
 	flag.DurationVar(&cfg.ReconnectMax, "reconnectMax", 60*time.Second, "指数退避最大重连等待时间")
@@ -235,6 +239,16 @@ func parseFlags() clientConfig {
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 10 * time.Second
+	}
+	cfg.Transport = strings.ToLower(strings.TrimSpace(cfg.Transport))
+	if cfg.Transport == "" {
+		cfg.Transport = tunnel.TransportQUIC
+	}
+	if cfg.Transport != tunnel.TransportQUIC && cfg.Transport != tunnel.TransportTCP {
+		cfg.Transport = tunnel.TransportQUIC
+	}
+	if cfg.DataChannels <= 0 {
+		cfg.DataChannels = 4
 	}
 	return cfg
 }
@@ -287,7 +301,7 @@ func run(ctx context.Context, cfg clientConfig) error {
 	}
 	snapshot := collectSystemSnapshot()
 	log.Printf(
-		"navmesh-client starting version=%s sncode=%s type=%s guid=%s server=%s port=%d api=%s hostname=%s hostIp=%s wanIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s stateFile=%s skipRegister=%t",
+		"navmesh-client starting version=%s sncode=%s type=%s guid=%s server=%s port=%d api=%s hostname=%s hostIp=%s wanIp=%s os=%s osVersion=%s kernel=%s arch=%s memoryTotal=%d diskTotal=%d sshPort=%d webPort=%d heartbeat=%s transport=%s dataChannels=%d stateFile=%s skipRegister=%t",
 		clientVersion,
 		cfg.Sncode,
 		cfg.DeviceType,
@@ -307,6 +321,8 @@ func run(ctx context.Context, cfg clientConfig) error {
 		cfg.SSHPort,
 		cfg.WebPort,
 		cfg.Heartbeat,
+		cfg.Transport,
+		cfg.DataChannels,
 		cfg.StateFile,
 		cfg.SkipRegister,
 	)
@@ -507,9 +523,16 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 }
 
 func connectAndServe(ctx context.Context, cfg clientConfig) error {
+	if cfg.Transport == tunnel.TransportTCP {
+		return connectAndServeTCP(ctx, cfg)
+	}
+	return connectAndServeQUIC(ctx, cfg)
+}
+
+func connectAndServeQUIC(ctx context.Context, cfg clientConfig) error {
 	addr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
 	log.Printf("connecting tunnel server=%s sncode=%s insecure=%t heartbeat=%s", addr, cfg.Sncode, cfg.InsecureQUIC, cfg.Heartbeat)
-	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
+	controlConn, err := quic.DialAddr(ctx, addr, &tls.Config{
 		InsecureSkipVerify: cfg.InsecureQUIC,
 		NextProtos:         []string{"navmesh-quic"},
 		MinVersion:         tls.VersionTLS13,
@@ -517,9 +540,21 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 	if err != nil {
 		return err
 	}
-	defer conn.CloseWithError(0, "client reconnecting")
+	defer controlConn.CloseWithError(0, "client reconnecting")
 
-	if err := sendHello(ctx, conn, cfg); err != nil {
+	if err := sendHello(ctx, controlConn, cfg, tunnel.RoleControl); err != nil {
+		return err
+	}
+	dataConn, err := quic.DialAddr(ctx, addr, &tls.Config{
+		InsecureSkipVerify: cfg.InsecureQUIC,
+		NextProtos:         []string{"navmesh-quic"},
+		MinVersion:         tls.VersionTLS13,
+	}, tunnel.NewQUICConfig(cfg.Heartbeat))
+	if err != nil {
+		return err
+	}
+	defer dataConn.CloseWithError(0, "client reconnecting")
+	if err := sendHello(ctx, dataConn, cfg, tunnel.RoleData); err != nil {
 		return err
 	}
 	snapshot := collectSystemSnapshot()
@@ -528,14 +563,14 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
 	heartbeatErr := make(chan error, 1)
-	go heartbeatLoop(heartbeatCtx, conn, cfg, heartbeatErr)
+	go heartbeatLoop(heartbeatCtx, controlConn, cfg, heartbeatErr)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	acceptErr := make(chan error, 1)
 	go func() {
 		for {
-			stream, err := conn.AcceptStream(ctx)
+			stream, err := dataConn.AcceptStream(ctx)
 			if err != nil {
 				acceptErr <- err
 				return
@@ -553,16 +588,18 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 		case err := <-acceptErr:
 			return err
 		case err := <-heartbeatErr:
-			_ = conn.CloseWithError(2, "heartbeat failed")
+			_ = controlConn.CloseWithError(2, "heartbeat failed")
+			_ = dataConn.CloseWithError(2, "heartbeat failed")
 			return err
 		case <-ctx.Done():
-			_ = conn.CloseWithError(0, "client stopping")
+			_ = controlConn.CloseWithError(0, "client stopping")
+			_ = dataConn.CloseWithError(0, "client stopping")
 			return ctx.Err()
 		}
 	}
 }
 
-func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
+func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig, role string) error {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
@@ -570,6 +607,8 @@ func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
 	defer stream.Close()
 	frame := tunnel.Frame{
 		Type:          tunnel.FrameTypeHello,
+		Role:          role,
+		Transport:     tunnel.TransportQUIC,
 		Token:         cfg.authToken(),
 		DeviceGuid:    cfg.DeviceGuid,
 		SnCode:        cfg.Sncode,
@@ -589,6 +628,181 @@ func sendHello(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
 		return fmt.Errorf("hello rejected: %s", ack.Message)
 	}
 	log.Printf("hello accepted sncode=%s message=%s", cfg.Sncode, ack.Message)
+	return nil
+}
+
+func connectAndServeTCP(ctx context.Context, cfg clientConfig) error {
+	addr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
+	log.Printf("connecting tcp tunnel server=%s sncode=%s heartbeat=%s dataChannels=%d", addr, cfg.Sncode, cfg.Heartbeat, cfg.DataChannels)
+	control, err := (&net.Dialer{Timeout: cfg.RequestTimeout, KeepAlive: cfg.Heartbeat}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer control.Close()
+	if err := sendTCPHello(control, cfg, tunnel.RoleControl); err != nil {
+		return err
+	}
+	dataCtx, cancelData := context.WithCancel(ctx)
+	defer cancelData()
+	dataErr := make(chan error, cfg.DataChannels)
+	for i := 0; i < cfg.DataChannels; i++ {
+		go tcpDataLoop(dataCtx, cfg, i, dataErr)
+	}
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	defer cancelHeartbeat()
+	heartbeatErr := make(chan error, 1)
+	go tcpHeartbeatLoop(heartbeatCtx, control, cfg, heartbeatErr)
+	snapshot := collectSystemSnapshot()
+	log.Printf("tcp tunnel connected server=%s sncode=%s hostname=%s hostIp=%s wanIp=%s %s", addr, cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, snapshot.logFields())
+	for {
+		select {
+		case err := <-heartbeatErr:
+			return err
+		case err := <-dataErr:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("tcp data channel exited: %v", err)
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func sendTCPHello(conn net.Conn, cfg clientConfig, role string) error {
+	_ = conn.SetDeadline(time.Now().Add(cfg.RequestTimeout))
+	frame := tunnel.Frame{
+		Type:          tunnel.FrameTypeHello,
+		Role:          role,
+		Transport:     tunnel.TransportTCP,
+		Token:         cfg.authToken(),
+		DeviceGuid:    cfg.DeviceGuid,
+		SnCode:        cfg.Sncode,
+		HostIP:        cfg.HostIP,
+		WanIP:         cfg.WanIP,
+		Hostname:      cfg.Hostname,
+		ClientVersion: clientVersion,
+	}
+	if err := writeFrame(conn, frame); err != nil {
+		return err
+	}
+	ack, err := readFrame(conn)
+	if err != nil {
+		return err
+	}
+	if ack.Type != tunnel.FrameTypeHelloAck || !ack.OK {
+		return fmt.Errorf("hello rejected: %s", ack.Message)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return nil
+}
+
+func tcpDataLoop(ctx context.Context, cfg clientConfig, index int, errCh chan<- error) {
+	addr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, err := (&net.Dialer{Timeout: cfg.RequestTimeout, KeepAlive: cfg.Heartbeat}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+			return
+		}
+		if err := sendTCPHello(conn, cfg, tunnel.RoleData); err != nil {
+			_ = conn.Close()
+			select {
+			case errCh <- err:
+			default:
+			}
+			return
+		}
+		log.Printf("tcp data channel ready index=%d sncode=%s", index, cfg.Sncode)
+		if err := handleTCPDataConnection(ctx, cfg, conn); err != nil && ctx.Err() == nil {
+			log.Printf("tcp data channel recycled index=%d err=%v", index, err)
+		}
+	}
+}
+
+func handleTCPDataConnection(ctx context.Context, cfg clientConfig, conn net.Conn) error {
+	defer conn.Close()
+	frame, err := readFrame(conn)
+	if err != nil {
+		return err
+	}
+	if frame.Type != tunnel.FrameTypeOpenTCP {
+		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "unsupported frame type"})
+		return errors.New("unsupported frame type")
+	}
+	targetHost := normalizeTargetHost(cfg, frame.TargetHost)
+	targetPort := frame.TargetPort
+	if targetPort <= 0 {
+		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "invalid target port"})
+		return errors.New("invalid target port")
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+	defer cancel()
+	local, err := (&net.Dialer{Timeout: cfg.RequestTimeout}).DialContext(dialCtx, "tcp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
+	if err != nil {
+		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, OK: false, Message: err.Error()})
+		return err
+	}
+	defer local.Close()
+	if err := writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeOpenTCPAck, RequestID: frame.RequestID, OK: true}); err != nil {
+		return err
+	}
+	bridge(local, conn)
+	return nil
+}
+
+func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errCh chan<- error) {
+	ticker := time.NewTicker(cfg.Heartbeat)
+	defer ticker.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tcpErr := sendTCPHeartbeat(conn, cfg)
+			httpErr := postHeartbeat(ctx, cfg)
+			if tcpErr != nil && httpErr != nil {
+				failures++
+				log.Printf("tcp heartbeat failed failures=%d tcpErr=%v httpErr=%v", failures, tcpErr, httpErr)
+			} else {
+				failures = 0
+				snapshot := collectSystemSnapshot()
+				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat, snapshot.logFields())
+			}
+			if failures >= cfg.HeartbeatFail {
+				select {
+				case errCh <- fmt.Errorf("heartbeat failed %d times", failures):
+				default:
+				}
+				return
+			}
+		}
+	}
+}
+
+func sendTCPHeartbeat(conn net.Conn, cfg clientConfig) error {
+	timeout := heartbeatRoundTripTimeout(cfg)
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
+	requestID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeHeartbeat, SnCode: cfg.Sncode, RequestID: requestID}); err != nil {
+		return err
+	}
+	ack, err := readFrame(conn)
+	if err != nil {
+		return err
+	}
+	if ack.Type != tunnel.FrameTypePong || !ack.OK {
+		return fmt.Errorf("heartbeat rejected: type=%s ok=%t message=%s", ack.Type, ack.OK, ack.Message)
+	}
 	return nil
 }
 

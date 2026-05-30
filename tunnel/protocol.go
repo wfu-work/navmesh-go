@@ -13,8 +13,19 @@ const (
 	FrameTypeError      = "error"
 )
 
+const (
+	TransportQUIC = "quic"
+	TransportTCP  = "tcp"
+
+	RoleLegacy  = ""
+	RoleControl = "control"
+	RoleData    = "data"
+)
+
 type Frame struct {
 	Type          string `json:"type"`
+	Role          string `json:"role,omitempty"`
+	Transport     string `json:"transport,omitempty"`
 	RequestID     string `json:"requestId,omitempty"`
 	Token         string `json:"token,omitempty"`
 	DeviceGuid    string `json:"deviceGuid,omitempty"`

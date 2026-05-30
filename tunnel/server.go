@@ -27,6 +27,7 @@ type Server struct {
 	addr     string
 	manager  *Manager
 	listener *quic.Listener
+	tcpLn    net.Listener
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
@@ -49,8 +50,16 @@ func (s *Server) Start() error {
 		return err
 	}
 	s.listener = listener
+	tcpLn, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	s.tcpLn = tcpLn
 	s.wg.Add(1)
 	go s.acceptLoop(ctx)
+	s.wg.Add(1)
+	go s.acceptTCPLoop(ctx)
 	global.NAV_LOG.Info("navmesh quic tunnel server started", zap.String("addr", s.addr))
 	return nil
 }
@@ -62,8 +71,30 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
+	if s.tcpLn != nil {
+		_ = s.tcpLn.Close()
+	}
 	s.manager.CloseAll()
 	s.wg.Wait()
+}
+
+func (s *Server) acceptTCPLoop(ctx context.Context) {
+	defer s.wg.Done()
+	for {
+		conn, err := s.tcpLn.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			global.NAV_LOG.Warn("accept tcp tunnel failed", zap.Error(err))
+			continue
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleTCPConnection(ctx, conn)
+		}()
+	}
 }
 
 func (s *Server) acceptLoop(ctx context.Context) {
@@ -114,9 +145,23 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 		_ = conn.CloseWithError(1, "auth failed")
 		return
 	}
-	s.manager.Register(*device, conn)
+	s.manager.RegisterQUIC(*device, conn, frame.Role)
 	_ = writeFrame(stream, Frame{Type: FrameTypeHelloAck, OK: true, DeviceGuid: device.Guid, SnCode: device.Sncode})
 	_ = stream.Close()
+	if frame.Role == RoleData {
+		defer s.manager.UnregisterQUICData(device.Guid, conn)
+		for {
+			next, err := conn.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.handleStream(ctx, device.Guid, next)
+			}()
+		}
+	}
 	defer func() {
 		s.manager.Unregister(device.Guid)
 		s.manager.SetOffline(device.Guid)
@@ -142,6 +187,59 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 	}
 }
 
+func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
+	frame, err := readFrameFromReader(conn)
+	if err != nil || frame.Type != FrameTypeHello {
+		_ = writeFrameToWriter(conn, Frame{Type: FrameTypeError, OK: false, Message: "hello required"})
+		_ = conn.Close()
+		return
+	}
+	device, err := services.ServiceGroupApp.DeviceService.Authenticate(
+		frame.Token,
+		frame.DeviceGuid,
+		frame.SnCode,
+		conn.RemoteAddr().String(),
+		frame.HostIP,
+		frame.WanIP,
+		frame.Hostname,
+		frame.ClientVersion,
+	)
+	if err != nil {
+		_ = writeFrameToWriter(conn, Frame{Type: FrameTypeError, OK: false, Message: err.Error()})
+		_ = conn.Close()
+		return
+	}
+	s.manager.RegisterTCP(*device, conn, frame.Role)
+	_ = writeFrameToWriter(conn, Frame{Type: FrameTypeHelloAck, OK: true, DeviceGuid: device.Guid, SnCode: device.Sncode})
+	if frame.Role == RoleData {
+		return
+	}
+	defer func() {
+		s.manager.Unregister(device.Guid)
+		s.manager.SetOffline(device.Guid)
+		services.ServiceGroupApp.EventService.Record(services.EventInput{
+			DeviceGuid: device.Guid,
+			EventType:  "device_offline",
+			Level:      "warn",
+			Title:      "device tcp tunnel offline",
+			Message:    conn.RemoteAddr().String(),
+		})
+	}()
+	for {
+		next, err := readFrameFromReader(conn)
+		if err != nil {
+			return
+		}
+		s.manager.Touch(device.Guid)
+		switch next.Type {
+		case FrameTypeHeartbeat, FrameTypePing:
+			_ = writeFrameToWriter(conn, Frame{Type: FrameTypePong, OK: true, RequestID: next.RequestID})
+		default:
+			_ = writeFrameToWriter(conn, Frame{Type: FrameTypeError, OK: false, RequestID: next.RequestID, Message: "unsupported frame type"})
+		}
+	}
+}
+
 func (s *Server) handleStream(ctx context.Context, deviceGuid string, stream *quic.Stream) {
 	defer stream.Close()
 	frame, err := readFrame(stream)
@@ -161,7 +259,11 @@ func (s *Server) handleStream(ctx context.Context, deviceGuid string, stream *qu
 }
 
 func readFrame(stream *quic.Stream) (Frame, error) {
-	line, err := readFrameLine(stream)
+	return readFrameFromReader(stream)
+}
+
+func readFrameFromReader(r io.Reader) (Frame, error) {
+	line, err := readFrameLine(r)
 	if err != nil {
 		return Frame{}, err
 	}
@@ -193,11 +295,15 @@ func readFrameLine(r io.Reader) ([]byte, error) {
 }
 
 func writeFrame(stream *quic.Stream, frame Frame) error {
+	return writeFrameToWriter(stream, frame)
+}
+
+func writeFrameToWriter(w io.Writer, frame Frame) error {
 	data, err := EncodeFrame(frame)
 	if err != nil {
 		return err
 	}
-	_, err = stream.Write(data)
+	_, err = w.Write(data)
 	return err
 }
 

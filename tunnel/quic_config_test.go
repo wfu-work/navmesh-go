@@ -19,6 +19,12 @@ func TestNewQUICConfigExpandsHTTPMappingCapacity(t *testing.T) {
 	if cfg.MaxConnectionReceiveWindow < 64<<20 {
 		t.Fatalf("MaxConnectionReceiveWindow = %d, want at least 64MiB", cfg.MaxConnectionReceiveWindow)
 	}
+	if cfg.InitialPacketSize != 1200 {
+		t.Fatalf("InitialPacketSize = %d, want 1200", cfg.InitialPacketSize)
+	}
+	if !cfg.DisablePathMTUDiscovery {
+		t.Fatal("DisablePathMTUDiscovery = false, want true")
+	}
 }
 
 func TestNewQUICConfigDefaultsKeepAlive(t *testing.T) {

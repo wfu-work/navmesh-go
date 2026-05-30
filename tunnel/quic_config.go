@@ -27,6 +27,8 @@ func NewQUICConfig(keepAlive time.Duration) *quic.Config {
 		MaxStreamReceiveWindow:           16 << 20,
 		InitialConnectionReceiveWindow:   4 << 20,
 		MaxConnectionReceiveWindow:       128 << 20,
+		InitialPacketSize:                1200,
+		DisablePathMTUDiscovery:          true,
 		EnableStreamResetPartialDelivery: true,
 	}
 }
