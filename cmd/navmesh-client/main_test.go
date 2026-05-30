@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -40,6 +41,28 @@ func TestCloseReadCancelsQUICReadSide(t *testing.T) {
 	}
 	if conn.closeCount != 0 {
 		t.Fatalf("Close count = %d, want 0", conn.closeCount)
+	}
+}
+
+func TestHeartbeatFailedRequiresQUICAndHTTPFailure(t *testing.T) {
+	err := errors.New("deadline exceeded")
+	tests := []struct {
+		name    string
+		quicErr error
+		httpErr error
+		want    bool
+	}{
+		{name: "both ok", want: false},
+		{name: "quic delayed http ok", quicErr: err, want: false},
+		{name: "quic ok http failed", httpErr: err, want: false},
+		{name: "both failed", quicErr: err, httpErr: err, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := heartbeatFailed(tt.quicErr, tt.httpErr); got != tt.want {
+				t.Fatalf("heartbeatFailed() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 

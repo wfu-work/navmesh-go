@@ -513,10 +513,7 @@ func connectAndServe(ctx context.Context, cfg clientConfig) error {
 		InsecureSkipVerify: cfg.InsecureQUIC,
 		NextProtos:         []string{"navmesh-quic"},
 		MinVersion:         tls.VersionTLS13,
-	}, &quic.Config{
-		KeepAlivePeriod: cfg.Heartbeat,
-		MaxIdleTimeout:  cfg.Heartbeat * 4,
-	})
+	}, tunnel.NewQUICConfig(cfg.Heartbeat))
 	if err != nil {
 		return err
 	}
@@ -604,13 +601,15 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := sendHeartbeat(ctx, conn, cfg); err != nil {
+			quicErr := sendHeartbeat(ctx, conn, cfg)
+			httpErr := postHeartbeat(ctx, cfg)
+			if heartbeatFailed(quicErr, httpErr) {
 				failures++
-				log.Printf("quic heartbeat failed failures=%d err=%v", failures, err)
-			} else if err := postHeartbeat(ctx, cfg); err != nil {
-				failures++
-				log.Printf("http heartbeat failed failures=%d err=%v", failures, err)
+				log.Printf("heartbeat failed failures=%d quicErr=%v httpErr=%v", failures, quicErr, httpErr)
 			} else {
+				if quicErr != nil {
+					log.Printf("quic heartbeat delayed but http heartbeat ok err=%v", quicErr)
+				}
 				failures = 0
 				snapshot := collectSystemSnapshot()
 				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat, snapshot.logFields())
@@ -624,6 +623,10 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 			}
 		}
 	}
+}
+
+func heartbeatFailed(quicErr error, httpErr error) bool {
+	return quicErr != nil && httpErr != nil
 }
 
 func sendHeartbeat(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {

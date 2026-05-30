@@ -44,10 +44,7 @@ func NewServer(addr string, manager *Manager) *Server {
 func (s *Server) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	listener, err := quic.ListenAddr(s.addr, generateTLSConfig(), &quic.Config{
-		KeepAlivePeriod: 30 * time.Second,
-		MaxIdleTimeout:  90 * time.Second,
-	})
+	listener, err := quic.ListenAddr(s.addr, generateTLSConfig(), NewQUICConfig(30*time.Second))
 	if err != nil {
 		return err
 	}
