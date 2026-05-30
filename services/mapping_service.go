@@ -2,13 +2,13 @@ package services
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 
 	"navmesh-go/domains"
 	"navmesh-go/utils"
 
 	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
-	"github.com/wfu-work/nav-common-go-lib/global"
 	commonServices "github.com/wfu-work/nav-common-go-lib/services"
 	"gorm.io/gorm"
 )
@@ -127,7 +127,10 @@ func (s MappingService) Disable(guid string) error {
 }
 
 func (s MappingService) AccessLogs(params map[string]string) ([]domains.HTTPAccessLog, int64, error) {
-	db := global.NAV_DB.Model(&domains.HTTPAccessLog{})
+	db := s.DB().Model(&domains.HTTPAccessLog{})
+	if mappingGuid := strings.TrimSpace(params["mappingGuid"]); mappingGuid != "" {
+		db = db.Where("mapping_guid = ?", mappingGuid)
+	}
 	if host := strings.TrimSpace(params["host"]); host != "" {
 		db = db.Where("host = ?", host)
 	}
@@ -142,6 +145,28 @@ func (s MappingService) AccessLogs(params map[string]string) ([]domains.HTTPAcce
 	}
 	if statusCode := utils.Str2Int(params["statusCode"]); statusCode > 0 {
 		db = db.Where("status_code = ?", statusCode)
+	}
+	if minDurationMs := queryInt64(params, "minDurationMs"); minDurationMs > 0 {
+		db = db.Where("duration_ms >= ?", minDurationMs)
+	}
+	if minTunnelOpenMs := queryInt64(params, "minTunnelOpenMs"); minTunnelOpenMs > 0 {
+		db = db.Where("tunnel_open_ms >= ?", minTunnelOpenMs)
+	}
+	if minUpstreamMs := queryInt64(params, "minUpstreamMs"); minUpstreamMs > 0 {
+		db = db.Where("upstream_ms >= ?", minUpstreamMs)
+	}
+	if minFirstByteMs := queryInt64(params, "minFirstByteMs"); minFirstByteMs > 0 {
+		db = db.Where("first_byte_ms >= ?", minFirstByteMs)
+	}
+	if reusedConn, ok := queryBool(params, "reusedConn"); ok {
+		db = db.Where("reused_conn = ?", reusedConn)
+	}
+	if hasError, ok := queryBool(params, "hasError"); ok {
+		if hasError {
+			db = db.Where("error_message <> ''")
+		} else {
+			db = db.Where("error_message = ''")
+		}
 	}
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
@@ -158,6 +183,30 @@ func (s MappingService) AccessLogs(params map[string]string) ([]domains.HTTPAcce
 	var items []domains.HTTPAccessLog
 	err := db.Order("create_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
 	return items, total, err
+}
+
+func queryInt64(params map[string]string, key string) int64 {
+	value := strings.TrimSpace(params[key])
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0
+	}
+	return parsed
+}
+
+func queryBool(params map[string]string, key string) (bool, bool) {
+	value := strings.ToLower(strings.TrimSpace(params[key]))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func (s MappingService) customDomainService() CustomDomainService {

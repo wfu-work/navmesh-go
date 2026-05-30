@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"navmesh-go/tunnel"
 
 	"github.com/google/uuid"
+	"github.com/quic-go/quic-go"
 	"github.com/wfu-work/nav-common-go-lib/global"
 	"go.uber.org/zap"
 )
@@ -31,7 +33,7 @@ type Server struct {
 
 func NewServer(addr string, manager *tunnel.Manager) *Server {
 	if strings.TrimSpace(addr) == "" {
-		addr = ":8080"
+		addr = ":3009"
 	}
 	if manager == nil {
 		manager = tunnel.DefaultManager
@@ -102,51 +104,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusForbidden, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: "access policy denied"})
 		return
 	}
-	permit, err := services.DefaultRuntimePolicy.Acquire(device.Guid, clientIP)
-	if err != nil {
-		renderGatewayErrorPage(w, gatewayErrorPage{
-			StatusCode:  http.StatusTooManyRequests,
-			Title:       "连接过多",
-			Subtitle:    "当前设备的访问会话已达到限制。",
-			Host:        host,
-			Path:        requestPath,
-			DeviceName:  displayDeviceName(device),
-			MappingName: displayMappingName(mapping),
-			Hint:        "请稍后刷新重试，或关闭不再使用的会话。",
-		})
-		services.ServiceGroupApp.EventService.Record(services.EventInput{
-			DeviceGuid: device.Guid,
-			EventType:  "session_rejected",
-			Level:      "warn",
-			Title:      "http session rejected",
-			Message:    err.Error(),
-		})
-		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusTooManyRequests, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: err.Error()})
-		return
-	}
-	defer services.DefaultRuntimePolicy.Release(permit)
 	proxy := newHTTPReverseProxy(s.transport, mapping, device, host, clientIP)
 	proxy.ServeHTTP(w, r)
-}
-
-func sanitizeHopByHopRequestHeaders(header http.Header) {
-	removeHopByHopHeaders(header)
-}
-
-func removeHopByHopHeaders(header http.Header) {
-	for _, key := range []string{
-		"Connection",
-		"Proxy-Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"Te",
-		"Trailer",
-		"Transfer-Encoding",
-		"Upgrade",
-	} {
-		header.Del(key)
-	}
 }
 
 type httpReverseProxy struct {
@@ -155,12 +114,11 @@ type httpReverseProxy struct {
 
 func newHTTPReverseProxy(transport *http.Transport, mapping domains.PortMapping, device domains.Device, host, clientIP string) *httpReverseProxy {
 	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = "http"
-			req.URL.Host = proxyPoolHost(mapping)
-			req.Host = mapping.PublicHost
-			sanitizeHopByHopRequestHeaders(req.Header)
-			req.Close = true
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = "http"
+			pr.Out.URL.Host = proxyPoolHost(mapping)
+			pr.Out.Host = firstNonEmpty(mapping.PublicHost, host)
+			setForwardedHeaders(pr, host, clientIP)
 		},
 		Transport: &httpMappingRoundTripper{
 			base:     transport,
@@ -173,13 +131,18 @@ func newHTTPReverseProxy(transport *http.Transport, mapping domains.PortMapping,
 			title := "目标服务暂时不可用"
 			subtitle := "网关暂时无法连接现场设备的目标服务。"
 			hint := "请稍后刷新重试；如果持续出现，请检查设备客户端和本地 Web 服务是否正常运行。"
-			if strings.Contains(strings.ToLower(err.Error()), "device tunnel offline") {
+			statusCode := statusCodeForProxyError(err)
+			if statusCode == http.StatusTooManyRequests {
+				title = "连接过多"
+				subtitle = "当前设备的访问连接已达到限制。"
+				hint = "请稍后刷新重试，或关闭不再使用的连接。"
+			} else if strings.Contains(strings.ToLower(err.Error()), "device tunnel offline") {
 				title = "设备隧道未连接"
 				subtitle = "现场设备当前不在线，HTTP 映射暂时无法访问。"
 				hint = "设备客户端重新连接后页面会恢复访问，可以稍后刷新重试。"
 			}
 			renderGatewayErrorPage(rw, gatewayErrorPage{
-				StatusCode:  http.StatusBadGateway,
+				StatusCode:  statusCode,
 				Title:       title,
 				Subtitle:    subtitle,
 				Host:        host,
@@ -192,6 +155,86 @@ func newHTTPReverseProxy(transport *http.Transport, mapping domains.PortMapping,
 		FlushInterval: 50 * time.Millisecond,
 	}
 	return &httpReverseProxy{proxy: proxy}
+}
+
+func setForwardedHeaders(pr *httputil.ProxyRequest, host, clientIP string) {
+	if clientIP != "" {
+		pr.Out.Header.Set("X-Real-IP", clientIP)
+		pr.Out.Header.Set("X-Forwarded-For", clientIP)
+	}
+	if host != "" {
+		pr.Out.Header.Set("X-Forwarded-Host", host)
+	}
+	pr.Out.Header.Set("X-Forwarded-Proto", requestProto(pr.In))
+	if port := requestPort(pr.In, host); port != "" {
+		pr.Out.Header.Set("X-Forwarded-Port", port)
+	}
+}
+
+func requestProto(r *http.Request) string {
+	if proto := normalizeProto(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); proto != "" {
+		return proto
+	}
+	if proto := normalizeProto(firstForwardedParam(r.Header.Get("Forwarded"), "proto")); proto != "" {
+		return proto
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func requestPort(r *http.Request, host string) string {
+	if port := firstForwardedValue(r.Header.Get("X-Forwarded-Port")); port != "" {
+		return port
+	}
+	if _, port, err := net.SplitHostPort(r.Host); err == nil {
+		return port
+	}
+	if _, port, err := net.SplitHostPort(host); err == nil {
+		return port
+	}
+	if requestProto(r) == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+func firstForwardedValue(value string) string {
+	value = strings.TrimSpace(value)
+	if index := strings.Index(value, ","); index >= 0 {
+		value = value[:index]
+	}
+	return strings.TrimSpace(value)
+}
+
+func firstForwardedParam(value string, key string) string {
+	for _, group := range strings.Split(value, ",") {
+		for _, part := range strings.Split(group, ";") {
+			k, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if ok && strings.EqualFold(strings.TrimSpace(k), key) {
+				return strings.Trim(strings.TrimSpace(raw), `"`)
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeProto(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "http" || value == "https" {
+		return value
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (p *httpReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +265,10 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	source := rt.sourceIP
 	var bytesIn int64
 	var bytesOut int64
+	var tunnelOpenMs int64
+	var upstreamMs int64
+	var firstByteMs int64
+	var reusedConn atomic.Bool
 	statusCode := 0
 	finishOnce := sync.Once{}
 	finish := func(reason string) {
@@ -235,9 +282,13 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 				SourceIP:     source,
 				StatusCode:   statusCodeOrDefault(statusCode),
 				DurationMs:   time.Since(start).Milliseconds(),
+				TunnelOpenMs: atomic.LoadInt64(&tunnelOpenMs),
+				UpstreamMs:   atomic.LoadInt64(&upstreamMs),
+				FirstByteMs:  atomic.LoadInt64(&firstByteMs),
+				ReusedConn:   reusedConn.Load(),
 				BytesIn:      bytesIn,
 				BytesOut:     atomic.LoadInt64(&bytesOut),
-				ErrorMessage: strings.TrimSpace(reason),
+				ErrorMessage: accessLogErrorMessage(reason),
 			})
 		})
 	}
@@ -255,9 +306,23 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		Host:     rt.host,
 		SourceIP: rt.sourceIP,
 	})
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			reusedConn.Store(info.Reused)
+			if !info.Reused {
+				atomic.StoreInt64(&tunnelOpenMs, time.Since(start).Milliseconds())
+			}
+		},
+		GotFirstResponseByte: func() {
+			atomic.CompareAndSwapInt64(&firstByteMs, 0, time.Since(start).Milliseconds())
+		},
+	}
+	ctx = httptrace.WithClientTrace(ctx, trace)
 	req = req.WithContext(ctx)
 	resp, err := rt.base.RoundTrip(req)
+	atomic.StoreInt64(&upstreamMs, time.Since(start).Milliseconds())
 	if err != nil {
+		statusCode = statusCodeForProxyError(err)
 		finish("proxy_error: " + err.Error())
 		var dialErr *tunnelDialError
 		if errors.As(err, &dialErr) {
@@ -267,7 +332,7 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	}
 	statusCode = resp.StatusCode
 	if resp.Body == nil {
-		finish("closed")
+		finish("")
 		return resp, nil
 	}
 	resp.Body = &countingResponseBody{
@@ -276,7 +341,7 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			atomic.AddInt64(&bytesOut, int64(n))
 		},
 		onClose: func() {
-			finish("closed")
+			finish("")
 		},
 	}
 	return resp, nil
@@ -290,7 +355,7 @@ func newTunnelHTTPTransport(manager *tunnel.Manager) *http.Transport {
 		Proxy:                 nil,
 		DialContext:           tunnelDialContext(manager),
 		ForceAttemptHTTP2:     false,
-		DisableKeepAlives:     true,
+		DisableKeepAlives:     false,
 		MaxIdleConns:          512,
 		MaxIdleConnsPerHost:   64,
 		MaxConnsPerHost:       128,
@@ -307,10 +372,22 @@ func tunnelDialContext(manager *tunnel.Manager) func(context.Context, string, st
 		if !ok {
 			return nil, net.InvalidAddrError("missing http mapping context")
 		}
+		permit, err := services.DefaultRuntimePolicy.Acquire(info.Device.Guid, info.SourceIP)
+		if err != nil {
+			services.ServiceGroupApp.EventService.Record(services.EventInput{
+				DeviceGuid: info.Device.Guid,
+				EventType:  "session_rejected",
+				Level:      "warn",
+				Title:      "http connection rejected",
+				Message:    err.Error(),
+			})
+			return nil, err
+		}
 		streamCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 		upstream, err := manager.OpenTCPStream(streamCtx, info.Device.Guid, info.Mapping.TargetHost, info.Mapping.TargetPort)
 		if err != nil {
+			services.DefaultRuntimePolicy.Release(permit)
 			return nil, &tunnelDialError{err: err}
 		}
 		session := createHTTPSession(info.Mapping, info.Device, info.Host, info.SourceIP)
@@ -318,8 +395,10 @@ func tunnelDialContext(manager *tunnel.Manager) func(context.Context, string, st
 			ReadWriteCloser: upstream,
 			sessionGuid:     session.Guid,
 			sourceIP:        info.SourceIP,
+			permit:          permit,
+			idleTimeout:     services.DefaultRuntimePolicy.IdleTimeout(),
 		}
-		applyIdleDeadline(conn, services.DefaultRuntimePolicy.IdleTimeout())
+		conn.refreshIdleDeadline()
 		services.DefaultSessionRegistry.RegisterSession(session.Guid, conn)
 		return conn, nil
 	}
@@ -374,6 +453,8 @@ type tunnelHTTPConn struct {
 	io.ReadWriteCloser
 	sessionGuid string
 	sourceIP    string
+	permit      *services.SessionPermit
+	idleTimeout time.Duration
 	bytesIn     atomic.Int64
 	bytesOut    atomic.Int64
 	closed      atomic.Bool
@@ -383,6 +464,7 @@ func (c *tunnelHTTPConn) Read(p []byte) (int, error) {
 	n, err := c.ReadWriteCloser.Read(p)
 	if n > 0 {
 		c.bytesOut.Add(int64(n))
+		c.refreshIdleDeadline()
 	}
 	return n, err
 }
@@ -391,6 +473,7 @@ func (c *tunnelHTTPConn) Write(p []byte) (int, error) {
 	n, err := c.ReadWriteCloser.Write(p)
 	if n > 0 {
 		c.bytesIn.Add(int64(n))
+		c.refreshIdleDeadline()
 	}
 	return n, err
 }
@@ -407,7 +490,15 @@ func (c *tunnelHTTPConn) Close() error {
 		services.DefaultSessionRegistry.UnregisterSession(c.sessionGuid)
 		closeHTTPSession(c.sessionGuid, c.bytesIn.Load(), c.bytesOut.Load(), reason)
 	}
-	return c.ReadWriteCloser.Close()
+	services.DefaultRuntimePolicy.Release(c.permit)
+	return closeTunnelReadWriteCloser(c.ReadWriteCloser)
+}
+
+func (c *tunnelHTTPConn) refreshIdleDeadline() {
+	if c.idleTimeout <= 0 {
+		return
+	}
+	_ = c.SetDeadline(time.Now().Add(c.idleTimeout))
 }
 
 func (c *tunnelHTTPConn) LocalAddr() net.Addr {
@@ -440,6 +531,17 @@ func (c *tunnelHTTPConn) SetWriteDeadline(t time.Time) error {
 		return deadliner.SetWriteDeadline(t)
 	}
 	return c.SetDeadline(t)
+}
+
+func closeTunnelReadWriteCloser(conn io.ReadWriteCloser) error {
+	if conn == nil {
+		return nil
+	}
+	err := conn.Close()
+	if closer, ok := conn.(interface{ CancelRead(quic.StreamErrorCode) }); ok {
+		closer.CancelRead(0)
+	}
+	return err
 }
 
 type tunnelHTTPAddr string
@@ -699,6 +801,27 @@ func statusCodeOrDefault(value int) int {
 	return value
 }
 
+func statusCodeForProxyError(err error) int {
+	if err == nil {
+		return http.StatusBadGateway
+	}
+	errText := strings.ToLower(err.Error())
+	if strings.Contains(errText, "rate limit exceeded") ||
+		strings.Contains(errText, "max concurrent sessions exceeded") ||
+		strings.Contains(errText, "max device sessions exceeded") {
+		return http.StatusTooManyRequests
+	}
+	return http.StatusBadGateway
+}
+
+func accessLogErrorMessage(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" || reason == "closed" {
+		return ""
+	}
+	return reason
+}
+
 type countingReadCloser struct {
 	io.ReadCloser
 	onRead func(int)
@@ -778,13 +901,4 @@ func isForceClosed(guid string) bool {
 		return false
 	}
 	return session.ForceClosed
-}
-
-func applyIdleDeadline(conn io.ReadWriteCloser, timeout time.Duration) {
-	if timeout <= 0 {
-		return
-	}
-	if deadliner, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
-		_ = deadliner.SetDeadline(time.Now().Add(timeout))
-	}
 }

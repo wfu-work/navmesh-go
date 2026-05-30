@@ -1122,16 +1122,44 @@ func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(a, b)
-		_ = a.Close()
+		closeWrite(a)
+		closeRead(b)
 		done <- struct{}{}
 	}()
 	go func() {
 		_, _ = io.Copy(b, a)
-		_ = b.Close()
+		closeWrite(b)
+		closeRead(a)
 		done <- struct{}{}
 	}()
 	<-done
 	<-done
+	_ = a.Close()
+	_ = b.Close()
+}
+
+func closeWrite(conn io.Closer) {
+	if conn == nil {
+		return
+	}
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = closer.CloseWrite()
+		return
+	}
+	_ = conn.Close()
+}
+
+func closeRead(conn io.Closer) {
+	if conn == nil {
+		return
+	}
+	if closer, ok := conn.(interface{ CloseRead() error }); ok {
+		_ = closer.CloseRead()
+		return
+	}
+	if closer, ok := conn.(interface{ CancelRead(quic.StreamErrorCode) }); ok {
+		closer.CancelRead(0)
+	}
 }
 
 func detectOutboundIP() string {

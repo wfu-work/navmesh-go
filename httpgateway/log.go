@@ -16,6 +16,10 @@ type mappingLogInput struct {
 	SourceIP     string
 	StatusCode   int
 	DurationMs   int64
+	TunnelOpenMs int64
+	UpstreamMs   int64
+	FirstByteMs  int64
+	ReusedConn   bool
 	BytesIn      int64
 	BytesOut     int64
 	ErrorMessage string
@@ -49,6 +53,10 @@ func insertAccessLog(input mappingLogInput) {
 		SourceIP:     input.SourceIP,
 		StatusCode:   input.StatusCode,
 		DurationMs:   input.DurationMs,
+		TunnelOpenMs: input.TunnelOpenMs,
+		UpstreamMs:   input.UpstreamMs,
+		FirstByteMs:  input.FirstByteMs,
+		ReusedConn:   input.ReusedConn,
 		BytesIn:      input.BytesIn,
 		BytesOut:     input.BytesOut,
 		ErrorMessage: input.ErrorMessage,

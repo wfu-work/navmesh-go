@@ -10,6 +10,10 @@ type HTTPAccessLog struct {
 	SourceIP     string `json:"sourceIp" gorm:"size:64;comment:来源IP"`
 	StatusCode   int    `json:"statusCode" gorm:"comment:状态码"`
 	DurationMs   int64  `json:"durationMs" gorm:"comment:耗时"`
+	TunnelOpenMs int64  `json:"tunnelOpenMs" gorm:"comment:打开隧道耗时"`
+	UpstreamMs   int64  `json:"upstreamMs" gorm:"comment:上游响应头耗时"`
+	FirstByteMs  int64  `json:"firstByteMs" gorm:"comment:首字节耗时"`
+	ReusedConn   bool   `json:"reusedConn" gorm:"comment:是否复用连接"`
 	BytesIn      int64  `json:"bytesIn" gorm:"comment:入站字节"`
 	BytesOut     int64  `json:"bytesOut" gorm:"comment:出站字节"`
 	ErrorMessage string `json:"errorMessage" gorm:"size:512;comment:错误信息"`
