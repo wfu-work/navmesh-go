@@ -9,6 +9,7 @@ func (g *GroupRouter) InitGroupRouter(router *gin.RouterGroup) {
 	{
 		groups.GET("list", groupApi.List)
 		groups.POST("", groupApi.Save)
+		groups.DELETE(":guid/delete", groupApi.Delete)
 		groups.DELETE(":guid", groupApi.Disable)
 	}
 

@@ -57,7 +57,7 @@ func registerTables() {
 	err := global.NAV_DB.AutoMigrate(
 		domains.Device{},
 		domains.DeviceToken{},
-		domains.ClientRelease{},
+		domains.Release{},
 		domains.DeviceUpgradeTask{},
 		domains.DeviceConnection{},
 		domains.DeviceHeartbeat{},
@@ -95,7 +95,7 @@ func ensureDataDirs() error {
 			ossDir = value
 		}
 	}
-	for _, dir := range []string{"./data", dataDir, filepath.Join(dataDir, "audit"), filepath.Join(dataDir, "cache"), filepath.Join(ossDir, "navmesh-client")} {
+	for _, dir := range []string{"./data", dataDir, filepath.Join(dataDir, "audit"), filepath.Join(dataDir, "cache"), filepath.Join(ossDir, "releases")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -117,6 +117,7 @@ func ensureDataDirs() error {
 func seedDefaultSettings() {
 	defaults := map[string]string{
 		"ssh_gateway_domain":               "sshd.navfirst.com",
+		"http_gateway_domain":              "httpd.navfirst.com",
 		"ssh_listen":                       ":3010",
 		"ssh_enabled":                      "true",
 		"http_listen":                      ":3009",

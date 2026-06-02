@@ -29,7 +29,7 @@ Options:
   --port PORT                NavMesh tunnel UDP port, default 3008
   --token TOKEN              Bootstrap register token, default navfirst@2020
   --extra-args "ARGS"        Extra navmesh-client arguments
-  --download-base URL        Custom binary download base URL, for private mirror/CDN
+  --download-base URL        NavMesh downloads API base URL, or custom binary mirror/CDN
   -h, --help                 Show help
 
 Example:
@@ -149,8 +149,10 @@ need_cmd install
 need_cmd systemctl
 
 ASSET="navmesh-client-${GOOS}-${GOARCH}"
+FALLBACK_DOWNLOAD_URL=""
 if [ -n "$DOWNLOAD_BASE" ]; then
-  DOWNLOAD_URL="${DOWNLOAD_BASE%/}/${ASSET}"
+  DOWNLOAD_URL="${DOWNLOAD_BASE%/}/releases/latest?releaseType=navmesh&os=${GOOS}&arch=${GOARCH}"
+  FALLBACK_DOWNLOAD_URL="${DOWNLOAD_BASE%/}/${ASSET}"
 elif [ "$VERSION" = "latest" ]; then
   DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 else
@@ -164,7 +166,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 log "Downloading ${ASSET}"
-curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/navmesh-client" "$DOWNLOAD_URL"
+if ! curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/navmesh-client" "$DOWNLOAD_URL"; then
+  if [ -n "$FALLBACK_DOWNLOAD_URL" ]; then
+    log "Latest release API unavailable, falling back to ${ASSET}"
+    curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/navmesh-client" "$FALLBACK_DOWNLOAD_URL"
+  else
+    die "download failed: ${DOWNLOAD_URL}"
+  fi
+fi
 [ -s "${TMP_DIR}/navmesh-client" ] || die "downloaded binary is empty"
 
 log "Installing navmesh-client to ${INSTALL_DIR}/navmesh-client"

@@ -10,7 +10,7 @@ var ServiceGroupApp = new(ServiceGroup)
 type ServiceGroup struct {
 	AccessPolicyService
 	AuditService
-	ClientReleaseService
+	ReleaseService
 	CustomDomainService
 	DeviceService
 	DeviceTokenService

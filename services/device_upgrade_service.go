@@ -64,15 +64,21 @@ func (s DeviceUpgradeService) CreateTask(deviceGuid string, req CreateDeviceUpgr
 	if err := s.DB().Where("guid = ?", deviceGuid).First(&device).Error; err != nil {
 		return nil, errors.New("device not found")
 	}
-	release, err := ServiceGroupApp.ClientReleaseService.WithDB(s.DB()).GetEnabled(req.ReleaseGuid)
+	release, err := ServiceGroupApp.ReleaseService.WithDB(s.DB()).GetEnabled(req.ReleaseGuid)
 	if err != nil {
 		return nil, err
 	}
 	if device.Status == domains.DeviceStatusDisabled {
 		return nil, errors.New("device is disabled")
 	}
+	if release.ReleaseType != domains.ReleaseTypeNavmesh {
+		return nil, errors.New("release is not a navmesh-client package")
+	}
+	if !sameDeviceType(device.DeviceType, release.DeviceType) && !sameDeviceType(device.GroupGuid, release.DeviceType) {
+		return nil, errors.New("release device type does not match device")
+	}
 	if !samePlatform(device.OS, release.OS) || !samePlatform(device.Arch, release.Arch) {
-		return nil, errors.New("client release platform does not match device")
+		return nil, errors.New("release platform does not match device")
 	}
 	var activeCount int64
 	if err := s.DB().Model(&domains.DeviceUpgradeTask{}).
@@ -220,20 +226,37 @@ func (s DeviceUpgradeService) Report(req DeviceUpgradeReportRequest) error {
 func samePlatform(current string, target string) bool {
 	current = normalizePlatformName(current)
 	target = normalizePlatformName(target)
-	return current == "" || target == "" || current == target
+	return current == "" || target == "" || target == "all" || current == target
+}
+
+func sameDeviceType(current string, target string) bool {
+	current = strings.TrimSpace(current)
+	target = strings.TrimSpace(target)
+	return target == "" || target == "all" || current == "" || current == target
 }
 
 func normalizePlatformName(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	aliases := map[string]string{
-		"aarch64": "arm64",
-		"armv8":   "arm64",
-		"x86_64":  "amd64",
-		"x64":     "amd64",
-		"macos":   "darwin",
-		"osx":     "darwin",
-		"win32":   "windows",
-		"win64":   "windows",
+		"aarch64":   "arm64",
+		"armv8":     "arm64",
+		"x86_64":    "amd64",
+		"x64":       "amd64",
+		"macos":     "darwin",
+		"osx":       "darwin",
+		"win32":     "windows",
+		"win64":     "windows",
+		"ubuntu":    "linux",
+		"debian":    "linux",
+		"centos":    "linux",
+		"rhel":      "linux",
+		"redhat":    "linux",
+		"fedora":    "linux",
+		"rocky":     "linux",
+		"almalinux": "linux",
+		"opensuse":  "linux",
+		"suse":      "linux",
+		"alpine":    "linux",
 	}
 	if normalized, ok := aliases[value]; ok {
 		return normalized

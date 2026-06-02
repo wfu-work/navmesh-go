@@ -172,7 +172,7 @@ curl -fsSL https://navmesh.navfirst.com/api/downloads/install-client.sh | sudo s
   --token xxxxxx
 ```
 
-后台上传的客户端二进制默认保存在 `local.oss-path/navmesh-client` 下。运行期配置 `client_download_base` 可指定公开下载域名，例如：
+后台上传的版本安装包默认保存在 `local.oss-path/releases` 下。运行期配置 `client_download_base` 可指定公开下载域名，例如：
 
 ```text
 https://navmesh.navfirst.com/api/downloads
@@ -185,7 +185,7 @@ curl -F file=@navmesh-client-linux-arm64 \
   -F version=v0.0.2 \
   -F os=linux \
   -F arch=arm64 \
-  https://navmesh.navfirst.com/api/client-releases/upload
+  https://navmesh.navfirst.com/api/releases/upload
 ```
 
 ## 构建
@@ -298,9 +298,11 @@ navmesh:
 | `GET /api/events/list` | 事件列表 |
 | `GET /api/audit-logs/list` | 审计日志 |
 | `GET /api/settings/list` | 运行期配置 |
-| `GET /api/client-releases/list` | 客户端二进制列表 |
-| `POST /api/client-releases/upload` | 上传客户端二进制 |
-| `GET /api/downloads/:fileName` | 下载客户端二进制 |
+| `GET /api/releases/list` | 客户端二进制列表 |
+| `POST /api/releases/upload` | 上传客户端二进制 |
+| `GET /api/downloads/releases/latest?releaseType=navmesh&os=linux&arch=arm64` | 下载最新匹配的客户端二进制 |
+| `GET /api/downloads/releases/:guid` | 按版本 ID 下载安装包 |
+| `GET /api/downloads/:fileName` | 按文件名下载最新启用安装包 |
 | `GET /api/devices/:guid/upgrades` | 设备升级任务列表 |
 | `POST /api/devices/:guid/upgrades` | 创建设备升级任务 |
 | `POST /api/device/upgrade/report` | 客户端上报升级结果 |

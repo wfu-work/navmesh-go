@@ -178,12 +178,12 @@ func (d DeviceApi) CreateUpgradeTask(c *gin.Context) {
 		return
 	}
 	guid := c.Param("guid")
-	release, err := clientReleaseService.GetEnabled(req.ReleaseGuid)
+	release, err := releaseService.GetEnabled(req.ReleaseGuid)
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
-	task, err := deviceUpgradeService.CreateTask(guid, req, publicDownloadURL(c, release.FileName))
+	task, err := deviceUpgradeService.CreateTask(guid, req, publicReleaseDownloadURL(c, release))
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return

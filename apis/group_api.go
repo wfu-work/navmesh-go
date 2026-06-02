@@ -45,6 +45,16 @@ func (g GroupApi) Disable(c *gin.Context) {
 	response.Ok(true, c)
 }
 
+func (g GroupApi) Delete(c *gin.Context) {
+	guid := c.Param("guid")
+	if err := groupService.Delete(guid); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "delete", Resource: "device_group", ResourceID: guid, SourceIP: c.ClientIP()})
+	response.Ok(true, c)
+}
+
 func (g GroupApi) AssignDevice(c *gin.Context) {
 	var req services.AssignDeviceGroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

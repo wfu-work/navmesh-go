@@ -132,6 +132,31 @@ func (s GroupService) Disable(guid string) error {
 	}).Error
 }
 
+func (s GroupService) Delete(guid string) error {
+	guid = strings.TrimSpace(guid)
+	if guid == "" {
+		return errors.New("guid required")
+	}
+	var row domains.DeviceGroup
+	if err := s.DB().Where("guid = ? OR group_key = ?", guid, guid).First(&row).Error; err != nil {
+		return errors.New("device group not found")
+	}
+	groupKey := row.Key
+	if groupKey == "" {
+		groupKey = row.Guid
+	}
+	var deviceCount int64
+	if err := s.DB().Model(&domains.Device{}).
+		Where("device_type IN ? OR group_guid IN ?", []string{row.Guid, groupKey}, []string{row.Guid, groupKey}).
+		Count(&deviceCount).Error; err != nil {
+		return err
+	}
+	if deviceCount > 0 {
+		return errors.New("device group is in use")
+	}
+	return s.DB().Unscoped().Where("guid = ? OR group_key = ?", row.Guid, groupKey).Delete(&domains.DeviceGroup{}).Error
+}
+
 func (s GroupService) AssignDevice(deviceGuid string, req AssignDeviceGroupRequest) error {
 	deviceGuid = strings.TrimSpace(deviceGuid)
 	req.GroupGuid = strings.TrimSpace(req.GroupGuid)

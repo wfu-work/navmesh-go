@@ -7,7 +7,7 @@ var ApiGroupApp = new(ApiGroup)
 type ApiGroup struct {
 	AccessPolicyApi
 	AuditApi
-	ClientReleaseApi
+	ReleaseApi
 	DeviceApi
 	EventApi
 	GroupApi
@@ -22,7 +22,7 @@ type ApiGroup struct {
 var (
 	accessPolicyService  = services.ServiceGroupApp.AccessPolicyService
 	auditService         = services.ServiceGroupApp.AuditService
-	clientReleaseService = services.ServiceGroupApp.ClientReleaseService
+	releaseService       = services.ServiceGroupApp.ReleaseService
 	customDomainService  = services.ServiceGroupApp.CustomDomainService
 	deviceService        = services.ServiceGroupApp.DeviceService
 	deviceTokenService   = services.ServiceGroupApp.DeviceTokenService
