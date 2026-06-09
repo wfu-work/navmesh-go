@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"navmesh-go/domains"
+
+	"github.com/quic-go/quic-go"
 )
 
 func TestOpenTCPOverDataConnSkipsEmptyPoolForQUIC(t *testing.T) {
@@ -82,6 +84,36 @@ func TestUnregisterTCPControlIgnoresReplacedConnection(t *testing.T) {
 	}
 }
 
+func TestCloseDeviceIfCurrentIgnoresReplacedConnection(t *testing.T) {
+	m := NewManager()
+	device := domains.Device{Sncode: "mgrl11", Alias: "MGRL11"}
+	device.Guid = "device-guid"
+
+	oldControl, oldPeer := net.Pipe()
+	defer oldControl.Close()
+	defer oldPeer.Close()
+	newControl, newPeer := net.Pipe()
+	defer newControl.Close()
+	defer newPeer.Close()
+
+	m.RegisterTCP(device, oldControl, RoleControl)
+	oldItem := m.connections[device.Guid]
+	m.RegisterTCP(device, newControl, RoleControl)
+
+	if m.CloseDeviceIfCurrent(device.Guid, oldItem, "quic idle timeout") {
+		t.Fatal("old connection item should not close the replaced device")
+	}
+	if !m.IsOnline(device.Guid) {
+		t.Fatal("device should remain online after stale close")
+	}
+	if !m.CloseDeviceIfCurrent(device.Guid, m.connections[device.Guid], "quic idle timeout") {
+		t.Fatal("current connection item should close the device")
+	}
+	if m.IsOnline(device.Guid) {
+		t.Fatal("device should be offline after current close")
+	}
+}
+
 func TestOpenTCPOverDataConnDeadlineCoversAckWait(t *testing.T) {
 	m := NewManager()
 	server, client := net.Pipe()
@@ -117,5 +149,17 @@ func TestOpenTCPOverDataConnDeadlineCoversAckWait(t *testing.T) {
 	case <-readDone:
 	case <-time.After(time.Second):
 		t.Fatal("client side did not receive open_tcp frame")
+	}
+}
+
+func TestIsQUICIdleTimeout(t *testing.T) {
+	if !isQUICIdleTimeout(&quic.IdleTimeoutError{}) {
+		t.Fatal("quic idle timeout should be treated as stale connection")
+	}
+	if !isQUICIdleTimeout(errors.New("timeout: no recent network activity")) {
+		t.Fatal("idle timeout message should be treated as stale connection")
+	}
+	if isQUICIdleTimeout(context.DeadlineExceeded) {
+		t.Fatal("context deadline should not be treated as quic idle timeout")
 	}
 }

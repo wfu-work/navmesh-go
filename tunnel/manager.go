@@ -238,6 +238,27 @@ func (m *Manager) CloseDevice(deviceGuid string, reason string) bool {
 	return true
 }
 
+func (m *Manager) CloseDeviceIfCurrent(deviceGuid string, expected *DeviceConnection, reason string) bool {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" || expected == nil {
+		return false
+	}
+	if reason == "" {
+		reason = "device connection closed"
+	}
+	m.mu.Lock()
+	item := m.connections[deviceGuid]
+	if item != expected {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.connections, deviceGuid)
+	m.mu.Unlock()
+	closeDeviceItem(item, reason)
+	markDeviceConnectionsClosed(deviceGuid, domains.NowMilli())
+	return true
+}
+
 func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost string, targetPort int) (io.ReadWriteCloser, error) {
 	m.mu.RLock()
 	item := m.connections[deviceGuid]
@@ -256,6 +277,9 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 		if err == nil {
 			m.Touch(deviceGuid)
 			return stream, nil
+		}
+		if isQUICIdleTimeout(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "quic idle timeout") {
+			m.SetOffline(deviceGuid)
 		}
 		return nil, err
 	}
@@ -436,6 +460,17 @@ func applyContextDeadline(value any, ctx context.Context) func() {
 		}
 	}
 	return func() {}
+}
+
+func isQUICIdleTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var idleTimeout *quic.IdleTimeoutError
+	if errors.As(err, &idleTimeout) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "no recent network activity")
 }
 
 func contextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
