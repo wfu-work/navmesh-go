@@ -35,8 +35,9 @@ import (
 )
 
 const (
-	clientVersion       = "v0.0.2"
-	clientTransportAuto = "auto"
+	clientVersion          = "v0.0.2"
+	clientTransportAuto    = "auto"
+	defaultTCPDataChannels = 32
 )
 
 type clientConfig struct {
@@ -197,7 +198,7 @@ func parseFlags() clientConfig {
 	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过HTTP设备注册，直接建立隧道")
 	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过QUIC服务器证书校验")
 	flag.StringVar(&cfg.Transport, "transport", clientTransportAuto, "隧道传输协议：auto、quic 或 tcp")
-	flag.IntVar(&cfg.DataChannels, "dataChannels", 4, "TCP 隧道数据连接池大小")
+	flag.IntVar(&cfg.DataChannels, "dataChannels", defaultTCPDataChannels, "TCP 隧道数据连接池大小")
 	flag.BoolVar(&showVersion, "v", false, "查看当前客户端版本")
 	flag.DurationVar(&cfg.ReconnectWait, "reconnectWait", 5*time.Second, "首次重连等待时间")
 	flag.DurationVar(&cfg.ReconnectMax, "reconnectMax", 60*time.Second, "指数退避最大重连等待时间")
@@ -245,7 +246,7 @@ func parseFlags() clientConfig {
 	}
 	cfg.Transport = normalizeTransport(cfg.Transport)
 	if cfg.DataChannels <= 0 {
-		cfg.DataChannels = 4
+		cfg.DataChannels = defaultTCPDataChannels
 	}
 	return cfg
 }
@@ -806,10 +807,13 @@ func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errC
 		case <-ticker.C:
 			tcpErr := sendTCPHeartbeat(conn, cfg)
 			httpErr := postHeartbeat(ctx, cfg)
-			if tcpErr != nil && httpErr != nil {
+			if heartbeatFailed(tcpErr, httpErr) {
 				failures++
 				log.Printf("tcp heartbeat failed failures=%d tcpErr=%v httpErr=%v", failures, tcpErr, httpErr)
 			} else {
+				if httpErr != nil {
+					log.Printf("http heartbeat failed but tcp tunnel heartbeat ok err=%v", httpErr)
+				}
 				failures = 0
 				snapshot := collectSystemSnapshot()
 				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat, snapshot.logFields())

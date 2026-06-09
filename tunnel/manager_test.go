@@ -54,6 +54,9 @@ func TestOpenTCPOverDataConnWaitsForTCPPool(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context deadline exceeded", err)
 	}
+	if !errors.Is(err, ErrTCPDataChannelExhausted) {
+		t.Fatalf("err = %v, want tcp data channel exhausted", err)
+	}
 }
 
 func TestUnregisterTCPControlIgnoresReplacedConnection(t *testing.T) {
@@ -171,6 +174,32 @@ func TestOpenTCPStreamClosesCurrentWhenDataChannelUnavailable(t *testing.T) {
 	}
 }
 
+func TestOpenTCPStreamKeepsTCPControlOnlineWhenDataChannelExhausted(t *testing.T) {
+	m := NewManager()
+	deviceGuid := "device-guid"
+	control, peer := net.Pipe()
+	defer control.Close()
+	defer peer.Close()
+	m.connections[deviceGuid] = &DeviceConnection{
+		tcpControl: control,
+		tcpData:    make(chan net.Conn, 1),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	conn, err := m.OpenTCPStream(ctx, deviceGuid, "127.0.0.1", 22)
+
+	if conn != nil {
+		t.Fatal("conn is not nil")
+	}
+	if !errors.Is(err, ErrTCPDataChannelExhausted) {
+		t.Fatalf("err = %v, want tcp data channel exhausted", err)
+	}
+	if !m.IsOnline(deviceGuid) {
+		t.Fatal("device should remain online when tcp data channels are busy")
+	}
+}
+
 func TestIsQUICIdleTimeout(t *testing.T) {
 	if !isQUICIdleTimeout(&quic.IdleTimeoutError{}) {
 		t.Fatal("quic idle timeout should be treated as stale connection")
@@ -195,6 +224,9 @@ func TestShouldCloseTunnelAfterOpenTCPError(t *testing.T) {
 	}
 	if !shouldCloseTunnelAfterOpenTCPError(errors.New("deadline exceeded")) {
 		t.Fatal("quic stream deadline message should close stale tunnel")
+	}
+	if shouldCloseTunnelAfterOpenTCPError(ErrTCPDataChannelExhausted) {
+		t.Fatal("busy tcp data channel pool should not close the tunnel")
 	}
 	if shouldCloseTunnelAfterOpenTCPError(errors.New("dial tcp 127.0.0.1:22: i/o timeout")) {
 		t.Fatal("local target timeout message should not close the tunnel")

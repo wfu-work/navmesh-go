@@ -26,7 +26,7 @@ Options:
   --service-name NAME        systemd service name, default navmesh-client
   --server HOST              NavMesh tunnel server, default navmesh.navfirst.com
   --api URL                  NavMesh API base URL, default https://navmesh.navfirst.com
-  --port PORT                NavMesh tunnel UDP port, default 3008
+  --port PORT                NavMesh tunnel UDP/TCP port, default 3008
   --token TOKEN              Bootstrap register token, default navfirst@2020
   --extra-args "ARGS"        Extra navmesh-client arguments
   --download-base URL        NavMesh downloads API base URL, or custom binary mirror/CDN
@@ -36,7 +36,8 @@ Example:
   curl -fsSL https://github.com/wfu-work/navmesh-go/releases/latest/download/install-client.sh | sudo sh -s -- \
     --server navmesh.navfirst.com \
     --api https://navmesh.navfirst.com \
-    --token navfirst@2020
+    --token navfirst@2020 \
+    --extra-args "-transport auto -dataChannels 32"
 
   curl -fsSL https://navmesh.navfirst.com/api/downloads/install-client.sh | sudo sh -s -- \
     --download-base https://navmesh.navfirst.com/api/downloads \

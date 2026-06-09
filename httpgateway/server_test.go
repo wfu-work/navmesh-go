@@ -124,8 +124,25 @@ func TestStatusCodeForProxyErrorUsesTooManyRequestsForPolicyRejects(t *testing.T
 	if got := statusCodeForProxyError(errors.New("max device sessions exceeded")); got != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want %d", got, http.StatusTooManyRequests)
 	}
+	if got := statusCodeForProxyError(errors.New("tcp data channel exhausted: context deadline exceeded")); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", got, http.StatusTooManyRequests)
+	}
 	if got := statusCodeForProxyError(errors.New("device tunnel offline")); got != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
+	}
+}
+
+func TestNewTunnelHTTPTransportConnectionPolicy(t *testing.T) {
+	transport := newTunnelHTTPTransport(nil)
+
+	if transport.MaxConnsPerHost != tunnelHTTPMaxConnsPerHost {
+		t.Fatalf("MaxConnsPerHost = %d, want %d", transport.MaxConnsPerHost, tunnelHTTPMaxConnsPerHost)
+	}
+	if transport.MaxIdleConnsPerHost != tunnelHTTPMaxIdleConnsPerHost {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, tunnelHTTPMaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout != tunnelHTTPIdleConnTimeout {
+		t.Fatalf("IdleConnTimeout = %s, want %s", transport.IdleConnTimeout, tunnelHTTPIdleConnTimeout)
 	}
 }
 

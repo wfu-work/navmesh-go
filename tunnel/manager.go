@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -40,7 +41,10 @@ type Manager struct {
 	connections map[string]*DeviceConnection
 }
 
-var DefaultManager = NewManager()
+var (
+	DefaultManager             = NewManager()
+	ErrTCPDataChannelExhausted = errors.New("tcp data channel exhausted")
+)
 
 func NewManager() *Manager {
 	return &Manager{connections: make(map[string]*DeviceConnection)}
@@ -285,7 +289,7 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 		return nil, err
 	}
 	if item.tcpControl != nil {
-		if shouldCloseTunnelAfterOpenTCPError(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel failed: "+dataErr.Error()) {
+		if isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error()) {
 			m.SetOffline(deviceGuid)
 		}
 		return nil, dataErr
@@ -371,7 +375,7 @@ func (m *Manager) openTCPOverDataConn(ctx context.Context, item *DeviceConnectio
 		}
 		return conn, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, fmt.Errorf("%w: %w", ErrTCPDataChannelExhausted, ctx.Err())
 	}
 }
 
@@ -484,6 +488,9 @@ func shouldCloseTunnelAfterOpenTCPError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrTCPDataChannelExhausted) {
+		return false
+	}
 	if isQUICIdleTimeout(err) {
 		return true
 	}
@@ -491,6 +498,13 @@ func shouldCloseTunnelAfterOpenTCPError(err error) bool {
 		return true
 	}
 	return strings.EqualFold(strings.TrimSpace(err.Error()), "deadline exceeded")
+}
+
+func isTCPDataChannelUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "tcp data channel unavailable")
 }
 
 func contextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

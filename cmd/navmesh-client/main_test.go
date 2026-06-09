@@ -86,6 +86,12 @@ func TestNormalizeTransport(t *testing.T) {
 	}
 }
 
+func TestDefaultTCPDataChannelsSupportsResourceHeavyPages(t *testing.T) {
+	if defaultTCPDataChannels < 32 {
+		t.Fatalf("defaultTCPDataChannels = %d, want at least 32", defaultTCPDataChannels)
+	}
+}
+
 type halfCloseBufferConn struct {
 	mu              sync.Mutex
 	readBuffer      *bytes.Buffer

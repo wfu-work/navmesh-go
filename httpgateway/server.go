@@ -31,6 +31,12 @@ type Server struct {
 	transport *http.Transport
 }
 
+const (
+	tunnelHTTPMaxConnsPerHost     = 32
+	tunnelHTTPMaxIdleConnsPerHost = 8
+	tunnelHTTPIdleConnTimeout     = 15 * time.Second
+)
+
 func NewServer(addr string, manager *tunnel.Manager) *Server {
 	if strings.TrimSpace(addr) == "" {
 		addr = ":3009"
@@ -356,10 +362,10 @@ func newTunnelHTTPTransport(manager *tunnel.Manager) *http.Transport {
 		DialContext:           tunnelDialContext(manager),
 		ForceAttemptHTTP2:     false,
 		DisableKeepAlives:     false,
-		MaxIdleConns:          512,
-		MaxIdleConnsPerHost:   16,
-		MaxConnsPerHost:       16,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   tunnelHTTPMaxIdleConnsPerHost,
+		MaxConnsPerHost:       tunnelHTTPMaxConnsPerHost,
+		IdleConnTimeout:       tunnelHTTPIdleConnTimeout,
 		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: time.Second,
 		DisableCompression:    false,
@@ -808,7 +814,8 @@ func statusCodeForProxyError(err error) int {
 	errText := strings.ToLower(err.Error())
 	if strings.Contains(errText, "rate limit exceeded") ||
 		strings.Contains(errText, "max concurrent sessions exceeded") ||
-		strings.Contains(errText, "max device sessions exceeded") {
+		strings.Contains(errText, "max device sessions exceeded") ||
+		strings.Contains(errText, "tcp data channel exhausted") {
 		return http.StatusTooManyRequests
 	}
 	return http.StatusBadGateway

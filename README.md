@@ -136,7 +136,7 @@ curl -fsSL https://navmesh.navfirst.com/api/downloads/install-client.sh | sudo s
 
 客户端可以不传 `sncode`、`alias`、`remark` 和 `type`。首次启动时会自动生成稳定的本地 `sncode`，并把设备状态保存到程序同级目录的 `navmesh-client.json`。
 
-客户端默认使用 `-transport auto`：优先尝试 QUIC，遇到 UDP/QUIC 不稳定的网络会自动降级到 TCP 隧道。若设备所在网络会清理或拦截 UDP，可以显式追加 `-transport tcp`。
+客户端默认使用 `-transport auto`：优先尝试 QUIC，遇到 UDP/QUIC 不稳定的网络会自动降级到 TCP 隧道。TCP 隧道默认预建 `-dataChannels 32`，适合网页资源较多的 HTTP 映射；若设备数量很多且只用于少量 SSH，可按需降低该值。若设备所在网络会清理或拦截 UDP，可以显式追加 `-transport tcp`。
 
 ## 设备激活流程
 

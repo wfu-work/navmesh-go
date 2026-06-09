@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/navmesh
-ExecStart=/opt/navmesh/navmesh-client -api https://navmesh.navfirst.com -server navmesh.navfirst.com -port 3008 -token navfirst@2020
+ExecStart=/opt/navmesh/navmesh-client -api https://navmesh.navfirst.com -server navmesh.navfirst.com -port 3008 -token navfirst@2020 -transport auto -dataChannels 32
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
