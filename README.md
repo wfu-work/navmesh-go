@@ -81,7 +81,7 @@ make run
 | 服务 | 默认值 |
 | --- | --- |
 | 管理 API | `http://127.0.0.1:3007/api` |
-| QUIC 隧道 | `:3008/udp` |
+| 设备隧道 | `:3008/udp` 和 `:3008/tcp` |
 | SSH 网关 | 由 `ssh_listen` 配置 |
 | HTTP 映射网关 | 由 `http_listen` 配置 |
 
@@ -135,6 +135,8 @@ curl -fsSL https://navmesh.navfirst.com/api/downloads/install-client.sh | sudo s
 ```
 
 客户端可以不传 `sncode`、`alias`、`remark` 和 `type`。首次启动时会自动生成稳定的本地 `sncode`，并把设备状态保存到程序同级目录的 `navmesh-client.json`。
+
+客户端默认使用 `-transport auto`：优先尝试 QUIC，遇到 UDP/QUIC 不稳定的网络会自动降级到 TCP 隧道。若设备所在网络会清理或拦截 UDP，可以显式追加 `-transport tcp`。
 
 ## 设备激活流程
 

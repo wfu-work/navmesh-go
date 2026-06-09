@@ -66,6 +66,26 @@ func TestHeartbeatFailedRequiresTunnelHeartbeat(t *testing.T) {
 	}
 }
 
+func TestNormalizeTransport(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "", want: clientTransportAuto},
+		{value: "AUTO", want: clientTransportAuto},
+		{value: "quic", want: "quic"},
+		{value: "tcp", want: "tcp"},
+		{value: "bad", want: clientTransportAuto},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			if got := normalizeTransport(tt.value); got != tt.want {
+				t.Fatalf("normalizeTransport(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 type halfCloseBufferConn struct {
 	mu              sync.Mutex
 	readBuffer      *bytes.Buffer

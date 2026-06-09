@@ -34,7 +34,10 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
-const clientVersion = "v0.0.1"
+const (
+	clientVersion       = "v0.0.2"
+	clientTransportAuto = "auto"
+)
 
 type clientConfig struct {
 	Server         string
@@ -193,7 +196,7 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.LocalHost, "localHost", "127.0.0.1", "服务端请求回环目标时使用的本机地址")
 	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过HTTP设备注册，直接建立隧道")
 	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过QUIC服务器证书校验")
-	flag.StringVar(&cfg.Transport, "transport", tunnel.TransportQUIC, "隧道传输协议：quic 或 tcp")
+	flag.StringVar(&cfg.Transport, "transport", clientTransportAuto, "隧道传输协议：auto、quic 或 tcp")
 	flag.IntVar(&cfg.DataChannels, "dataChannels", 4, "TCP 隧道数据连接池大小")
 	flag.BoolVar(&showVersion, "v", false, "查看当前客户端版本")
 	flag.DurationVar(&cfg.ReconnectWait, "reconnectWait", 5*time.Second, "首次重连等待时间")
@@ -240,17 +243,24 @@ func parseFlags() clientConfig {
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 10 * time.Second
 	}
-	cfg.Transport = strings.ToLower(strings.TrimSpace(cfg.Transport))
-	if cfg.Transport == "" {
-		cfg.Transport = tunnel.TransportQUIC
-	}
-	if cfg.Transport != tunnel.TransportQUIC && cfg.Transport != tunnel.TransportTCP {
-		cfg.Transport = tunnel.TransportQUIC
-	}
+	cfg.Transport = normalizeTransport(cfg.Transport)
 	if cfg.DataChannels <= 0 {
 		cfg.DataChannels = 4
 	}
 	return cfg
+}
+
+func normalizeTransport(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", clientTransportAuto:
+		return clientTransportAuto
+	case tunnel.TransportQUIC:
+		return tunnel.TransportQUIC
+	case tunnel.TransportTCP:
+		return tunnel.TransportTCP
+	default:
+		return clientTransportAuto
+	}
 }
 
 func run(ctx context.Context, cfg clientConfig) error {
@@ -523,10 +533,36 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 }
 
 func connectAndServe(ctx context.Context, cfg clientConfig) error {
-	if cfg.Transport == tunnel.TransportTCP {
+	switch cfg.Transport {
+	case tunnel.TransportTCP:
 		return connectAndServeTCP(ctx, cfg)
+	case tunnel.TransportQUIC:
+		return connectAndServeQUIC(ctx, cfg)
+	default:
+		return connectAndServeAuto(ctx, cfg)
 	}
-	return connectAndServeQUIC(ctx, cfg)
+}
+
+func connectAndServeAuto(ctx context.Context, cfg clientConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	quicErr := connectAndServeQUIC(ctx, cfg)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if quicErr == nil {
+		return nil
+	}
+	log.Printf("quic tunnel unavailable, falling back to tcp: %v", quicErr)
+	tcpErr := connectAndServeTCP(ctx, cfg)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if tcpErr == nil {
+		return nil
+	}
+	return fmt.Errorf("auto tunnel failed: quic=%v tcp=%w", quicErr, tcpErr)
 }
 
 func connectAndServeQUIC(ctx context.Context, cfg clientConfig) error {
@@ -562,8 +598,9 @@ func connectAndServeQUIC(ctx context.Context, cfg clientConfig) error {
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
-	heartbeatErr := make(chan error, 1)
+	heartbeatErr := make(chan error, 2)
 	go heartbeatLoop(heartbeatCtx, controlConn, cfg, heartbeatErr)
+	go quicTunnelHeartbeatLoop(heartbeatCtx, dataConn, cfg, tunnel.RoleData, heartbeatErr)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -831,6 +868,33 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 			if failures >= cfg.HeartbeatFail {
 				select {
 				case errCh <- fmt.Errorf("heartbeat failed %d times", failures):
+				default:
+				}
+				return
+			}
+		}
+	}
+}
+
+func quicTunnelHeartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, name string, errCh chan<- error) {
+	ticker := time.NewTicker(cfg.Heartbeat)
+	defer ticker.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := sendHeartbeat(ctx, conn, cfg)
+			if err != nil {
+				failures++
+				log.Printf("%s tunnel heartbeat failed failures=%d err=%v", name, failures, err)
+			} else {
+				failures = 0
+			}
+			if failures >= cfg.HeartbeatFail {
+				select {
+				case errCh <- fmt.Errorf("%s tunnel heartbeat failed %d times: %w", name, failures, err):
 				default:
 				}
 				return

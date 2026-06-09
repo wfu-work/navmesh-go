@@ -16,6 +16,7 @@ LimitNOFILE=1048576
 # Production entry ports:
 # - TCP 22: SSH Gateway, transparent TCP proxy
 # - UDP 3008: QUIC device tunnel
+# - TCP 3008: TCP fallback device tunnel
 # - TCP 3007: management API, normally bound behind Caddy/firewall
 # - TCP 8080: HTTP mapping upstream from Caddy
 AmbientCapabilities=CAP_NET_BIND_SERVICE
