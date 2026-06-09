@@ -44,7 +44,7 @@ func TestCloseReadCancelsQUICReadSide(t *testing.T) {
 	}
 }
 
-func TestHeartbeatFailedRequiresQUICAndHTTPFailure(t *testing.T) {
+func TestHeartbeatFailedRequiresTunnelHeartbeat(t *testing.T) {
 	err := errors.New("deadline exceeded")
 	tests := []struct {
 		name    string
@@ -53,7 +53,7 @@ func TestHeartbeatFailedRequiresQUICAndHTTPFailure(t *testing.T) {
 		want    bool
 	}{
 		{name: "both ok", want: false},
-		{name: "quic delayed http ok", quicErr: err, want: false},
+		{name: "quic failed http ok", quicErr: err, want: true},
 		{name: "quic ok http failed", httpErr: err, want: false},
 		{name: "both failed", quicErr: err, httpErr: err, want: true},
 	}

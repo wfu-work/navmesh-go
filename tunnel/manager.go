@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -278,13 +279,19 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 			m.Touch(deviceGuid)
 			return stream, nil
 		}
-		if isQUICIdleTimeout(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "quic idle timeout") {
+		if shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp over quic failed: "+err.Error()) {
 			m.SetOffline(deviceGuid)
 		}
 		return nil, err
 	}
 	if item.tcpControl != nil {
+		if shouldCloseTunnelAfterOpenTCPError(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel failed: "+dataErr.Error()) {
+			m.SetOffline(deviceGuid)
+		}
 		return nil, dataErr
+	}
+	if m.CloseDeviceIfCurrent(deviceGuid, item, "device tunnel data channel unavailable") {
+		m.SetOffline(deviceGuid)
 	}
 	return nil, errors.New("device tunnel data channel unavailable")
 }
@@ -471,6 +478,19 @@ func isQUICIdleTimeout(err error) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "no recent network activity")
+}
+
+func shouldCloseTunnelAfterOpenTCPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isQUICIdleTimeout(err) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(err.Error()), "deadline exceeded")
 }
 
 func contextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

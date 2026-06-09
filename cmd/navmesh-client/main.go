@@ -821,8 +821,8 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 				failures++
 				log.Printf("heartbeat failed failures=%d quicErr=%v httpErr=%v", failures, quicErr, httpErr)
 			} else {
-				if quicErr != nil {
-					log.Printf("quic heartbeat delayed but http heartbeat ok err=%v", quicErr)
+				if httpErr != nil {
+					log.Printf("http heartbeat failed but tunnel heartbeat ok err=%v", httpErr)
 				}
 				failures = 0
 				snapshot := collectSystemSnapshot()
@@ -840,7 +840,7 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 }
 
 func heartbeatFailed(quicErr error, httpErr error) bool {
-	return quicErr != nil && httpErr != nil
+	return quicErr != nil
 }
 
 func sendHeartbeat(ctx context.Context, conn *quic.Conn, cfg clientConfig) error {
