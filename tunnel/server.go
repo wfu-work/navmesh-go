@@ -163,7 +163,9 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 		}
 	}
 	defer func() {
-		s.manager.Unregister(device.Guid)
+		if !s.manager.UnregisterQUICControl(device.Guid, conn) {
+			return
+		}
 		s.manager.SetOffline(device.Guid)
 		services.ServiceGroupApp.EventService.Record(services.EventInput{
 			DeviceGuid: device.Guid,
@@ -215,7 +217,9 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 	defer func() {
-		s.manager.Unregister(device.Guid)
+		if !s.manager.UnregisterTCPControl(device.Guid, conn) {
+			return
+		}
 		s.manager.SetOffline(device.Guid)
 		services.ServiceGroupApp.EventService.Record(services.EventInput{
 			DeviceGuid: device.Guid,

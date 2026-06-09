@@ -59,36 +59,38 @@ func (m *Manager) RegisterQUIC(device domains.Device, conn *quic.Conn, role stri
 		ConnectedTime:  now,
 		LastActiveTime: now,
 	}
+	var replaced *DeviceConnection
+	var replacedData *quic.Conn
 	m.mu.Lock()
 	item := m.connections[device.Guid]
-	if item == nil {
-		item = &DeviceConnection{info: info, tcpData: make(chan net.Conn, 64)}
-		m.connections[device.Guid] = item
-	}
-	item.info = info
 	if role == RoleData {
+		if item == nil {
+			item = &DeviceConnection{tcpData: make(chan net.Conn, 64)}
+			m.connections[device.Guid] = item
+		}
+		item.info = info
+		if item.data != nil && item.data != conn && item.data != item.control {
+			replacedData = item.data
+		}
 		item.data = conn
 	} else {
-		item.control = conn
+		replaced = item
+		item = &DeviceConnection{info: info, control: conn, tcpData: make(chan net.Conn, 64)}
+		m.connections[device.Guid] = item
 		if role == RoleLegacy {
 			item.data = conn
 		}
 	}
 	m.mu.Unlock()
 	if role == RoleData {
+		if replacedData != nil {
+			_ = replacedData.CloseWithError(0, "device data channel replaced")
+		}
 		return
 	}
-	_ = global.NAV_DB.Create(&domains.DeviceConnection{
-		DeviceGuid:     device.Guid,
-		ConnectionID:   uuid.NewString(),
-		Protocol:       TransportQUIC,
-		RemoteAddr:     info.RemoteAddr,
-		Status:         int(domains.StatusEnabled),
-		ConnectedTime:  now,
-		LastActiveTime: now,
-		CreateTime:     now,
-		UpdateTime:     now,
-	}).Error
+	closeDeviceItem(replaced, "device connection replaced")
+	markDeviceConnectionsClosed(device.Guid, now)
+	recordDeviceConnection(device.Guid, TransportQUIC, info.RemoteAddr, now)
 }
 
 func (m *Manager) RegisterTCP(device domains.Device, conn net.Conn, role string) {
@@ -101,14 +103,15 @@ func (m *Manager) RegisterTCP(device domains.Device, conn net.Conn, role string)
 		ConnectedTime:  now,
 		LastActiveTime: now,
 	}
+	var replaced *DeviceConnection
 	m.mu.Lock()
 	item := m.connections[device.Guid]
-	if item == nil {
-		item = &DeviceConnection{info: info, tcpData: make(chan net.Conn, 64)}
-		m.connections[device.Guid] = item
-	}
-	item.info = info
 	if role == RoleData {
+		if item == nil {
+			item = &DeviceConnection{tcpData: make(chan net.Conn, 64)}
+			m.connections[device.Guid] = item
+		}
+		item.info = info
 		select {
 		case item.tcpData <- conn:
 		default:
@@ -117,19 +120,13 @@ func (m *Manager) RegisterTCP(device domains.Device, conn net.Conn, role string)
 		m.mu.Unlock()
 		return
 	}
-	item.tcpControl = conn
+	replaced = item
+	item = &DeviceConnection{info: info, tcpControl: conn, tcpData: make(chan net.Conn, 64)}
+	m.connections[device.Guid] = item
 	m.mu.Unlock()
-	_ = global.NAV_DB.Create(&domains.DeviceConnection{
-		DeviceGuid:     device.Guid,
-		ConnectionID:   uuid.NewString(),
-		Protocol:       TransportTCP,
-		RemoteAddr:     info.RemoteAddr,
-		Status:         int(domains.StatusEnabled),
-		ConnectedTime:  now,
-		LastActiveTime: now,
-		CreateTime:     now,
-		UpdateTime:     now,
-	}).Error
+	closeDeviceItem(replaced, "device connection replaced")
+	markDeviceConnectionsClosed(device.Guid, now)
+	recordDeviceConnection(device.Guid, TransportTCP, info.RemoteAddr, now)
 }
 
 func (m *Manager) Unregister(deviceGuid string) {
@@ -138,10 +135,41 @@ func (m *Manager) Unregister(deviceGuid string) {
 	delete(m.connections, deviceGuid)
 	m.mu.Unlock()
 	closeDeviceItem(item, "device unregister")
-	now := domains.NowMilli()
-	_ = global.NAV_DB.Model(&domains.DeviceConnection{}).
-		Where("device_guid = ? AND status = ?", deviceGuid, int(domains.StatusEnabled)).
-		Updates(map[string]any{"status": domains.StatusDisabled, "update_time": now}).Error
+	markDeviceConnectionsClosed(deviceGuid, domains.NowMilli())
+}
+
+func (m *Manager) UnregisterQUICControl(deviceGuid string, conn *quic.Conn) bool {
+	if strings.TrimSpace(deviceGuid) == "" || conn == nil {
+		return false
+	}
+	m.mu.Lock()
+	item := m.connections[deviceGuid]
+	if item == nil || item.control != conn {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.connections, deviceGuid)
+	m.mu.Unlock()
+	closeDeviceItem(item, "device unregister")
+	markDeviceConnectionsClosed(deviceGuid, domains.NowMilli())
+	return true
+}
+
+func (m *Manager) UnregisterTCPControl(deviceGuid string, conn net.Conn) bool {
+	if strings.TrimSpace(deviceGuid) == "" || conn == nil {
+		return false
+	}
+	m.mu.Lock()
+	item := m.connections[deviceGuid]
+	if item == nil || item.tcpControl != conn {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.connections, deviceGuid)
+	m.mu.Unlock()
+	closeDeviceItem(item, "device unregister")
+	markDeviceConnectionsClosed(deviceGuid, domains.NowMilli())
+	return true
 }
 
 func (m *Manager) UnregisterQUICData(deviceGuid string, conn *quic.Conn) {
@@ -152,6 +180,9 @@ func (m *Manager) UnregisterQUICData(deviceGuid string, conn *quic.Conn) {
 	m.mu.Lock()
 	if item := m.connections[deviceGuid]; item != nil && item.data == conn {
 		item.data = nil
+		if item.control == nil && item.tcpControl == nil {
+			delete(m.connections, deviceGuid)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -163,6 +194,9 @@ func (m *Manager) Touch(deviceGuid string) {
 		item.info.LastActiveTime = now
 	}
 	m.mu.Unlock()
+	if global.NAV_DB == nil {
+		return
+	}
 	_ = global.NAV_DB.Model(&domains.DeviceConnection{}).
 		Where("device_guid = ? AND status = ?", deviceGuid, int(domains.StatusEnabled)).
 		Updates(map[string]any{"last_active_time": now, "update_time": now}).Error
@@ -200,10 +234,7 @@ func (m *Manager) CloseDevice(deviceGuid string, reason string) bool {
 		return false
 	}
 	closeDeviceItem(item, reason)
-	now := domains.NowMilli()
-	_ = global.NAV_DB.Model(&domains.DeviceConnection{}).
-		Where("device_guid = ? AND status = ?", deviceGuid, int(domains.StatusEnabled)).
-		Updates(map[string]any{"status": domains.StatusDisabled, "update_time": now}).Error
+	markDeviceConnectionsClosed(deviceGuid, domains.NowMilli())
 	return true
 }
 
@@ -214,9 +245,10 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 	if item == nil {
 		return nil, errors.New("device tunnel offline")
 	}
-	if conn, err := m.openTCPOverDataConn(ctx, item, targetHost, targetPort); err == nil {
+	dataConn, dataErr := m.openTCPOverDataConn(ctx, item, targetHost, targetPort)
+	if dataErr == nil {
 		m.Touch(deviceGuid)
-		return conn, nil
+		return dataConn, nil
 	}
 	conn := item.data
 	if conn != nil {
@@ -227,6 +259,9 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 		}
 		return nil, err
 	}
+	if item.tcpControl != nil {
+		return nil, dataErr
+	}
 	return nil, errors.New("device tunnel data channel unavailable")
 }
 
@@ -235,6 +270,8 @@ func (m *Manager) openTCPOverQUICConn(ctx context.Context, conn *quic.Conn, targ
 	if err != nil {
 		return nil, err
 	}
+	clearDeadline := applyContextDeadline(stream, ctx)
+	defer clearDeadline()
 	frame := Frame{Type: FrameTypeOpenTCP, RequestID: uuid.NewString(), TargetHost: targetHost, TargetPort: targetPort}
 	payload, err := EncodeFrame(frame)
 	if err != nil {
@@ -273,6 +310,8 @@ func (m *Manager) openTCPOverDataConn(ctx context.Context, item *DeviceConnectio
 	}
 	select {
 	case conn := <-item.tcpData:
+		clearDeadline := applyContextDeadline(conn, ctx)
+		defer clearDeadline()
 		frame := Frame{Type: FrameTypeOpenTCP, RequestID: uuid.NewString(), TargetHost: targetHost, TargetPort: targetPort}
 		payload, err := EncodeFrame(frame)
 		if err != nil {
@@ -308,6 +347,9 @@ func (m *Manager) openTCPOverDataConn(ctx context.Context, item *DeviceConnectio
 func (m *Manager) SetOffline(deviceGuid string) {
 	deviceGuid = strings.TrimSpace(deviceGuid)
 	if deviceGuid == "" {
+		return
+	}
+	if global.NAV_DB == nil {
 		return
 	}
 	now := domains.NowMilli()
@@ -349,6 +391,51 @@ func closeDeviceItem(item *DeviceConnection, reason string) {
 			}
 		}
 	}
+}
+
+func recordDeviceConnection(deviceGuid, protocol, remoteAddr string, now int64) {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" || global.NAV_DB == nil {
+		return
+	}
+	_ = global.NAV_DB.Create(&domains.DeviceConnection{
+		DeviceGuid:     deviceGuid,
+		ConnectionID:   uuid.NewString(),
+		Protocol:       protocol,
+		RemoteAddr:     remoteAddr,
+		Status:         int(domains.StatusEnabled),
+		ConnectedTime:  now,
+		LastActiveTime: now,
+		CreateTime:     now,
+		UpdateTime:     now,
+	}).Error
+}
+
+func markDeviceConnectionsClosed(deviceGuid string, now int64) {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" || global.NAV_DB == nil {
+		return
+	}
+	_ = global.NAV_DB.Model(&domains.DeviceConnection{}).
+		Where("device_guid = ? AND status = ?", deviceGuid, int(domains.StatusEnabled)).
+		Updates(map[string]any{"status": int(domains.StatusDisabled), "update_time": now}).Error
+}
+
+func applyContextDeadline(value any, ctx context.Context) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return func() {}
+	}
+	if setter, ok := value.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = setter.SetDeadline(deadline)
+		return func() {
+			_ = setter.SetDeadline(time.Time{})
+		}
+	}
+	return func() {}
 }
 
 func contextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

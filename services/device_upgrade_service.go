@@ -142,7 +142,7 @@ func (s DeviceUpgradeService) List(deviceGuid string, params map[string]string) 
 func (s DeviceUpgradeService) PendingCommand(deviceGuid string) (*DeviceUpgradeCommand, error) {
 	var task domains.DeviceUpgradeTask
 	staleRunningBefore := domains.NowMilli() - int64(deviceUpgradeRunningLease/time.Millisecond)
-	err := s.DB().
+	result := s.DB().
 		Where(
 			"device_guid = ? AND (status = ? OR (status = ? AND start_time > 0 AND start_time < ?))",
 			strings.TrimSpace(deviceGuid),
@@ -151,12 +151,13 @@ func (s DeviceUpgradeService) PendingCommand(deviceGuid string) (*DeviceUpgradeC
 			staleRunningBefore,
 		).
 		Order("create_time ASC").
-		First(&task).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
+		Limit(1).
+		Find(&task)
+	if result.Error != nil {
+		return nil, result.Error
 	}
-	if err != nil {
-		return nil, err
+	if result.RowsAffected == 0 {
+		return nil, nil
 	}
 	return &DeviceUpgradeCommand{
 		TaskGuid:    task.Guid,
