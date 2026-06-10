@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -24,6 +25,11 @@ import (
 type DeviceService struct {
 	commonServices.CrudService[domains.Device]
 }
+
+const (
+	diskUsageHighEventType = "disk_usage_high"
+	diskUsageHighThreshold = 90.0
+)
 
 func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
 	s.CrudService = *s.CrudService.WithDB(db)
@@ -332,6 +338,7 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, now); err != nil {
 		return nil, err
 	}
+	s.recordDailyDiskUsageEvent(device.Guid, req, now)
 	_ = s.DB().Where("guid = ?", device.Guid).First(&device).Error
 	return &device, nil
 }
@@ -796,6 +803,54 @@ func (s DeviceService) recordHeartbeat(deviceGuid, sourceIP, hostIP, wanIP, loca
 		Location:   location,
 		CreateTime: now,
 	}).Error
+}
+
+func (s DeviceService) recordDailyDiskUsageEvent(deviceGuid string, req HeartbeatRequest, now int64) {
+	if strings.TrimSpace(deviceGuid) == "" || req.DiskUsedPct < diskUsageHighThreshold {
+		return
+	}
+	start, end := localDayRangeMillis(now)
+	var count int64
+	if err := s.DB().Model(&domains.Event{}).
+		Where("device_guid = ? AND event_type = ? AND create_time >= ? AND create_time < ?", deviceGuid, diskUsageHighEventType, start, end).
+		Count(&count).Error; err != nil || count > 0 {
+		return
+	}
+	message := fmt.Sprintf("磁盘使用率 %.1f%%，已达到 %.0f%% 告警阈值", req.DiskUsedPct, diskUsageHighThreshold)
+	if req.DiskTotal > 0 && req.DiskFree >= 0 {
+		message = fmt.Sprintf("%s，剩余 %s / 总量 %s", message, formatStorageSize(req.DiskFree), formatStorageSize(req.DiskTotal))
+	}
+	ServiceGroupApp.EventService.WithDB(s.DB()).Record(EventInput{
+		DeviceGuid: deviceGuid,
+		EventType:  diskUsageHighEventType,
+		Level:      "warn",
+		Title:      "磁盘空间不足",
+		Message:    message,
+	})
+}
+
+func localDayRangeMillis(now int64) (int64, int64) {
+	t := time.UnixMilli(now).In(time.Local)
+	start := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	return start.UnixMilli(), start.Add(24 * time.Hour).UnixMilli()
+}
+
+func formatStorageSize(value int64) string {
+	if value < 0 {
+		value = 0
+	}
+	const unit = 1024
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	size := float64(value)
+	for _, suffix := range []string{"KB", "MB", "GB", "TB", "PB"} {
+		size = size / unit
+		if size < unit {
+			return fmt.Sprintf("%.1f %s", size, suffix)
+		}
+	}
+	return fmt.Sprintf("%.1f EB", size/unit)
 }
 
 func (s DeviceService) closeActiveDeviceConnections(now int64) error {
