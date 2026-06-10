@@ -105,9 +105,14 @@ func (a ReleaseApi) Delete(c *gin.Context) {
 
 func (a ReleaseApi) Download(c *gin.Context) {
 	fileName := strings.TrimSpace(c.Param("fileName"))
-	if fileName == "install-client.sh" {
+	switch fileName {
+	case "install-client.sh":
 		c.Header("Content-Disposition", `attachment; filename="install-client.sh"`)
 		c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", deployAssets.InstallClientScript)
+		return
+	case "install-rain.sh":
+		c.Header("Content-Disposition", `attachment; filename="install-rain.sh"`)
+		c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", deployAssets.InstallRainScript)
 		return
 	}
 	item, err := releaseService.FindDownload(fileName)

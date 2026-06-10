@@ -87,6 +87,19 @@ type UpdateDeviceProfileRequest struct {
 	Remark     string `json:"remark"`
 }
 
+type DeviceStats struct {
+	Total      int64 `json:"total"`
+	Registered int64 `json:"registered"`
+	Online     int64 `json:"online"`
+	Offline    int64 `json:"offline"`
+	Disabled   int64 `json:"disabled"`
+}
+
+type DeviceVPNRestartCommand struct {
+	RequestedAt int64  `json:"requestedAt"`
+	Message     string `json:"message"`
+}
+
 type DeviceRegisterResult struct {
 	Device      domains.Device        `json:"device"`
 	TypeDefault domains.DeviceGroup   `json:"typeDefault"`
@@ -379,14 +392,88 @@ func (s DeviceService) List(params map[string]string) ([]domains.Device, int64, 
 	if pageInfo.Size <= 0 {
 		pageInfo.Size = 20
 	}
+	db := s.deviceListQuery(params, true)
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var items []domains.Device
+	err := db.Order("update_time DESC").Limit(pageInfo.Size).Offset((pageInfo.Page - 1) * pageInfo.Size).Find(&items).Error
+	return items, total, err
+}
+
+func (s DeviceService) Stats(params map[string]string) (*DeviceStats, error) {
+	stats := &DeviceStats{}
+	if err := s.deviceListQuery(params, false).Count(&stats.Total).Error; err != nil {
+		return nil, err
+	}
+	countStatus := func(status int) int64 {
+		var count int64
+		_ = s.deviceListQuery(params, false).Where("status = ?", status).Count(&count).Error
+		return count
+	}
+	stats.Registered = countStatus(domains.DeviceStatusRegistered)
+	stats.Online = countStatus(domains.DeviceStatusOnline)
+	stats.Offline = countStatus(domains.DeviceStatusOffline)
+	stats.Disabled = countStatus(domains.DeviceStatusDisabled)
+	return stats, nil
+}
+
+func (s DeviceService) RequestVPNRestart(guid string) (*DeviceVPNRestartCommand, error) {
+	guid = strings.TrimSpace(guid)
+	if guid == "" {
+		return nil, errors.New("guid required")
+	}
+	var device domains.Device
+	if err := s.DB().Where("guid = ?", guid).First(&device).Error; err != nil {
+		return nil, errors.New("device not found")
+	}
+	if device.Status != domains.DeviceStatusOnline {
+		return nil, errors.New("device is not online")
+	}
+	now := domains.NowMilli()
+	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", guid).Updates(map[string]any{
+		"vpn_restart_requested_at": now,
+		"update_time":              now,
+	}).Error; err != nil {
+		return nil, err
+	}
+	return &DeviceVPNRestartCommand{RequestedAt: now, Message: "restart vpn tunnel"}, nil
+}
+
+func (s DeviceService) TakeVPNRestartCommand(guid string) (*DeviceVPNRestartCommand, error) {
+	guid = strings.TrimSpace(guid)
+	if guid == "" {
+		return nil, nil
+	}
+	var device domains.Device
+	if err := s.DB().Select("guid", "vpn_restart_requested_at", "vpn_restart_delivered_at").Where("guid = ?", guid).First(&device).Error; err != nil {
+		return nil, err
+	}
+	if device.VPNRestartRequestedAt <= 0 || device.VPNRestartRequestedAt <= device.VPNRestartDeliveredAt {
+		return nil, nil
+	}
+	now := domains.NowMilli()
+	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", guid).Updates(map[string]any{
+		"vpn_restart_delivered_at": now,
+		"update_time":              now,
+	}).Error; err != nil {
+		return nil, err
+	}
+	return &DeviceVPNRestartCommand{RequestedAt: device.VPNRestartRequestedAt, Message: "restart vpn tunnel"}, nil
+}
+
+func (s DeviceService) deviceListQuery(params map[string]string, includeStatus bool) *gorm.DB {
 	db := s.DB().Model(&domains.Device{})
 	keyword := strings.TrimSpace(utils.FirstNonEmpty(params["keyword"], params["content"]))
 	if keyword != "" {
 		like := "%" + keyword + "%"
 		db = db.Where("sn_code LIKE ? OR alias LIKE ? OR remark LIKE ?", like, like, like)
 	}
-	if status := utils.Str2Int(params["status"]); status > 0 {
-		db = db.Where("status = ?", status)
+	if includeStatus {
+		if status := utils.Str2Int(params["status"]); status > 0 {
+			db = db.Where("status = ?", status)
+		}
 	}
 	if deviceType := strings.TrimSpace(params["type"]); deviceType != "" {
 		db = db.Where("device_type = ?", deviceType)
@@ -397,13 +484,7 @@ func (s DeviceService) List(params map[string]string) ([]domains.Device, int64, 
 	if tag := strings.TrimSpace(params["tag"]); tag != "" {
 		db = db.Where("tags = ? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?", tag, tag+",%", "%,"+tag, "%,"+tag+",%")
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	var items []domains.Device
-	err := db.Order("update_time DESC").Limit(pageInfo.Size).Offset((pageInfo.Page - 1) * pageInfo.Size).Find(&items).Error
-	return items, total, err
+	return db
 }
 
 func (s DeviceService) Get(guid string) (*domains.Device, []domains.DeviceToken, error) {

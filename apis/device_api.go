@@ -1,16 +1,25 @@
 package apis
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"navmesh-go/services"
+	"navmesh-go/tunnel"
 	"navmesh-go/utils"
+	"net/http"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/wfu-work/nav-common-go-lib/response"
 )
 
 type DeviceApi struct{}
+
+var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
 
 func (d DeviceApi) Register(c *gin.Context) {
 	var req services.RegisterDeviceRequest
@@ -44,9 +53,16 @@ func (d DeviceApi) Heartbeat(c *gin.Context) {
 	if data, err := json.Marshal(device); err == nil {
 		_ = json.Unmarshal(data, &payload)
 	}
+	upgradeSent := false
 	if strings.ToLower(settingService.Value("client_upgrade_enabled", "true")) != "false" {
 		if upgrade, err := deviceUpgradeService.PendingCommand(device.Guid); err == nil && upgrade != nil {
 			payload["upgrade"] = upgrade
+			upgradeSent = true
+		}
+	}
+	if !upgradeSent {
+		if command, err := deviceService.TakeVPNRestartCommand(device.Guid); err == nil && command != nil {
+			payload["vpnRestart"] = command
 		}
 	}
 	response.Ok(payload, c)
@@ -60,6 +76,16 @@ func (d DeviceApi) List(c *gin.Context) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
+}
+
+func (d DeviceApi) Stats(c *gin.Context) {
+	params := utils.QueryParams(c)
+	stats, err := deviceService.Stats(params)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(stats, c)
 }
 
 func (d DeviceApi) Get(c *gin.Context) {
@@ -115,6 +141,90 @@ func (d DeviceApi) Enable(c *gin.Context) {
 	}
 	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "enable", Resource: "device", ResourceID: guid, SourceIP: c.ClientIP()})
 	response.Ok(true, c)
+}
+
+func (d DeviceApi) RestartVPN(c *gin.Context) {
+	guid := c.Param("guid")
+	command, err := deviceService.RequestVPNRestart(guid)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "restart", Resource: "device_vpn", ResourceID: guid, Message: "VPN 重启指令", SourceIP: c.ClientIP()})
+	eventService.Record(services.EventInput{DeviceGuid: guid, EventType: "vpn_restart", Level: "info", Title: "VPN 重启指令已创建", Message: "等待客户端心跳执行"})
+	response.Ok(command, c)
+}
+
+func (d DeviceApi) StreamServiceLogs(c *gin.Context) {
+	guid := strings.TrimSpace(c.Param("guid"))
+	serviceName, tail, err := normalizeServiceLogQuery(c.Query("service"), c.Query("tail"))
+	if err != nil {
+		c.String(http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, _, err := deviceService.Get(guid); err != nil {
+		c.String(http.StatusNotFound, err.Error())
+		return
+	}
+	openCtx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	stream, err := tunnel.DefaultManager.OpenServiceLogStream(openCtx, guid, serviceName, tail)
+	cancel()
+	if err != nil {
+		c.String(http.StatusBadGateway, err.Error())
+		return
+	}
+	defer stream.Close()
+
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "view", Resource: "device_service_log", ResourceID: guid, Message: serviceName, SourceIP: c.ClientIP()})
+	eventService.Record(services.EventInput{DeviceGuid: guid, EventType: "service_log", Level: "info", Title: "服务日志查看", Message: serviceName})
+
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	c.Writer.Flush()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-c.Request.Context().Done():
+			_ = stream.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := stream.Read(buf)
+		if n > 0 {
+			if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
+				return
+			}
+			c.Writer.Flush()
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return
+			}
+			return
+		}
+	}
+}
+
+func normalizeServiceLogQuery(serviceName string, tailText string) (string, int, error) {
+	serviceName = strings.TrimSpace(serviceName)
+	if !serviceLogNamePattern.MatchString(serviceName) {
+		return "", 0, errors.New("invalid service name")
+	}
+	tail := utils.Str2Int(tailText)
+	if tail <= 0 {
+		tail = 200
+	}
+	if tail > 2000 {
+		tail = 2000
+	}
+	return serviceName, tail, nil
 }
 
 func (d DeviceApi) DisableToken(c *gin.Context) {

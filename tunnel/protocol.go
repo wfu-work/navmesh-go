@@ -10,6 +10,8 @@ const (
 	FrameTypePong       = "pong"
 	FrameTypeOpenTCP    = "open_tcp"
 	FrameTypeOpenTCPAck = "open_tcp_ack"
+	FrameTypeOpenLog    = "open_service_log"
+	FrameTypeOpenLogAck = "open_service_log_ack"
 	FrameTypeError      = "error"
 )
 
@@ -36,6 +38,8 @@ type Frame struct {
 	ClientVersion string `json:"clientVersion,omitempty"`
 	TargetHost    string `json:"targetHost,omitempty"`
 	TargetPort    int    `json:"targetPort,omitempty"`
+	ServiceName   string `json:"serviceName,omitempty"`
+	Tail          int    `json:"tail,omitempty"`
 	OK            bool   `json:"ok,omitempty"`
 	Message       string `json:"message,omitempty"`
 }

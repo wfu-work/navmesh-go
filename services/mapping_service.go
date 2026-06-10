@@ -46,6 +46,9 @@ func (s MappingService) List(params map[string]string) ([]domains.PortMapping, i
 	if deviceGuid := strings.TrimSpace(params["deviceGuid"]); deviceGuid != "" {
 		db = db.Where("device_guid = ?", deviceGuid)
 	}
+	if deviceGuids := splitCommaValues(params["deviceGuids"]); len(deviceGuids) > 0 {
+		db = db.Where("device_guid IN ?", deviceGuids)
+	}
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -207,6 +210,24 @@ func queryBool(params map[string]string, key string) (bool, bool) {
 	default:
 		return false, false
 	}
+}
+
+func splitCommaValues(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	return result
 }
 
 func (s MappingService) customDomainService() CustomDomainService {

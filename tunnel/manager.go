@@ -300,6 +300,42 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 	return nil, errors.New("device tunnel data channel unavailable")
 }
 
+func (m *Manager) OpenServiceLogStream(ctx context.Context, deviceGuid, serviceName string, tail int) (io.ReadWriteCloser, error) {
+	m.mu.RLock()
+	item := m.connections[deviceGuid]
+	m.mu.RUnlock()
+	if item == nil {
+		return nil, errors.New("device tunnel offline")
+	}
+	dataConn, dataErr := m.openServiceLogOverDataConn(ctx, item, serviceName, tail)
+	if dataErr == nil {
+		m.Touch(deviceGuid)
+		return dataConn, nil
+	}
+	conn := item.data
+	if conn != nil {
+		stream, err := m.openServiceLogOverQUICConn(ctx, conn, serviceName, tail)
+		if err == nil {
+			m.Touch(deviceGuid)
+			return stream, nil
+		}
+		if shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open service log over quic failed: "+err.Error()) {
+			m.SetOffline(deviceGuid)
+		}
+		return nil, err
+	}
+	if item.tcpControl != nil {
+		if isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error()) {
+			m.SetOffline(deviceGuid)
+		}
+		return nil, dataErr
+	}
+	if m.CloseDeviceIfCurrent(deviceGuid, item, "device tunnel data channel unavailable") {
+		m.SetOffline(deviceGuid)
+	}
+	return nil, errors.New("device tunnel data channel unavailable")
+}
+
 func (m *Manager) openTCPOverQUICConn(ctx context.Context, conn *quic.Conn, targetHost string, targetPort int) (io.ReadWriteCloser, error) {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -332,6 +368,29 @@ func (m *Manager) openTCPOverQUICConn(ctx context.Context, conn *quic.Conn, targ
 	if ack.Type != FrameTypeOpenTCPAck {
 		_ = stream.Close()
 		return nil, errors.New("invalid open tcp ack")
+	}
+	return stream, nil
+}
+
+func (m *Manager) openServiceLogOverQUICConn(ctx context.Context, conn *quic.Conn, serviceName string, tail int) (io.ReadWriteCloser, error) {
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	clearDeadline := applyContextDeadline(stream, ctx)
+	defer clearDeadline()
+	if err := writeOpenServiceLogFrame(stream, serviceName, tail); err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	ack, err := readFrame(stream)
+	if err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	if err := validateOpenServiceLogAck(ack); err != nil {
+		_ = stream.Close()
+		return nil, err
 	}
 	return stream, nil
 }
@@ -377,6 +436,59 @@ func (m *Manager) openTCPOverDataConn(ctx context.Context, item *DeviceConnectio
 	case <-ctx.Done():
 		return nil, fmt.Errorf("%w: %w", ErrTCPDataChannelExhausted, ctx.Err())
 	}
+}
+
+func (m *Manager) openServiceLogOverDataConn(ctx context.Context, item *DeviceConnection, serviceName string, tail int) (io.ReadWriteCloser, error) {
+	if item == nil || item.tcpData == nil {
+		return nil, errors.New("tcp data channel unavailable")
+	}
+	if item.tcpControl == nil && len(item.tcpData) == 0 {
+		return nil, errors.New("tcp data channel unavailable")
+	}
+	select {
+	case conn := <-item.tcpData:
+		clearDeadline := applyContextDeadline(conn, ctx)
+		defer clearDeadline()
+		if err := writeOpenServiceLogFrame(conn, serviceName, tail); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		ack, err := readFrameFromReader(conn)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if err := validateOpenServiceLogAck(ack); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %w", ErrTCPDataChannelExhausted, ctx.Err())
+	}
+}
+
+func writeOpenServiceLogFrame(w io.Writer, serviceName string, tail int) error {
+	frame := Frame{Type: FrameTypeOpenLog, RequestID: uuid.NewString(), ServiceName: serviceName, Tail: tail}
+	payload, err := EncodeFrame(frame)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(payload)
+	return err
+}
+
+func validateOpenServiceLogAck(ack Frame) error {
+	if ack.Type == FrameTypeError || !ack.OK {
+		if ack.Message == "" {
+			ack.Message = "open service log rejected"
+		}
+		return errors.New(ack.Message)
+	}
+	if ack.Type != FrameTypeOpenLogAck {
+		return errors.New("invalid service log ack")
+	}
+	return nil
 }
 
 func (m *Manager) SetOffline(deviceGuid string) {

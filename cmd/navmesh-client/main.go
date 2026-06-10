@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -39,6 +40,8 @@ const (
 	clientTransportAuto    = "auto"
 	defaultTCPDataChannels = 32
 )
+
+var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
 
 type clientConfig struct {
 	Server         string
@@ -103,12 +106,13 @@ type apiResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
-		Guid       string                `json:"guid"`
-		Sncode     string                `json:"sncode"`
-		DeviceType string                `json:"deviceType"`
-		Alias      string                `json:"alias"`
-		Remark     string                `json:"remark"`
-		Upgrade    *clientUpgradeCommand `json:"upgrade"`
+		Guid       string                   `json:"guid"`
+		Sncode     string                   `json:"sncode"`
+		DeviceType string                   `json:"deviceType"`
+		Alias      string                   `json:"alias"`
+		Remark     string                   `json:"remark"`
+		Upgrade    *clientUpgradeCommand    `json:"upgrade"`
+		VPNRestart *clientVPNRestartCommand `json:"vpnRestart"`
 	} `json:"data"`
 }
 
@@ -121,6 +125,11 @@ type clientUpgradeCommand struct {
 	DownloadURL string `json:"downloadUrl"`
 	Sha256      string `json:"sha256"`
 	Size        int64  `json:"size"`
+}
+
+type clientVPNRestartCommand struct {
+	RequestedAt int64  `json:"requestedAt"`
+	Message     string `json:"message"`
 }
 
 type clientState struct {
@@ -152,6 +161,26 @@ var upgradeState = struct {
 	sync.Mutex
 	taskGuid string
 }{}
+
+var vpnRestartState = struct {
+	sync.Mutex
+	lastRequestedAt int64
+	ch              chan clientVPNRestartCommand
+}{ch: make(chan clientVPNRestartCommand, 1)}
+
+var errVPNRestartRequested = errors.New("vpn restart requested")
+
+type clientUpgradeReporter struct {
+	cfg            clientConfig
+	upgrade        clientUpgradeCommand
+	progress       int
+	downloadedSize int64
+}
+
+type upgradeProgressReader struct {
+	reader io.Reader
+	onRead func(int64)
+}
 
 func main() {
 	cfg := parseFlags()
@@ -374,6 +403,10 @@ func run(ctx context.Context, cfg clientConfig) error {
 		failures = 0
 		if err := connectAndServe(ctx, cfg); err != nil {
 			log.Printf("tunnel disconnected: %v", err)
+			if errors.Is(err, errVPNRestartRequested) {
+				failures = 0
+				continue
+			}
 		}
 		failures++
 		if err := waitReconnect(ctx, cfg, failures); err != nil {
@@ -771,12 +804,21 @@ func handleTCPDataConnection(ctx context.Context, cfg clientConfig, conn net.Con
 	if err != nil {
 		return err
 	}
-	if frame.Type != tunnel.FrameTypeOpenTCP {
+	switch frame.Type {
+	case tunnel.FrameTypeOpenTCP:
+		return handleOpenTCPFrame(ctx, cfg, conn, frame)
+	case tunnel.FrameTypeOpenLog:
+		return handleOpenServiceLogFrame(ctx, conn, frame)
+	default:
 		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "unsupported frame type"})
 		return errors.New("unsupported frame type")
 	}
+}
+
+func handleOpenTCPFrame(ctx context.Context, cfg clientConfig, conn io.ReadWriteCloser, frame tunnel.Frame) error {
 	targetHost := normalizeTargetHost(cfg, frame.TargetHost)
 	targetPort := frame.TargetPort
+	log.Printf("open tcp request requestId=%s target=%s:%d sncode=%s", frame.RequestID, targetHost, targetPort, cfg.Sncode)
 	if targetPort <= 0 {
 		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "invalid target port"})
 		return errors.New("invalid target port")
@@ -793,7 +835,52 @@ func handleTCPDataConnection(ctx context.Context, cfg clientConfig, conn net.Con
 		return err
 	}
 	bridge(local, conn)
+	log.Printf("open tcp closed requestId=%s target=%s:%d", frame.RequestID, targetHost, targetPort)
 	return nil
+}
+
+func handleOpenServiceLogFrame(ctx context.Context, conn io.ReadWriteCloser, frame tunnel.Frame) error {
+	serviceName, tail, err := normalizeServiceLogRequest(frame.ServiceName, frame.Tail)
+	if err != nil {
+		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, OK: false, Message: err.Error()})
+		return err
+	}
+	if _, err := exec.LookPath("journalctl"); err != nil {
+		_ = writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, OK: false, Message: "journalctl not found"})
+		return err
+	}
+	if err := writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeOpenLogAck, RequestID: frame.RequestID, OK: true}); err != nil {
+		return err
+	}
+	log.Printf("service log opened requestId=%s service=%s tail=%d", frame.RequestID, serviceName, tail)
+	cmdCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, conn)
+		cancel()
+		close(done)
+	}()
+	cmd := exec.CommandContext(cmdCtx, "journalctl", "-u", serviceName, "-n", strconv.Itoa(tail), "-f", "-o", "short-iso", "--no-pager")
+	cmd.Stdout = conn
+	cmd.Stderr = conn
+	err = cmd.Run()
+	cancel()
+	_ = conn.Close()
+	waitForServiceLogDrain(done)
+	if err != nil && ctx.Err() == nil && cmdCtx.Err() == nil {
+		log.Printf("service log closed with error service=%s err=%v", serviceName, err)
+		return err
+	}
+	log.Printf("service log closed service=%s", serviceName)
+	return nil
+}
+
+func waitForServiceLogDrain(done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errCh chan<- error) {
@@ -802,6 +889,12 @@ func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errC
 	failures := 0
 	for {
 		select {
+		case cmd := <-vpnRestartState.ch:
+			select {
+			case errCh <- fmt.Errorf("%w requestedAt=%d message=%s", errVPNRestartRequested, cmd.RequestedAt, cmd.Message):
+			default:
+			}
+			return
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
@@ -853,6 +946,12 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 	failures := 0
 	for {
 		select {
+		case cmd := <-vpnRestartState.ch:
+			select {
+			case errCh <- fmt.Errorf("%w requestedAt=%d message=%s", errVPNRestartRequested, cmd.RequestedAt, cmd.Message):
+			default:
+			}
+			return
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
@@ -1013,7 +1112,40 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	if result.Data.Upgrade != nil {
 		startClientUpgrade(cfg, *result.Data.Upgrade)
 	}
+	if result.Data.VPNRestart != nil {
+		signalVPNRestart(*result.Data.VPNRestart)
+	}
 	return nil
+}
+
+func signalVPNRestart(command clientVPNRestartCommand) {
+	if command.RequestedAt <= 0 {
+		command.RequestedAt = time.Now().UnixMilli()
+	}
+	vpnRestartState.Lock()
+	if command.RequestedAt <= vpnRestartState.lastRequestedAt {
+		vpnRestartState.Unlock()
+		return
+	}
+	vpnRestartState.lastRequestedAt = command.RequestedAt
+	vpnRestartState.Unlock()
+	if command.Message == "" {
+		command.Message = "restart vpn tunnel"
+	}
+	select {
+	case vpnRestartState.ch <- command:
+		log.Printf("vpn restart requested requestedAt=%d message=%s", command.RequestedAt, command.Message)
+	default:
+		select {
+		case <-vpnRestartState.ch:
+		default:
+		}
+		select {
+		case vpnRestartState.ch <- command:
+			log.Printf("vpn restart requested requestedAt=%d message=%s", command.RequestedAt, command.Message)
+		default:
+		}
+	}
 }
 
 func startClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) {
@@ -1035,16 +1167,54 @@ func startClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) {
 			upgradeState.taskGuid = ""
 			upgradeState.Unlock()
 		}()
-		if err := performClientUpgrade(cfg, upgrade); err != nil {
+		reporter := newClientUpgradeReporter(cfg, upgrade)
+		if err := performClientUpgrade(cfg, upgrade, reporter); err != nil {
 			log.Printf("client upgrade failed task=%s version=%s err=%v", upgrade.TaskGuid, upgrade.Version, err)
-			_ = reportClientUpgrade(context.Background(), cfg, upgrade, "failed", "", err.Error())
+			reporter.Failed(err.Error())
 		}
 	}()
 }
 
-func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) error {
+func newClientUpgradeReporter(cfg clientConfig, upgrade clientUpgradeCommand) *clientUpgradeReporter {
+	return &clientUpgradeReporter{cfg: cfg, upgrade: upgrade}
+}
+
+func (r *clientUpgradeReporter) Running(message string, progress int, downloadedSize int64) {
+	r.report("running", message, "", progress, downloadedSize)
+}
+
+func (r *clientUpgradeReporter) Success(message string) {
+	r.report("success", message, "", 100, r.downloadedSize)
+}
+
+func (r *clientUpgradeReporter) Failed(detail string) {
+	r.report("failed", "客户端升级失败", detail, r.progress, r.downloadedSize)
+}
+
+func (r *clientUpgradeReporter) report(status string, message string, detail string, progress int, downloadedSize int64) {
+	if r == nil {
+		return
+	}
+	if downloadedSize >= 0 {
+		r.downloadedSize = maxInt64(r.downloadedSize, downloadedSize)
+	}
+	r.progress = clampClientProgress(progress, 0, 100)
+	if err := reportClientUpgrade(context.Background(), r.cfg, r.upgrade, status, message, detail, r.progress, r.downloadedSize); err != nil {
+		log.Printf("client upgrade report failed task=%s status=%s progress=%d err=%v", r.upgrade.TaskGuid, status, r.progress, err)
+	}
+}
+
+func (r *upgradeProgressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(int64(n))
+	}
+	return n, err
+}
+
+func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter *clientUpgradeReporter) error {
 	log.Printf("client upgrade started task=%s version=%s url=%s", upgrade.TaskGuid, upgrade.Version, upgrade.DownloadURL)
-	_ = reportClientUpgrade(context.Background(), cfg, upgrade, "running", "downloading client binary", "")
+	reporter.Running("准备升级客户端", 3, 0)
 	if err := validateUpgradePlatform(upgrade); err != nil {
 		return err
 	}
@@ -1054,28 +1224,32 @@ func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) error 
 	}
 	tmpPath := currentPath + ".new"
 	backupPath := currentPath + ".bak"
-	if err := downloadUpgradeBinary(cfg, upgrade, tmpPath); err != nil {
+	reporter.Running("正在下载客户端二进制", 8, 0)
+	if err := downloadUpgradeBinary(cfg, upgrade, tmpPath, reporter); err != nil {
 		return err
 	}
+	reporter.Running("正在设置客户端文件权限", 90, reporter.downloadedSize)
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return err
 	}
+	reporter.Running("正在备份当前客户端", 92, reporter.downloadedSize)
 	_ = os.Remove(backupPath)
 	if err := os.Rename(currentPath, backupPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
+	reporter.Running("正在替换客户端二进制", 96, reporter.downloadedSize)
 	if err := os.Rename(tmpPath, currentPath); err != nil {
 		_ = os.Rename(backupPath, currentPath)
 		return err
 	}
-	_ = reportClientUpgrade(context.Background(), cfg, upgrade, "success", "client binary replaced", firstNonEmpty(upgrade.Version, clientVersion))
+	reporter.Success("客户端二进制已替换，准备重启服务")
 	log.Printf("client upgrade installed task=%s current=%s backup=%s", upgrade.TaskGuid, currentPath, backupPath)
 	restartClientService(cfg)
 	return nil
 }
 
-func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targetPath string) error {
+func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targetPath string, reporter *clientUpgradeReporter) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	url := upgrade.DownloadURL
@@ -1095,12 +1269,35 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("download status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
+	totalSize := upgrade.Size
+	if totalSize <= 0 && resp.ContentLength > 0 {
+		totalSize = resp.ContentLength
+	}
 	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
 	}
 	hash := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(out, hash), resp.Body)
+	downloadedSize := int64(0)
+	lastProgress := 8
+	lastReportAt := time.Now()
+	reader := io.Reader(resp.Body)
+	if reporter != nil {
+		reader = &upgradeProgressReader{
+			reader: resp.Body,
+			onRead: func(n int64) {
+				downloadedSize += n
+				progress := downloadProgress(downloadedSize, totalSize)
+				now := time.Now()
+				if progress >= lastProgress+5 || now.Sub(lastReportAt) >= 2*time.Second {
+					reporter.Running("正在下载客户端二进制", progress, downloadedSize)
+					lastProgress = progress
+					lastReportAt = now
+				}
+			},
+		}
+	}
+	size, copyErr := io.Copy(io.MultiWriter(out, hash), reader)
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(targetPath)
@@ -1109,6 +1306,9 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 	if closeErr != nil {
 		_ = os.Remove(targetPath)
 		return closeErr
+	}
+	if reporter != nil {
+		reporter.Running("正在校验客户端二进制", 84, size)
 	}
 	if upgrade.Size > 0 && size != upgrade.Size {
 		_ = os.Remove(targetPath)
@@ -1121,19 +1321,49 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 			return fmt.Errorf("sha256 mismatch want=%s got=%s", upgrade.Sha256, got)
 		}
 	}
+	if reporter != nil {
+		reporter.Running("客户端二进制校验完成", 88, size)
+	}
 	return nil
 }
 
-func reportClientUpgrade(ctx context.Context, cfg clientConfig, upgrade clientUpgradeCommand, status, message, detail string) error {
+func downloadProgress(downloadedSize int64, totalSize int64) int {
+	if totalSize <= 0 {
+		return 10
+	}
+	progress := 10 + int(downloadedSize*70/totalSize)
+	return clampClientProgress(progress, 10, 80)
+}
+
+func clampClientProgress(value int, minValue int, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func maxInt64(a int64, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func reportClientUpgrade(ctx context.Context, cfg clientConfig, upgrade clientUpgradeCommand, status, message, detail string, progress int, downloadedSize int64) error {
 	body := map[string]any{
-		"token":         cfg.authToken(),
-		"taskGuid":      upgrade.TaskGuid,
-		"deviceGuid":    cfg.DeviceGuid,
-		"sncode":        cfg.Sncode,
-		"status":        status,
-		"message":       message,
-		"errorMessage":  detail,
-		"clientVersion": clientVersion,
+		"token":          cfg.authToken(),
+		"taskGuid":       upgrade.TaskGuid,
+		"deviceGuid":     cfg.DeviceGuid,
+		"sncode":         cfg.Sncode,
+		"status":         status,
+		"progress":       progress,
+		"downloadedSize": downloadedSize,
+		"message":        message,
+		"errorMessage":   detail,
+		"clientVersion":  clientVersion,
 	}
 	if status == "success" {
 		body["clientVersion"] = firstNonEmpty(upgrade.Version, clientVersion)
@@ -1325,33 +1555,33 @@ func handleStream(ctx context.Context, cfg clientConfig, stream *quic.Stream) {
 		log.Printf("read stream frame failed: %v", err)
 		return
 	}
-	if frame.Type != tunnel.FrameTypeOpenTCP {
+	switch frame.Type {
+	case tunnel.FrameTypeOpenTCP:
+		if err := handleOpenTCPFrame(ctx, cfg, stream, frame); err != nil {
+			log.Printf("handle open tcp failed requestId=%s err=%v", frame.RequestID, err)
+		}
+	case tunnel.FrameTypeOpenLog:
+		if err := handleOpenServiceLogFrame(ctx, stream, frame); err != nil {
+			log.Printf("handle service log failed requestId=%s err=%v", frame.RequestID, err)
+		}
+	default:
 		_ = writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "unsupported frame type"})
 		return
 	}
-	targetHost := normalizeTargetHost(cfg, frame.TargetHost)
-	targetPort := frame.TargetPort
-	log.Printf("open tcp request requestId=%s target=%s:%d sncode=%s", frame.RequestID, targetHost, targetPort, cfg.Sncode)
-	if targetPort <= 0 {
-		_ = writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, Message: "invalid target port"})
-		return
+}
+
+func normalizeServiceLogRequest(serviceName string, tail int) (string, int, error) {
+	serviceName = strings.TrimSpace(serviceName)
+	if !serviceLogNamePattern.MatchString(serviceName) {
+		return "", 0, errors.New("invalid service name")
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
-	defer cancel()
-	local, err := (&net.Dialer{Timeout: cfg.RequestTimeout}).DialContext(dialCtx, "tcp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
-	if err != nil {
-		log.Printf("dial local target failed target=%s:%d err=%v", targetHost, targetPort, err)
-		_ = writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeError, RequestID: frame.RequestID, OK: false, Message: err.Error()})
-		return
+	if tail <= 0 {
+		tail = 200
 	}
-	defer local.Close()
-	if err := writeFrame(stream, tunnel.Frame{Type: tunnel.FrameTypeOpenTCPAck, RequestID: frame.RequestID, OK: true}); err != nil {
-		log.Printf("write open_tcp ack failed: %v", err)
-		return
+	if tail > 2000 {
+		tail = 2000
 	}
-	log.Printf("open tcp connected requestId=%s target=%s:%d", frame.RequestID, targetHost, targetPort)
-	bridge(local, stream)
-	log.Printf("open tcp closed requestId=%s target=%s:%d", frame.RequestID, targetHost, targetPort)
+	return serviceName, tail, nil
 }
 
 func normalizeTargetHost(cfg clientConfig, targetHost string) string {

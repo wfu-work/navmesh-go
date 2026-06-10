@@ -24,6 +24,8 @@ type DeviceUpgradeTask struct {
 	FromVersion    string `json:"fromVersion" gorm:"size:64;comment:升级前版本"`
 	CurrentVersion string `json:"currentVersion" gorm:"size:64;comment:上报版本"`
 	Status         int    `json:"status" gorm:"index;comment:状态"`
+	Progress       int    `json:"progress" gorm:"comment:升级进度百分比"`
+	DownloadedSize int64  `json:"downloadedSize" gorm:"comment:已下载大小"`
 	Message        string `json:"message" gorm:"type:text;comment:消息"`
 	ErrorMessage   string `json:"errorMessage" gorm:"type:text;comment:错误消息"`
 	StartTime      int64  `json:"startTime" gorm:"index;comment:开始时间"`

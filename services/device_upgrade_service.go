@@ -30,14 +30,16 @@ type CreateDeviceUpgradeRequest struct {
 }
 
 type DeviceUpgradeReportRequest struct {
-	Token         string `json:"token"`
-	TaskGuid      string `json:"taskGuid"`
-	DeviceGuid    string `json:"deviceGuid"`
-	Sncode        string `json:"sncode"`
-	Status        string `json:"status"`
-	Message       string `json:"message"`
-	ErrorMessage  string `json:"errorMessage"`
-	ClientVersion string `json:"clientVersion"`
+	Token          string `json:"token"`
+	TaskGuid       string `json:"taskGuid"`
+	DeviceGuid     string `json:"deviceGuid"`
+	Sncode         string `json:"sncode"`
+	Status         string `json:"status"`
+	Progress       int    `json:"progress"`
+	DownloadedSize int64  `json:"downloadedSize"`
+	Message        string `json:"message"`
+	ErrorMessage   string `json:"errorMessage"`
+	ClientVersion  string `json:"clientVersion"`
 }
 
 type DeviceUpgradeCommand struct {
@@ -103,6 +105,8 @@ func (s DeviceUpgradeService) CreateTask(deviceGuid string, req CreateDeviceUpgr
 		Size:           release.Size,
 		FromVersion:    device.ClientVersion,
 		Status:         domains.DeviceUpgradeStatusPending,
+		Progress:       0,
+		DownloadedSize: 0,
 		Message:        strings.TrimSpace(req.Message),
 	}
 	if task.DownloadURL == "" {
@@ -144,7 +148,7 @@ func (s DeviceUpgradeService) PendingCommand(deviceGuid string) (*DeviceUpgradeC
 	staleRunningBefore := domains.NowMilli() - int64(deviceUpgradeRunningLease/time.Millisecond)
 	result := s.DB().
 		Where(
-			"device_guid = ? AND (status = ? OR (status = ? AND start_time > 0 AND start_time < ?))",
+			"device_guid = ? AND (status = ? OR (status = ? AND update_time < ?))",
 			strings.TrimSpace(deviceGuid),
 			domains.DeviceUpgradeStatusPending,
 			domains.DeviceUpgradeStatusRunning,
@@ -197,6 +201,8 @@ func (s DeviceUpgradeService) Report(req DeviceUpgradeReportRequest) error {
 	now := domains.NowMilli()
 	updates := map[string]any{
 		"status":          status,
+		"progress":        reportProgress(status, req.Progress, task.Progress),
+		"downloaded_size": reportDownloadedSize(req.DownloadedSize, task.DownloadedSize),
 		"message":         strings.TrimSpace(req.Message),
 		"error_message":   strings.TrimSpace(req.ErrorMessage),
 		"current_version": strings.TrimSpace(req.ClientVersion),
@@ -284,6 +290,55 @@ func reportStatus(value string) int {
 	default:
 		return 0
 	}
+}
+
+func reportProgress(status int, progress int, previous int) int {
+	switch status {
+	case domains.DeviceUpgradeStatusRunning:
+		if progress <= 0 {
+			if previous > 0 {
+				return minInt(previous, 99)
+			}
+			return 1
+		}
+		return clampInt(progress, 1, 99)
+	case domains.DeviceUpgradeStatusSuccess:
+		return 100
+	case domains.DeviceUpgradeStatusFailed, domains.DeviceUpgradeStatusCanceled:
+		if progress <= 0 {
+			return clampInt(previous, 0, 100)
+		}
+		return clampInt(progress, 0, 100)
+	default:
+		return clampInt(progress, 0, 100)
+	}
+}
+
+func reportDownloadedSize(downloaded int64, previous int64) int64 {
+	if downloaded < 0 {
+		return previous
+	}
+	if downloaded == 0 && previous > 0 {
+		return previous
+	}
+	return downloaded
+}
+
+func clampInt(value int, minValue int, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func firstNonEmptyString(values ...string) string {
