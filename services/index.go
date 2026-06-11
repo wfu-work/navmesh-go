@@ -22,6 +22,7 @@ type ServiceGroup struct {
 	SessionService
 	SettingService
 	SSHService
+	TCPMappingService
 }
 
 func PageResult(items any, total int64, params map[string]string) commonDomains.PageResult {

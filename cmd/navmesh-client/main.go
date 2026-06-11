@@ -1,7 +1,10 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -36,9 +39,13 @@ import (
 )
 
 const (
-	clientVersion          = "v0.0.2"
+	clientVersion          = "v0.0.3"
 	clientTransportAuto    = "auto"
 	defaultTCPDataChannels = 32
+	releaseTypeNavmesh     = "navmesh"
+	releaseTypeRain        = "rain"
+	defaultRainInstallDir  = "/mnt/navfirst/nav-rain-go"
+	defaultRainServiceName = "raind"
 )
 
 var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
@@ -118,6 +125,8 @@ type apiResponse struct {
 
 type clientUpgradeCommand struct {
 	TaskGuid    string `json:"taskGuid"`
+	ReleaseType string `json:"releaseType"`
+	DeviceType  string `json:"deviceType"`
 	Version     string `json:"version"`
 	OS          string `json:"os"`
 	Arch        string `json:"arch"`
@@ -254,7 +263,7 @@ func parseFlags() clientConfig {
 	if cfg.HostIP == "" {
 		cfg.HostIP = detectOutboundIP()
 	}
-	cfg.WanIP = normalizeIP(cfg.WanIP)
+	cfg.WanIP = normalizeIPv4(cfg.WanIP)
 	if cfg.WanIP == "" {
 		cfg.WanIP = detectPublicIP(3 * time.Second)
 	}
@@ -1213,11 +1222,19 @@ func (r *upgradeProgressReader) Read(p []byte) (int, error) {
 }
 
 func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter *clientUpgradeReporter) error {
-	log.Printf("client upgrade started task=%s version=%s url=%s", upgrade.TaskGuid, upgrade.Version, upgrade.DownloadURL)
-	reporter.Running("准备升级客户端", 3, 0)
+	upgrade.ReleaseType = normalizeUpgradeReleaseType(upgrade.ReleaseType)
+	log.Printf("upgrade started task=%s type=%s version=%s url=%s", upgrade.TaskGuid, upgrade.ReleaseType, upgrade.Version, upgrade.DownloadURL)
+	reporter.Running("准备升级", 3, 0)
 	if err := validateUpgradePlatform(upgrade); err != nil {
 		return err
 	}
+	if upgrade.ReleaseType == releaseTypeRain {
+		return performRainUpgrade(cfg, upgrade, reporter)
+	}
+	return performNavmeshClientUpgrade(cfg, upgrade, reporter)
+}
+
+func performNavmeshClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter *clientUpgradeReporter) error {
 	currentPath, err := currentExecutablePath()
 	if err != nil {
 		return err
@@ -1246,6 +1263,47 @@ func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, report
 	reporter.Success("客户端二进制已替换，准备重启服务")
 	log.Printf("client upgrade installed task=%s current=%s backup=%s", upgrade.TaskGuid, currentPath, backupPath)
 	restartClientService(cfg)
+	return nil
+}
+
+func performRainUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter *clientUpgradeReporter) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("rain upgrade only supports linux hosts")
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return fmt.Errorf("systemctl not found: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "navmesh-rain-upgrade-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	packagePath := filepath.Join(tmpDir, "rain-package")
+	extractDir := filepath.Join(tmpDir, "extract")
+	reporter.Running("正在下载北斗降雨应用", 8, 0)
+	if err := downloadUpgradeBinary(cfg, upgrade, packagePath, reporter); err != nil {
+		return err
+	}
+	reporter.Running("正在解压北斗降雨应用", 84, reporter.downloadedSize)
+	appPath, err := extractRainPackage(packagePath, extractDir)
+	if err != nil {
+		return err
+	}
+	reporter.Running("正在停止 raind 服务", 90, reporter.downloadedSize)
+	stopSystemdService(defaultRainServiceName)
+	reporter.Running("正在安装北斗降雨应用", 94, reporter.downloadedSize)
+	if err := copyDirContents(filepath.Dir(appPath), defaultRainInstallDir); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Join(defaultRainInstallDir, "navRainApp"), 0o755); err != nil {
+		return err
+	}
+	reporter.Running("正在重启 raind 服务", 98, reporter.downloadedSize)
+	if err := restartSystemdService(defaultRainServiceName); err != nil {
+		return err
+	}
+	reporter.Success("北斗降雨应用已升级并重启")
+	log.Printf("rain upgrade installed task=%s installDir=%s service=%s", upgrade.TaskGuid, defaultRainInstallDir, defaultRainServiceName)
 	return nil
 }
 
@@ -1290,7 +1348,7 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 				progress := downloadProgress(downloadedSize, totalSize)
 				now := time.Now()
 				if progress >= lastProgress+5 || now.Sub(lastReportAt) >= 2*time.Second {
-					reporter.Running("正在下载客户端二进制", progress, downloadedSize)
+					reporter.Running(upgradeDownloadMessage(upgrade), progress, downloadedSize)
 					lastProgress = progress
 					lastReportAt = now
 				}
@@ -1308,7 +1366,7 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 		return closeErr
 	}
 	if reporter != nil {
-		reporter.Running("正在校验客户端二进制", 84, size)
+		reporter.Running(upgradeVerifyMessage(upgrade), 84, size)
 	}
 	if upgrade.Size > 0 && size != upgrade.Size {
 		_ = os.Remove(targetPath)
@@ -1322,9 +1380,30 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 		}
 	}
 	if reporter != nil {
-		reporter.Running("客户端二进制校验完成", 88, size)
+		reporter.Running(upgradeVerifiedMessage(upgrade), 88, size)
 	}
 	return nil
+}
+
+func upgradeDownloadMessage(upgrade clientUpgradeCommand) string {
+	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeRain {
+		return "正在下载北斗降雨应用"
+	}
+	return "正在下载客户端二进制"
+}
+
+func upgradeVerifyMessage(upgrade clientUpgradeCommand) string {
+	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeRain {
+		return "正在校验北斗降雨应用"
+	}
+	return "正在校验客户端二进制"
+}
+
+func upgradeVerifiedMessage(upgrade clientUpgradeCommand) string {
+	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeRain {
+		return "北斗降雨应用校验完成"
+	}
+	return "客户端二进制校验完成"
 }
 
 func downloadProgress(downloadedSize int64, totalSize int64) int {
@@ -1363,10 +1442,11 @@ func reportClientUpgrade(ctx context.Context, cfg clientConfig, upgrade clientUp
 		"downloadedSize": downloadedSize,
 		"message":        message,
 		"errorMessage":   detail,
-		"clientVersion":  clientVersion,
 	}
-	if status == "success" {
+	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeNavmesh && status == "success" {
 		body["clientVersion"] = firstNonEmpty(upgrade.Version, clientVersion)
+	} else {
+		body["clientVersion"] = clientVersion
 	}
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
@@ -1404,6 +1484,222 @@ func validateUpgradePlatform(upgrade clientUpgradeCommand) error {
 	}
 	if upgrade.Arch = strings.ToLower(strings.TrimSpace(upgrade.Arch)); upgrade.Arch != "" && upgrade.Arch != runtime.GOARCH {
 		return fmt.Errorf("upgrade arch mismatch want=%s current=%s", upgrade.Arch, runtime.GOARCH)
+	}
+	return nil
+}
+
+func normalizeUpgradeReleaseType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "navmesh_client":
+		return releaseTypeNavmesh
+	case releaseTypeRain, "device_software":
+		return releaseTypeRain
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func extractRainPackage(packagePath string, extractDir string) (string, error) {
+	if err := os.MkdirAll(extractDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := unzipFile(packagePath, extractDir); err == nil {
+		return findRainApp(extractDir)
+	}
+	if err := untarGzipFile(packagePath, extractDir); err == nil {
+		return findRainApp(extractDir)
+	}
+	target := filepath.Join(extractDir, "navRainApp")
+	if err := copyFile(packagePath, target, 0o755); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func findRainApp(root string) (string, error) {
+	var found string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if found != "" || entry.IsDir() || entry.Name() != "navRainApp" {
+			return nil
+		}
+		found = path
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if found == "" {
+		return "", errors.New("navRainApp not found in package")
+	}
+	return found, nil
+}
+
+func unzipFile(src string, dst string) error {
+	reader, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	for _, file := range reader.File {
+		target, err := safeJoin(dst, file.Name)
+		if err != nil {
+			return err
+		}
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		srcFile, err := file.Open()
+		if err != nil {
+			return err
+		}
+		mode := file.FileInfo().Mode()
+		if mode == 0 {
+			mode = 0o644
+		}
+		err = writeReaderToFile(srcFile, target, mode)
+		closeErr := srcFile.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
+}
+
+func untarGzipFile(src string, dst string) error {
+	file, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer gzipReader.Close()
+	tarReader := tar.NewReader(gzipReader)
+	for {
+		header, err := tarReader.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target, err := safeJoin(dst, header.Name)
+		if err != nil {
+			return err
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			mode := os.FileMode(header.Mode)
+			if mode == 0 {
+				mode = 0o644
+			}
+			if err := writeReaderToFile(tarReader, target, mode); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func copyDirContents(srcDir string, dstDir string) error {
+	return filepath.WalkDir(srcDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		target, err := safeJoin(dstDir, rel)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+func copyFile(src string, dst string, mode os.FileMode) error {
+	file, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if mode == 0 {
+		mode = 0o644
+	}
+	return writeReaderToFile(file, dst, mode)
+}
+
+func writeReaderToFile(reader io.Reader, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, reader)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func safeJoin(root string, name string) (string, error) {
+	cleanRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(cleanRoot, filepath.Clean(name))
+	rel, err := filepath.Rel(cleanRoot, target)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("unsafe package path: %s", name)
+	}
+	return target, nil
+}
+
+func stopSystemdService(serviceName string) {
+	cmd := exec.Command("systemctl", "stop", serviceName)
+	_ = cmd.Run()
+}
+
+func restartSystemdService(serviceName string) error {
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	if err := exec.Command("systemctl", "restart", serviceName).Run(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1695,11 +1991,16 @@ func detectPublicIP(timeout time.Duration) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	client := http.Client{Timeout: timeout}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp4", address)
+	}
+	defer transport.CloseIdleConnections()
+	client := http.Client{Timeout: timeout, Transport: transport}
 	for _, endpoint := range []string{
-		"https://api.ipify.org",
+		"https://api4.ipify.org",
 		"https://ifconfig.me/ip",
-		"https://icanhazip.com",
+		"https://ipv4.icanhazip.com",
 	} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
@@ -1714,9 +2015,20 @@ func detectPublicIP(timeout time.Duration) string {
 		if readErr != nil || resp.StatusCode >= 300 {
 			continue
 		}
-		if ip := normalizeIP(string(data)); isPublicIP(ip) {
+		if ip := normalizeIPv4(string(data)); isPublicIPv4(ip) {
 			return ip
 		}
+	}
+	return ""
+}
+
+func normalizeIPv4(value string) string {
+	ip := net.ParseIP(normalizeIP(value))
+	if ip == nil {
+		return ""
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4.String()
 	}
 	return ""
 }
@@ -1735,6 +2047,11 @@ func normalizeIP(value string) string {
 		return ""
 	}
 	return ip.String()
+}
+
+func isPublicIPv4(value string) bool {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	return ip != nil && ip.To4() != nil && isPublicIP(value)
 }
 
 func isPublicIP(value string) bool {

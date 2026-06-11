@@ -12,8 +12,11 @@ const (
 
 type DeviceUpgradeTask struct {
 	commonDomains.BaseDataEntity
+	BatchGuid      string `json:"batchGuid" gorm:"size:64;index;comment:批量升级批次ID"`
 	DeviceGuid     string `json:"deviceGuid" gorm:"size:64;index;comment:设备ID"`
 	ReleaseGuid    string `json:"releaseGuid" gorm:"size:64;index;comment:客户端版本ID"`
+	ReleaseType    string `json:"releaseType" gorm:"size:32;index;comment:版本类型"`
+	DeviceType     string `json:"deviceType" gorm:"size:64;index;comment:设备类型"`
 	Version        string `json:"version" gorm:"size:64;comment:目标版本"`
 	OS             string `json:"os" gorm:"size:32;comment:目标系统"`
 	Arch           string `json:"arch" gorm:"size:32;comment:目标架构"`
@@ -35,5 +38,24 @@ type DeviceUpgradeTask struct {
 func (DeviceUpgradeTask) TableName() string { return "navmesh_device_upgrade_tasks" }
 
 func (s DeviceUpgradeTask) GetBaseData() commonDomains.BaseDataEntity {
+	return s.BaseDataEntity
+}
+
+type DeviceUpgradeBatch struct {
+	commonDomains.BaseDataEntity
+	ReleaseGuid string `json:"releaseGuid" gorm:"size:64;index;comment:客户端版本ID"`
+	ReleaseType string `json:"releaseType" gorm:"size:32;index;comment:版本类型"`
+	DeviceType  string `json:"deviceType" gorm:"size:64;index;comment:设备类型"`
+	Version     string `json:"version" gorm:"size:64;comment:目标版本"`
+	OS          string `json:"os" gorm:"size:32;comment:目标系统"`
+	Arch        string `json:"arch" gorm:"size:32;comment:目标架构"`
+	FileName    string `json:"fileName" gorm:"size:255;comment:文件名"`
+	TotalCount  int    `json:"totalCount" gorm:"comment:任务总数"`
+	Message     string `json:"message" gorm:"type:text;comment:批次备注"`
+}
+
+func (DeviceUpgradeBatch) TableName() string { return "navmesh_device_upgrade_batches" }
+
+func (s DeviceUpgradeBatch) GetBaseData() commonDomains.BaseDataEntity {
 	return s.BaseDataEntity
 }

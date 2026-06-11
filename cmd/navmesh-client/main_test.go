@@ -86,6 +86,45 @@ func TestNormalizeTransport(t *testing.T) {
 	}
 }
 
+func TestNormalizeIPv4RejectsIPv6(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "plain ipv4", value: " 203.0.113.10 ", want: "203.0.113.10"},
+		{name: "ipv4 with port", value: "203.0.113.10:8080", want: "203.0.113.10"},
+		{name: "ipv6", value: "240e:36d:389:5a0::1", want: ""},
+		{name: "ipv6 with brackets", value: "[240e:36d:389:5a0::1]", want: ""},
+		{name: "invalid", value: "not-an-ip", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeIPv4(tt.value); got != tt.want {
+				t.Fatalf("normalizeIPv4(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsPublicIPv4RejectsIPv6AndPrivateIP(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "8.8.8.8", want: true},
+		{value: "192.168.1.10", want: false},
+		{value: "240e:36d:389:5a0::1", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			if got := isPublicIPv4(tt.value); got != tt.want {
+				t.Fatalf("isPublicIPv4(%q) = %t, want %t", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDefaultTCPDataChannelsSupportsResourceHeavyPages(t *testing.T) {
 	if defaultTCPDataChannels < 32 {
 		t.Fatalf("defaultTCPDataChannels = %d, want at least 32", defaultTCPDataChannels)

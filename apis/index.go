@@ -16,6 +16,7 @@ type ApiGroup struct {
 	SessionApi
 	SettingApi
 	SSHApi
+	TCPMappingApi
 	TunnelApi
 }
 
@@ -34,4 +35,5 @@ var (
 	sessionService       = services.ServiceGroupApp.SessionService
 	settingService       = services.ServiceGroupApp.SettingService
 	sshService           = services.ServiceGroupApp.SSHService
+	tcpMappingService    = services.ServiceGroupApp.TCPMappingService
 )

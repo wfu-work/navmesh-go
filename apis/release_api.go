@@ -57,6 +57,58 @@ func (a ReleaseApi) Get(c *gin.Context) {
 	response.Ok(item, c)
 }
 
+func (a ReleaseApi) UpgradeCandidates(c *gin.Context) {
+	items, err := deviceUpgradeService.Candidates(c.Param("guid"))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(items, c)
+}
+
+func (a ReleaseApi) CreateUpgradeBatch(c *gin.Context) {
+	var req services.CreateDeviceUpgradeBatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	release, err := releaseService.GetEnabled(c.Param("guid"))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	result, err := deviceUpgradeService.CreateBatch(release.Guid, req, publicReleaseDownloadURL(c, release))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "create", Resource: "device_upgrade_batch", ResourceID: result.Batch.Guid, Message: release.Guid, SourceIP: c.ClientIP()})
+	response.Ok(result, c)
+}
+
+func (a ReleaseApi) ListUpgradeBatches(c *gin.Context) {
+	params := utils.QueryParams(c)
+	params["releaseGuid"] = c.Param("guid")
+	items, total, err := deviceUpgradeService.ListBatches(params)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(services.PageResult(items, total, params), c)
+}
+
+func (a ReleaseApi) ListUpgradeBatchTasks(c *gin.Context) {
+	params := utils.QueryParams(c)
+	params["releaseGuid"] = c.Param("guid")
+	params["batchGuid"] = c.Param("batchGuid")
+	items, total, err := deviceUpgradeService.List("", params)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(services.PageResult(items, total, params), c)
+}
+
 func (a ReleaseApi) Update(c *gin.Context) {
 	file, _ := c.FormFile("file")
 	item, err := releaseService.Update(c.Param("guid"), file, services.UploadReleaseRequest{
@@ -112,7 +164,7 @@ func (a ReleaseApi) Download(c *gin.Context) {
 		return
 	case "install-rain.sh":
 		c.Header("Content-Disposition", `attachment; filename="install-rain.sh"`)
-		c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", deployAssets.InstallRainScript)
+		c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", renderInstallScript(deployAssets.InstallRainScript, publicDownloadBase(c)))
 		return
 	}
 	item, err := releaseService.FindDownload(fileName)
@@ -142,6 +194,10 @@ func (a ReleaseApi) DownloadLatest(c *gin.Context) {
 }
 
 func publicDownloadURL(c *gin.Context, fileName string) string {
+	return publicDownloadBase(c) + "/" + strings.TrimLeft(fileName, "/")
+}
+
+func publicDownloadBase(c *gin.Context) string {
 	base := strings.TrimSpace(settingService.Value("client_download_base", ""))
 	if base == "" {
 		scheme := firstForwardedValue(c.GetHeader("X-Forwarded-Proto"))
@@ -158,29 +214,28 @@ func publicDownloadURL(c *gin.Context, fileName string) string {
 		}
 		base = scheme + "://" + host + "/api/downloads"
 	}
-	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(fileName, "/")
+	return strings.TrimRight(base, "/")
+}
+
+func renderInstallScript(script []byte, downloadBase string) []byte {
+	downloadBase = strings.TrimSpace(downloadBase)
+	if downloadBase == "" {
+		return script
+	}
+	rendered := strings.Replace(string(script), `DOWNLOAD_BASE=""`, `DOWNLOAD_BASE=`+shellDoubleQuoted(downloadBase), 1)
+	return []byte(rendered)
+}
+
+func shellDoubleQuoted(value string) string {
+	value = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "$", `\$`, "`", "\\`").Replace(value)
+	return `"` + value + `"`
 }
 
 func publicReleaseDownloadURL(c *gin.Context, item *domains.Release) string {
 	if item == nil {
 		return ""
 	}
-	base := strings.TrimSpace(settingService.Value("client_download_base", ""))
-	if base == "" {
-		scheme := firstForwardedValue(c.GetHeader("X-Forwarded-Proto"))
-		if scheme == "" {
-			if c.Request.TLS != nil {
-				scheme = "https"
-			} else {
-				scheme = "http"
-			}
-		}
-		host := firstForwardedValue(c.GetHeader("X-Forwarded-Host"))
-		if host == "" {
-			host = c.Request.Host
-		}
-		base = scheme + "://" + host + "/api/downloads"
-	}
+	base := publicDownloadBase(c)
 	if item.Guid != "" {
 		return strings.TrimRight(base, "/") + "/releases/" + strings.TrimLeft(item.Guid, "/")
 	}

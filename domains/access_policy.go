@@ -9,6 +9,7 @@ type AccessPolicy struct {
 	TargetID  string `json:"targetId" gorm:"size:128;index;comment:目标ID"`
 	AllowSSH  bool   `json:"allowSsh" gorm:"comment:允许SSH"`
 	AllowHTTP bool   `json:"allowHttp" gorm:"comment:允许HTTP"`
+	AllowTCP  bool   `json:"allowTcp" gorm:"comment:允许TCP"`
 	Status    int    `json:"status" gorm:"index;comment:状态"`
 }
 

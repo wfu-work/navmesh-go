@@ -185,7 +185,12 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	}
 	device.Hostname = req.Hostname
 	device.HostIP = req.HostIP
-	device.WanIP = resolveDeviceWanIP(req.WanIP, sourceIP)
+	if wanIP := resolveDeviceWanIP(req.WanIP, sourceIP); wanIP != "" || normalizeIPv4(device.WanIP) == "" {
+		device.WanIP = wanIP
+		if wanIP == "" {
+			device.Location = ""
+		}
+	}
 	if location := resolveDeviceLocation(device.WanIP); location != "" {
 		device.Location = location
 	}
@@ -289,6 +294,9 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 		if location != "" {
 			updates["location"] = location
 		}
+	} else if strings.TrimSpace(device.WanIP) != "" && normalizeIPv4(device.WanIP) == "" {
+		updates["wan_ip"] = ""
+		updates["location"] = ""
 	}
 	if strings.TrimSpace(req.HostIP) != "" {
 		updates["host_ip"] = strings.TrimSpace(req.HostIP)
@@ -521,6 +529,9 @@ func (s DeviceService) Delete(guid string) error {
 		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.PortMapping{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.TCPMapping{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&domains.SSHEntrypoint{}).Where("device_guid = ?", guid).Updates(map[string]any{
 			"device_guid": "",
 			"update_time": domains.NowMilli(),
@@ -648,7 +659,7 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 	req.Remark = strings.TrimSpace(req.Remark)
 	req.Hostname = strings.TrimSpace(req.Hostname)
 	req.HostIP = strings.TrimSpace(req.HostIP)
-	req.WanIP = normalizeIP(req.WanIP)
+	req.WanIP = normalizeIPv4(req.WanIP)
 	req.ClientVersion = strings.TrimSpace(req.ClientVersion)
 	req.OS = strings.TrimSpace(req.OS)
 	req.OSVersion = strings.TrimSpace(req.OSVersion)
@@ -677,10 +688,21 @@ func normalizeRegisterRequest(req RegisterDeviceRequest) RegisterDeviceRequest {
 }
 
 func resolveDeviceWanIP(wanIP, sourceIP string) string {
-	if ip := normalizeIP(wanIP); ip != "" {
+	if ip := normalizeIPv4(wanIP); ip != "" {
 		return ip
 	}
-	return normalizeIP(sourceIP)
+	return normalizeIPv4(sourceIP)
+}
+
+func normalizeIPv4(value string) string {
+	ip := net.ParseIP(normalizeIP(value))
+	if ip == nil {
+		return ""
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4.String()
+	}
+	return ""
 }
 
 func normalizeIP(value string) string {

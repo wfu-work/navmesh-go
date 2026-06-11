@@ -12,9 +12,15 @@ func TestSamePlatformLinuxDistributionAliases(t *testing.T) {
 		target  string
 	}{
 		{current: "ubuntu", target: "linux"},
+		{current: "ubuntu 20.04", target: "linux"},
+		{current: "Ubuntu 22.04.4 LTS", target: "linux"},
 		{current: "debian", target: "linux"},
+		{current: "debian 12.14", target: "linux"},
 		{current: "centos", target: "linux"},
+		{current: "centos 7", target: "linux"},
 		{current: "alpine", target: "linux"},
+		{current: "rocky linux 9", target: "linux"},
+		{current: "almaLinux 9.4", target: "linux"},
 	}
 
 	for _, tt := range tests {
@@ -23,6 +29,33 @@ func TestSamePlatformLinuxDistributionAliases(t *testing.T) {
 				t.Fatalf("samePlatform(%q, %q) = false; want true", tt.current, tt.target)
 			}
 		})
+	}
+}
+
+func TestReleaseUpgradeDisabledReasonExplainsPlatformMismatch(t *testing.T) {
+	release := domains.Release{ReleaseType: domains.ReleaseTypeNavmesh, DeviceType: "all", OS: "linux", Arch: "arm64"}
+	device := domains.Device{DeviceType: "ssh", OS: "linux", Arch: "amd64", ClientVersion: "v0.0.3"}
+
+	if got := releaseUpgradeDisabledReason(release, device); got != "设备系统或架构与升级包不匹配" {
+		t.Fatalf("releaseUpgradeDisabledReason() = %q", got)
+	}
+}
+
+func TestReleaseUpgradeDisabledReasonAllowsMatchingPlatform(t *testing.T) {
+	release := domains.Release{ReleaseType: domains.ReleaseTypeNavmesh, DeviceType: "all", OS: "linux", Arch: "arm64"}
+	device := domains.Device{DeviceType: "ssh", OS: "ubuntu", Arch: "arm64", ClientVersion: "v0.0.3"}
+
+	if got := releaseUpgradeDisabledReason(release, device); got != "" {
+		t.Fatalf("releaseUpgradeDisabledReason() = %q, want empty", got)
+	}
+}
+
+func TestReleaseUpgradeDisabledReasonRequiresRainCapableClient(t *testing.T) {
+	release := domains.Release{ReleaseType: domains.ReleaseTypeRain, DeviceType: "all", OS: "linux", Arch: "arm64"}
+	device := domains.Device{DeviceType: "rain", OS: "linux", Arch: "arm64", ClientVersion: "v0.0.2"}
+
+	if got := releaseUpgradeDisabledReason(release, device); got != "设备客户端版本不支持北斗降雨在线升级" {
+		t.Fatalf("releaseUpgradeDisabledReason() = %q", got)
 	}
 }
 

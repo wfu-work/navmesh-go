@@ -19,6 +19,7 @@ type SessionStats struct {
 	Closed           int64 `json:"closed"`
 	SSH              int64 `json:"ssh"`
 	HTTP             int64 `json:"http"`
+	TCP              int64 `json:"tcp"`
 	BytesIn          int64 `json:"bytesIn"`
 	BytesOut         int64 `json:"bytesOut"`
 	ForceClosed      int64 `json:"forceClosed"`
@@ -93,6 +94,7 @@ func (s SessionService) Stats(params map[string]string) (*SessionStats, error) {
 	_ = db.Session(&gorm.Session{}).Where("status = ?", int(domains.StatusDisabled)).Count(&stats.Closed).Error
 	_ = db.Session(&gorm.Session{}).Where("session_type = ?", "ssh").Count(&stats.SSH).Error
 	_ = db.Session(&gorm.Session{}).Where("session_type = ?", "http").Count(&stats.HTTP).Error
+	_ = db.Session(&gorm.Session{}).Where("session_type = ?", "tcp").Count(&stats.TCP).Error
 	_ = db.Session(&gorm.Session{}).Where("force_closed = ?", true).Count(&stats.ForceClosed).Error
 	var sums struct {
 		BytesIn  int64

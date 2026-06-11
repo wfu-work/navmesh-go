@@ -15,6 +15,10 @@ func (r *ReleaseRouter) InitReleaseRouter(publicGroup *gin.RouterGroup, privateG
 	releases := privateGroup.Group("releases")
 	{
 		releases.GET("list", releaseApi.List)
+		releases.GET(":guid/upgrade/candidates", releaseApi.UpgradeCandidates)
+		releases.GET(":guid/upgrade/batches", releaseApi.ListUpgradeBatches)
+		releases.POST(":guid/upgrade/batches", releaseApi.CreateUpgradeBatch)
+		releases.GET(":guid/upgrade/batches/:batchGuid/tasks", releaseApi.ListUpgradeBatchTasks)
 		releases.GET(":guid", releaseApi.Get)
 		releases.POST("upload", releaseApi.Upload)
 		releases.PUT(":guid", releaseApi.Update)

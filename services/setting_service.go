@@ -16,9 +16,13 @@ func (s SettingService) List() ([]domains.Setting, error) {
 }
 
 func (s SettingService) Save(key, value string) (*domains.Setting, error) {
+	key = strings.TrimSpace(key)
 	now := domains.NowMilli()
 	row := domains.Setting{Key: key, Value: value, CreateTime: now, UpdateTime: now}
 	err := global.NAV_DB.Save(&row).Error
+	if err == nil && isTCPMappingSetting(key) {
+		triggerTCPMappingReload()
+	}
 	return &row, err
 }
 
@@ -31,4 +35,13 @@ func (s SettingService) Value(key, def string) string {
 		return def
 	}
 	return strings.TrimSpace(row.Value)
+}
+
+func isTCPMappingSetting(key string) bool {
+	switch key {
+	case "tcp_mapping_enabled", "tcp_public_port_min", "tcp_public_port_max", "tcp_gateway_domain":
+		return true
+	default:
+		return false
+	}
 }

@@ -37,6 +37,28 @@ func TestRecordDailyDiskUsageEventLimitsOnePerDay(t *testing.T) {
 	assertDiskUsageEventCount(t, db, deviceGuid, 2)
 }
 
+func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {
+	tests := []struct {
+		name     string
+		wanIP    string
+		sourceIP string
+		want     string
+	}{
+		{name: "reported ipv4 wins", wanIP: " 203.0.113.10 ", sourceIP: "198.51.100.20", want: "203.0.113.10"},
+		{name: "reported ipv6 ignored source ipv4 used", wanIP: "240e:36d:389:5a0::1", sourceIP: "198.51.100.20", want: "198.51.100.20"},
+		{name: "source ipv6 ignored", wanIP: "", sourceIP: "240e:36d:389:5a0::1", want: ""},
+		{name: "both ipv6 ignored", wanIP: "240e:36d:389:5a0::1", sourceIP: "2001:db8::1", want: ""},
+		{name: "ipv4 with port normalized", wanIP: "203.0.113.10:443", sourceIP: "", want: "203.0.113.10"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveDeviceWanIP(tt.wanIP, tt.sourceIP); got != tt.want {
+				t.Fatalf("resolveDeviceWanIP(%q, %q) = %q, want %q", tt.wanIP, tt.sourceIP, got, tt.want)
+			}
+		})
+	}
+}
+
 func assertDiskUsageEventCount(t *testing.T, db *gorm.DB, deviceGuid string, want int64) {
 	t.Helper()
 	var count int64

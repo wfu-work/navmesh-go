@@ -29,6 +29,7 @@ type SaveAccessPolicyRequest struct {
 	TargetID  string `json:"targetId"`
 	AllowSSH  bool   `json:"allowSsh"`
 	AllowHTTP bool   `json:"allowHttp"`
+	AllowTCP  bool   `json:"allowTcp"`
 	Status    int    `json:"status"`
 }
 
@@ -88,6 +89,7 @@ func (s AccessPolicyService) Save(req SaveAccessPolicyRequest) (*domains.AccessP
 	row.TargetID = req.TargetID
 	row.AllowSSH = req.AllowSSH
 	row.AllowHTTP = req.AllowHTTP
+	row.AllowTCP = req.AllowTCP
 	row.Status = req.Status
 	row.UpdateTime = now
 	return &row, s.DB().Save(&row).Error
@@ -129,6 +131,8 @@ func (s AccessPolicyService) IsAllowed(deviceGuid, mappingGuid, protocol string)
 			allowed = allowed && policy.AllowSSH
 		case "http", "https":
 			allowed = allowed && policy.AllowHTTP
+		case "tcp":
+			allowed = allowed && policy.AllowTCP
 		}
 	}
 	return allowed

@@ -20,6 +20,7 @@ type RouterGroup struct {
 	SessionRouter
 	SettingRouter
 	SSHRouter
+	TCPMappingRouter
 	TunnelRouter
 }
 
@@ -35,6 +36,7 @@ var (
 	sessionApi      = apis.ApiGroupApp.SessionApi
 	settingApi      = apis.ApiGroupApp.SettingApi
 	sshApi          = apis.ApiGroupApp.SSHApi
+	tcpMappingApi   = apis.ApiGroupApp.TCPMappingApi
 	tunnelApi       = apis.ApiGroupApp.TunnelApi
 )
 
@@ -50,5 +52,6 @@ func (r *RouterGroup) InitRouters(publicGroup *gin.RouterGroup, privateGroup *gi
 	r.InitSessionRouter(privateGroup)
 	r.InitSettingRouter(privateGroup)
 	r.InitSSHRouter(privateGroup)
+	r.InitTCPMappingRouter(privateGroup)
 	r.InitTunnelRouter(privateGroup)
 }

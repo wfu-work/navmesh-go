@@ -9,6 +9,7 @@ import (
 	"navmesh-go/routers"
 	"navmesh-go/services"
 	"navmesh-go/sshgateway"
+	"navmesh-go/tcpgateway"
 	"navmesh-go/tunnel"
 	"navmesh-go/utils"
 	"navmesh-go/webs"
@@ -26,6 +27,7 @@ import (
 var tunnelServer *tunnel.Server
 var sshServer *sshgateway.Server
 var httpMappingServer *httpgateway.Server
+var tcpMappingServer *tcpgateway.Server
 var maintenanceCancel context.CancelFunc
 var deviceOfflineCancel context.CancelFunc
 
@@ -58,12 +60,14 @@ func registerTables() {
 		domains.Device{},
 		domains.DeviceToken{},
 		domains.Release{},
+		domains.DeviceUpgradeBatch{},
 		domains.DeviceUpgradeTask{},
 		domains.DeviceConnection{},
 		domains.DeviceHeartbeat{},
 		domains.SSHAlias{},
 		domains.SSHEntrypoint{},
 		domains.PortMapping{},
+		domains.TCPMapping{},
 		domains.CustomDomain{},
 		domains.TunnelSession{},
 		domains.HTTPAccessLog{},
@@ -122,6 +126,10 @@ func seedDefaultSettings() {
 		"ssh_enabled":                      "true",
 		"http_listen":                      ":3009",
 		"http_mapping_enabled":             "true",
+		"tcp_gateway_domain":               "tcpd.navfirst.com",
+		"tcp_mapping_enabled":              "true",
+		"tcp_public_port_min":              "20000",
+		"tcp_public_port_max":              "29999",
 		"tunnel_listen":                    ":3008",
 		"tunnel_enabled":                   "true",
 		"device_register_token":            services.DefaultDeviceRegisterToken(),
@@ -166,9 +174,11 @@ func startBackgroundServers() {
 	startTunnelServer()
 	startSSHServer()
 	startHTTPMappingServer()
+	startTCPMappingServer()
 }
 
 func stopBackgroundServers() {
+	stopTCPMappingServer()
 	stopHTTPMappingServer()
 	stopSSHServer()
 	stopTunnelServer()
@@ -264,6 +274,31 @@ func stopHTTPMappingServer() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		httpMappingServer.Stop(ctx)
+	}
+}
+
+func startTCPMappingServer() {
+	if strings.EqualFold(getSettingValue("tcp_mapping_enabled", "true"), "false") {
+		global.NAV_LOG.Info("navmesh tcp mapping gateway disabled")
+		return
+	}
+	tcpMappingServer = tcpgateway.NewServer(tunnel.DefaultManager)
+	services.RegisterTCPMappingReloader(func() {
+		if tcpMappingServer == nil {
+			return
+		}
+		if err := tcpMappingServer.Reload(); err != nil {
+			global.NAV_LOG.Error("reload navmesh tcp mapping gateway failed", zap.Error(err))
+		}
+	})
+	if err := tcpMappingServer.Start(); err != nil {
+		global.NAV_LOG.Error("start navmesh tcp mapping gateway failed", zap.Error(err))
+	}
+}
+
+func stopTCPMappingServer() {
+	if tcpMappingServer != nil {
+		tcpMappingServer.Stop()
 	}
 }
 
