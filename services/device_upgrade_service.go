@@ -150,6 +150,9 @@ func (s DeviceUpgradeService) Candidates(releaseGuid string) ([]DeviceUpgradeCan
 		if !releaseMatchesDeviceType(*release, device) {
 			continue
 		}
+		if !releaseMatchesDevicePlatform(*release, device) {
+			continue
+		}
 		item := DeviceUpgradeCandidate{Device: device}
 		if task, ok := activeMap[device.Guid]; ok {
 			item.HasActiveUpgrade = true
@@ -425,12 +428,16 @@ func (s DeviceUpgradeService) Report(req DeviceUpgradeReportRequest) error {
 		return nil
 	}
 	now := domains.NowMilli()
+	errorMessage := strings.TrimSpace(req.ErrorMessage)
+	if status != domains.DeviceUpgradeStatusFailed {
+		errorMessage = ""
+	}
 	updates := map[string]any{
 		"status":          status,
 		"progress":        reportProgress(status, req.Progress, task.Progress),
 		"downloaded_size": reportDownloadedSize(req.DownloadedSize, task.DownloadedSize),
 		"message":         strings.TrimSpace(req.Message),
-		"error_message":   strings.TrimSpace(req.ErrorMessage),
+		"error_message":   errorMessage,
 		"current_version": strings.TrimSpace(req.ClientVersion),
 		"update_time":     now,
 	}

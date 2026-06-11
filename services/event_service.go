@@ -16,6 +16,8 @@ type EventService struct {
 	commonServices.CrudService[domains.Event]
 }
 
+const ignoredServiceLogEventType = "service_log"
+
 func (s EventService) WithDB(db *gorm.DB) EventService {
 	s.CrudService = *s.CrudService.WithDB(db)
 	return s
@@ -30,7 +32,7 @@ type EventInput struct {
 }
 
 func (s EventService) List(params map[string]string) ([]domains.Event, int64, error) {
-	db := s.DB().Model(&domains.Event{})
+	db := s.DB().Model(&domains.Event{}).Where("event_type <> ?", ignoredServiceLogEventType)
 	if deviceGuid := strings.TrimSpace(params["deviceGuid"]); deviceGuid != "" {
 		db = db.Where("device_guid = ?", deviceGuid)
 	}
@@ -74,7 +76,7 @@ func (s EventService) Close(guid string) error {
 func (s EventService) Record(input EventInput) {
 	input.EventType = strings.TrimSpace(input.EventType)
 	input.Title = strings.TrimSpace(input.Title)
-	if input.EventType == "" || input.Title == "" {
+	if input.EventType == "" || input.EventType == ignoredServiceLogEventType || input.Title == "" {
 		return
 	}
 	level := strings.TrimSpace(input.Level)

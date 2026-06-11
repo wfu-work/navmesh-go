@@ -176,7 +176,6 @@ func (d DeviceApi) StreamServiceLogs(c *gin.Context) {
 	defer stream.Close()
 
 	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "view", Resource: "device_service_log", ResourceID: guid, Message: serviceName, SourceIP: c.ClientIP()})
-	eventService.Record(services.EventInput{DeviceGuid: guid, EventType: "service_log", Level: "info", Title: "服务日志查看", Message: serviceName})
 
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.Header("Cache-Control", "no-cache, no-transform")
