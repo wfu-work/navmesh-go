@@ -37,6 +37,60 @@ func TestRecordDailyDiskUsageEventLimitsOnePerDay(t *testing.T) {
 	assertDiskUsageEventCount(t, db, deviceGuid, 2)
 }
 
+func TestRecordStaleOfflineEventsWaitsForDelayAndDedupes(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}, &domains.Event{}); err != nil {
+		t.Fatalf("migrate tables: %v", err)
+	}
+
+	service := ServiceGroupApp.DeviceService.WithDB(db)
+	now := domains.NowMilli()
+	recent := domains.Device{Sncode: "recent", Alias: "recent", Status: domains.DeviceStatusOffline, LastSeenTime: now - 299*time.Second.Milliseconds()}
+	stale := domains.Device{Sncode: "stale", Alias: "stale", Status: domains.DeviceStatusOffline, LastSeenTime: now - 301*time.Second.Milliseconds()}
+	if err := db.Create(&recent).Error; err != nil {
+		t.Fatalf("seed recent device: %v", err)
+	}
+	if err := db.Create(&stale).Error; err != nil {
+		t.Fatalf("seed stale device: %v", err)
+	}
+
+	created, err := service.RecordStaleOfflineEvents(300 * time.Second)
+	if err != nil {
+		t.Fatalf("record offline events: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created events = %d, want 1", created)
+	}
+	assertOfflineEventCount(t, db, stale.Guid, 1)
+	assertOfflineEventCount(t, db, recent.Guid, 0)
+
+	created, err = service.RecordStaleOfflineEvents(300 * time.Second)
+	if err != nil {
+		t.Fatalf("record offline events again: %v", err)
+	}
+	if created != 0 {
+		t.Fatalf("created duplicate events = %d, want 0", created)
+	}
+	assertOfflineEventCount(t, db, stale.Guid, 1)
+
+	if err := db.Model(&domains.Event{}).
+		Where("device_guid = ? AND event_type = ?", stale.Guid, deviceOfflineEventType).
+		Update("status", int(domains.StatusDisabled)).Error; err != nil {
+		t.Fatalf("ack offline event: %v", err)
+	}
+	created, err = service.RecordStaleOfflineEvents(300 * time.Second)
+	if err != nil {
+		t.Fatalf("record offline events after ack: %v", err)
+	}
+	if created != 0 {
+		t.Fatalf("created acked duplicate events = %d, want 0", created)
+	}
+	assertOfflineEventCount(t, db, stale.Guid, 1)
+}
+
 func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -56,6 +110,19 @@ func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {
 				t.Fatalf("resolveDeviceWanIP(%q, %q) = %q, want %q", tt.wanIP, tt.sourceIP, got, tt.want)
 			}
 		})
+	}
+}
+
+func assertOfflineEventCount(t *testing.T, db *gorm.DB, deviceGuid string, want int64) {
+	t.Helper()
+	var count int64
+	if err := db.Model(&domains.Event{}).
+		Where("device_guid = ? AND event_type = ?", deviceGuid, deviceOfflineEventType).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count offline events: %v", err)
+	}
+	if count != want {
+		t.Fatalf("offline event count = %d, want %d", count, want)
 	}
 }
 

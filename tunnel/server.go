@@ -166,14 +166,6 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 		if !s.manager.UnregisterQUICControl(device.Guid, conn) {
 			return
 		}
-		s.manager.SetOffline(device.Guid)
-		services.ServiceGroupApp.EventService.Record(services.EventInput{
-			DeviceGuid: device.Guid,
-			EventType:  "device_offline",
-			Level:      "warn",
-			Title:      "device tunnel offline",
-			Message:    conn.RemoteAddr().String(),
-		})
 	}()
 
 	for {
@@ -220,14 +212,6 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
 		if !s.manager.UnregisterTCPControl(device.Guid, conn) {
 			return
 		}
-		s.manager.SetOffline(device.Guid)
-		services.ServiceGroupApp.EventService.Record(services.EventInput{
-			DeviceGuid: device.Guid,
-			EventType:  "device_offline",
-			Level:      "warn",
-			Title:      "device tcp tunnel offline",
-			Message:    conn.RemoteAddr().String(),
-		})
 	}()
 	for {
 		next, err := readFrameFromReader(conn)

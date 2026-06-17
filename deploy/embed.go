@@ -7,3 +7,6 @@ var InstallClientScript []byte
 
 //go:embed install-rain.sh
 var InstallRainScript []byte
+
+//go:embed install-hipnames.sh
+var InstallHipnamesScript []byte

@@ -39,3 +39,7 @@ func (e EventApi) Close(c *gin.Context) {
 	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "close", Resource: "event", ResourceID: guid, SourceIP: c.ClientIP()})
 	response.Ok(true, c)
 }
+
+func (e EventApi) Stream(c *gin.Context) {
+	services.ServiceGroupApp.EventWebSocket.ServeHTTP(c.Writer, c.Request)
+}

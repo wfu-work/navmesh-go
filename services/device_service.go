@@ -29,6 +29,7 @@ type DeviceService struct {
 const (
 	diskUsageHighEventType = "disk_usage_high"
 	diskUsageHighThreshold = 90.0
+	deviceOfflineEventType = "device_offline"
 )
 
 func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
@@ -611,7 +612,7 @@ func (s DeviceService) MarkOnlineDevicesOffline() (int64, error) {
 
 func (s DeviceService) MarkStaleOnlineDevicesOffline(timeout time.Duration) (int64, error) {
 	if timeout <= 0 {
-		timeout = 90 * time.Second
+		timeout = deviceHeartbeatTimeout()
 	}
 	now := domains.NowMilli()
 	cutoff := now - timeout.Milliseconds()
@@ -628,8 +629,43 @@ func (s DeviceService) MarkStaleOnlineDevicesOffline(timeout time.Duration) (int
 	return result.RowsAffected, result.Error
 }
 
+func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, error) {
+	if timeout <= 0 {
+		timeout = 300 * time.Second
+	}
+	now := domains.NowMilli()
+	cutoff := now - timeout.Milliseconds()
+	var devices []domains.Device
+	if err := s.DB().
+		Where("status = ?", domains.DeviceStatusOffline).
+		Where("last_seen_time = 0 OR last_seen_time < ?", cutoff).
+		Find(&devices).Error; err != nil {
+		return 0, err
+	}
+	var created int64
+	for _, device := range devices {
+		if strings.TrimSpace(device.Guid) == "" || s.hasDeviceOfflineEventSinceLastSeen(device.Guid, device.LastSeenTime) {
+			continue
+		}
+		message := "设备心跳超过 300 秒未更新，请检查设备网络或 navmesh-client 运行状态。"
+		if timeout != 300*time.Second {
+			message = fmt.Sprintf("设备心跳超过 %s 未更新，请检查设备网络或 navmesh-client 运行状态。", timeout)
+		}
+		ServiceGroupApp.EventService.WithDB(s.DB()).RecordAt(EventInput{
+			DeviceGuid: device.Guid,
+			EventType:  deviceOfflineEventType,
+			Level:      "warn",
+			Title:      "device heartbeat offline",
+			Message:    message,
+		}, now)
+		created++
+	}
+	return created, nil
+}
+
 func (s DeviceService) StartOfflineCleaner(ctx context.Context) {
 	timeout := deviceHeartbeatTimeout()
+	eventDelay := deviceOfflineEventDelay()
 	interval := deviceOfflineCheckInterval()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -645,6 +681,14 @@ func (s DeviceService) StartOfflineCleaner(ctx context.Context) {
 			}
 			if affected > 0 {
 				global.NAV_LOG.Info("mark stale online devices offline", zap.Int64("affected", affected), zap.Duration("timeout", timeout))
+			}
+			created, err := s.RecordStaleOfflineEvents(eventDelay)
+			if err != nil {
+				global.NAV_LOG.Warn("record stale offline device events failed", zap.Error(err))
+				continue
+			}
+			if created > 0 {
+				global.NAV_LOG.Info("record stale offline device events", zap.Int64("created", created), zap.Duration("delay", eventDelay))
 			}
 		}
 	}
@@ -842,13 +886,23 @@ func (s DeviceService) recordDailyDiskUsageEvent(deviceGuid string, req Heartbea
 	if req.DiskTotal > 0 && req.DiskFree >= 0 {
 		message = fmt.Sprintf("%s，剩余 %s / 总量 %s", message, formatStorageSize(req.DiskFree), formatStorageSize(req.DiskTotal))
 	}
-	ServiceGroupApp.EventService.WithDB(s.DB()).Record(EventInput{
+	ServiceGroupApp.EventService.WithDB(s.DB()).RecordAt(EventInput{
 		DeviceGuid: deviceGuid,
 		EventType:  diskUsageHighEventType,
 		Level:      "warn",
 		Title:      "磁盘空间不足",
 		Message:    message,
-	})
+	}, now)
+}
+
+func (s DeviceService) hasDeviceOfflineEventSinceLastSeen(deviceGuid string, lastSeenTime int64) bool {
+	var count int64
+	if err := s.DB().Model(&domains.Event{}).
+		Where("device_guid = ? AND event_type = ? AND create_time >= ?", deviceGuid, deviceOfflineEventType, lastSeenTime).
+		Count(&count).Error; err != nil {
+		return true
+	}
+	return count > 0
 }
 
 func localDayRangeMillis(now int64) (int64, int64) {
@@ -947,6 +1001,10 @@ func deviceHeartbeatTimeout() time.Duration {
 
 func deviceOfflineCheckInterval() time.Duration {
 	return deviceSettingDuration("device_offline_check_interval", 30*time.Second)
+}
+
+func deviceOfflineEventDelay() time.Duration {
+	return deviceSettingDuration("device_offline_event_delay", 300*time.Second)
 }
 
 func DefaultDeviceRegisterToken() string {

@@ -146,13 +146,13 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	if err != nil {
 		writeConnectError(client, 502, "Bad Gateway")
 		global.NAV_LOG.Warn("open ssh tunnel stream failed", zap.String("deviceGuid", route.Device.Guid), zap.Error(err))
-		services.ServiceGroupApp.EventService.Record(services.EventInput{
+		services.ServiceGroupApp.EventService.RecordSuppressed(services.EventInput{
 			DeviceGuid: route.Device.Guid,
 			EventType:  "open_tcp_failed",
 			Level:      "error",
 			Title:      "open ssh target failed",
 			Message:    err.Error(),
-		})
+		}, 2*time.Hour)
 		markSessionClosed(session.Guid, 0, 0, "open_tunnel_failed: "+err.Error())
 		return
 	}

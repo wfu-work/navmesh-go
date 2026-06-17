@@ -45,7 +45,7 @@ func (r *RouterGroup) InitRouters(publicGroup *gin.RouterGroup, privateGroup *gi
 	r.InitAuditRouter(privateGroup)
 	r.InitReleaseRouter(publicGroup, privateGroup)
 	r.InitDeviceRouter(publicGroup, privateGroup)
-	r.InitEventRouter(privateGroup)
+	r.InitEventRouter(publicGroup, privateGroup)
 	r.InitGroupRouter(privateGroup)
 	r.InitMappingRouter(privateGroup)
 	r.InitMaintenanceRouter(privateGroup)

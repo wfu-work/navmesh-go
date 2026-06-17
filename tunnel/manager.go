@@ -283,20 +283,14 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 			m.Touch(deviceGuid)
 			return stream, nil
 		}
-		if shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp over quic failed: "+err.Error()) {
-			m.SetOffline(deviceGuid)
-		}
+		_ = shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp over quic failed: "+err.Error())
 		return nil, err
 	}
 	if item.tcpControl != nil {
-		if isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error()) {
-			m.SetOffline(deviceGuid)
-		}
+		_ = isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error())
 		return nil, dataErr
 	}
-	if m.CloseDeviceIfCurrent(deviceGuid, item, "device tunnel data channel unavailable") {
-		m.SetOffline(deviceGuid)
-	}
+	m.CloseDeviceIfCurrent(deviceGuid, item, "device tunnel data channel unavailable")
 	return nil, errors.New("device tunnel data channel unavailable")
 }
 
@@ -319,20 +313,14 @@ func (m *Manager) OpenServiceLogStream(ctx context.Context, deviceGuid, serviceN
 			m.Touch(deviceGuid)
 			return stream, nil
 		}
-		if shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open service log over quic failed: "+err.Error()) {
-			m.SetOffline(deviceGuid)
-		}
+		_ = shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open service log over quic failed: "+err.Error())
 		return nil, err
 	}
 	if item.tcpControl != nil {
-		if isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error()) {
-			m.SetOffline(deviceGuid)
-		}
+		_ = isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error())
 		return nil, dataErr
 	}
-	if m.CloseDeviceIfCurrent(deviceGuid, item, "device tunnel data channel unavailable") {
-		m.SetOffline(deviceGuid)
-	}
+	m.CloseDeviceIfCurrent(deviceGuid, item, "device tunnel data channel unavailable")
 	return nil, errors.New("device tunnel data channel unavailable")
 }
 
@@ -489,20 +477,6 @@ func validateOpenServiceLogAck(ack Frame) error {
 		return errors.New("invalid service log ack")
 	}
 	return nil
-}
-
-func (m *Manager) SetOffline(deviceGuid string) {
-	deviceGuid = strings.TrimSpace(deviceGuid)
-	if deviceGuid == "" {
-		return
-	}
-	if global.NAV_DB == nil {
-		return
-	}
-	now := domains.NowMilli()
-	_ = global.NAV_DB.Model(&domains.Device{}).
-		Where("guid = ? AND status != ?", deviceGuid, domains.DeviceStatusDisabled).
-		Updates(map[string]any{"status": domains.DeviceStatusOffline, "update_time": now}).Error
 }
 
 func (m *Manager) CloseAll() {

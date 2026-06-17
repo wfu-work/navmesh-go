@@ -1,37 +1,36 @@
 #!/bin/sh
 set -eu
 
-INSTALL_DIR="/mnt/navfirst/nav-rain-go"
-SERVICE_NAME="raind"
+INSTALL_DIR="/mnt/navfirst/nav-hipnames"
+SERVICE_NAME="hipnames"
 DOWNLOAD_BASE=""
-RELEASE_TYPE="rain"
-DEVICE_TYPE="rain"
-SKIP_DEPS="false"
+RELEASE_TYPE="hipnames"
+DEVICE_TYPE="hipnames"
+APP_NAME=""
 EXE_FILE=""
 
 usage() {
   cat <<'EOF'
-NavFirst rain installer
+NavFirst hipnames installer
 
 Usage:
-  sh install-rain.sh [options]
+  sh install-hipnames.sh [options]
 
 Options:
-  --install-dir DIR          Install directory, default /mnt/navfirst/nav-rain-go
-  --service-name NAME        systemd service name, default raind
+  --install-dir DIR          Install directory, default /mnt/navfirst/nav-hipnames
+  --service-name NAME        systemd service name, default hipnames
   --download-base URL        NavMesh downloads API base URL, for example https://navmesh.navfirst.com/api/downloads
-  --release-type TYPE        Release type, default rain
-  --device-type TYPE         Device type, default rain
-  --exe-file FILE            Local navRainApp executable for offline installation
-  --skip-deps                Skip apt and pip dependency installation
+  --release-type TYPE        Release type, default hipnames
+  --device-type TYPE         Device type, default hipnames
+  --app-name NAME            Executable name in package, auto-detect by default
+  --exe-file FILE            Local executable for offline installation
   -h, --help                 Show help
 
 Example:
-  curl -fsSL https://navmesh.navfirst.com/api/downloads/install-rain.sh | sudo sh -s -- \
-    --download-base https://navmesh.navfirst.com/api/downloads \
-    --device-type rain
+  curl -fsSL https://navmesh.navfirst.com/api/downloads/install-hipnames.sh | sudo sh -s -- \
+    --download-base https://navmesh.navfirst.com/api/downloads
 
-  sudo ./install-rain.sh --exe-file ./navRainApp --skip-deps
+  sudo ./install-hipnames.sh --exe-file ./navHipnames
 EOF
 }
 
@@ -70,13 +69,13 @@ while [ "$#" -gt 0 ]; do
       DEVICE_TYPE="${2:-}"
       shift 2
       ;;
+    --app-name)
+      APP_NAME="${2:-}"
+      shift 2
+      ;;
     --exe-file)
       EXE_FILE="${2:-}"
       shift 2
-      ;;
-    --skip-deps)
-      SKIP_DEPS="true"
-      shift
       ;;
     -h|--help)
       usage
@@ -123,32 +122,9 @@ esac
 if [ -z "$EXE_FILE" ]; then
   need_cmd curl
 fi
+need_cmd find
 need_cmd install
 need_cmd systemctl
-
-install_dependencies() {
-  if [ "$SKIP_DEPS" = "true" ]; then
-    log "Skipping dependency installation"
-    return
-  fi
-  if ! command -v apt-get >/dev/null 2>&1; then
-    log "apt-get not found, skipping system dependency installation"
-    return
-  fi
-  log "Installing system dependencies"
-  apt-get update
-  apt-get install -y python3-pip unzip lrzsz
-  mkdir -p "$HOME/.pip"
-  cat > "$HOME/.pip/pip.conf" <<'EOF'
-[global]
-index-url = https://mirrors.aliyun.com/pypi/simple/
-[install]
-trusted-host = mirrors.aliyun.com
-EOF
-  if command -v pip3 >/dev/null 2>&1; then
-    log "Installing Python dependencies"
-  fi
-}
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -157,60 +133,82 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 DOWNLOAD_URL="${DOWNLOAD_BASE%/}/releases/latest?releaseType=${RELEASE_TYPE}&deviceType=${DEVICE_TYPE}&os=${GOOS}&arch=${GOARCH}"
-DOWNLOAD_PATH="${TMP_DIR}/rain-download"
+DOWNLOAD_PATH="${TMP_DIR}/hipnames-download"
 EXTRACT_DIR="${TMP_DIR}/extract"
+OFFLINE_APP_PATH=""
 
-install_dependencies
 mkdir -p "$EXTRACT_DIR"
 
 if [ -n "$EXE_FILE" ]; then
+  APP_FILE="${APP_NAME:-$(basename "$EXE_FILE")}"
+  OFFLINE_APP_PATH="${EXTRACT_DIR}/${APP_FILE}"
   log "Using local executable ${EXE_FILE}"
-  cp "$EXE_FILE" "$EXTRACT_DIR/navRainApp"
+  cp "$EXE_FILE" "$OFFLINE_APP_PATH"
 else
   log "Downloading latest ${RELEASE_TYPE} file for ${GOOS}/${GOARCH}"
   curl -fL --retry 3 --connect-timeout 15 -o "$DOWNLOAD_PATH" "$DOWNLOAD_URL"
   [ -s "$DOWNLOAD_PATH" ] || die "downloaded file is empty"
 
-  if unzip -t "$DOWNLOAD_PATH" >/dev/null 2>&1; then
+  if command -v unzip >/dev/null 2>&1 && unzip -t "$DOWNLOAD_PATH" >/dev/null 2>&1; then
     log "Extracting zip package"
     unzip -q "$DOWNLOAD_PATH" -d "$EXTRACT_DIR"
   elif tar -tzf "$DOWNLOAD_PATH" >/dev/null 2>&1; then
     log "Extracting tar.gz package"
     tar -xzf "$DOWNLOAD_PATH" -C "$EXTRACT_DIR"
   else
-    log "Treating downloaded file as navRainApp binary"
-    cp "$DOWNLOAD_PATH" "$EXTRACT_DIR/navRainApp"
+    log "Treating downloaded file as binary"
+    cp "$DOWNLOAD_PATH" "$EXTRACT_DIR/${APP_NAME:-hipnames}"
   fi
 fi
 
-APP_PATH="$(find "$EXTRACT_DIR" -type f -name navRainApp | head -n 1)"
-[ -n "$APP_PATH" ] || die "navRainApp not found"
+find_app() {
+  if [ -n "$APP_NAME" ]; then
+    find "$EXTRACT_DIR" -type f -name "$APP_NAME" | head -n 1
+    return
+  fi
+  for name in navHipnames nav-hipnames hipnames hipnamesApp navHipnamesApp; do
+    found="$(find "$EXTRACT_DIR" -type f -name "$name" | head -n 1)"
+    if [ -n "$found" ]; then
+      printf '%s\n' "$found"
+      return
+    fi
+  done
+  find "$EXTRACT_DIR" -type f -perm -111 | head -n 1
+}
+
+if [ -n "$OFFLINE_APP_PATH" ]; then
+  APP_PATH="$OFFLINE_APP_PATH"
+else
+  APP_PATH="$(find_app)"
+fi
+[ -n "$APP_PATH" ] || die "hipnames executable not found; use --app-name to specify it"
+APP_FILE="$(basename "$APP_PATH")"
 APP_DIR="$(dirname "$APP_PATH")"
 
-log "Installing rain application to ${INSTALL_DIR}"
+log "Installing hipnames application to ${INSTALL_DIR}"
 install -d -m 0755 "$INSTALL_DIR"
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
   log "Stopping existing ${SERVICE_NAME} service"
   systemctl stop "$SERVICE_NAME"
 fi
 cp -R "$APP_DIR"/. "$INSTALL_DIR"/
-chmod +x "$INSTALL_DIR/navRainApp"
+chmod +x "$INSTALL_DIR/$APP_FILE"
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 log "Writing systemd service ${SERVICE_FILE}"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=navfirst rain predict for go
-After=network.target
+Description=NavFirst Hipnames
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=idle
-TimeoutStartSec=infinity
-ExecStartPre=/bin/sleep 5
-ExecStart=${INSTALL_DIR}/navRainApp
+Type=simple
 WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/${APP_FILE}
 Restart=always
-RestartSec=10s
+RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target

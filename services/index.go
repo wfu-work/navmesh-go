@@ -5,7 +5,7 @@ import (
 	"github.com/wfu-work/nav-common-go-lib/utils"
 )
 
-var ServiceGroupApp = new(ServiceGroup)
+var ServiceGroupApp = newServiceGroup()
 
 type ServiceGroup struct {
 	AccessPolicyService
@@ -23,6 +23,16 @@ type ServiceGroup struct {
 	SettingService
 	SSHService
 	TCPMappingService
+	EventHub       *EventHub
+	EventWebSocket *EventWebSocket
+}
+
+func newServiceGroup() *ServiceGroup {
+	eventHub := NewEventHub()
+	return &ServiceGroup{
+		EventHub:       eventHub,
+		EventWebSocket: NewEventWebSocket(eventHub),
+	}
 }
 
 func PageResult(items any, total int64, params map[string]string) commonDomains.PageResult {

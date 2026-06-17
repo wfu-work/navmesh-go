@@ -135,6 +135,7 @@ func seedDefaultSettings() {
 		"device_register_token":            services.DefaultDeviceRegisterToken(),
 		"device_heartbeat_timeout":         "90s",
 		"device_offline_check_interval":    "30s",
+		"device_offline_event_delay":       "300s",
 		"session_idle_timeout":             "30m",
 		"max_concurrent_sessions":          "0",
 		"max_device_sessions":              "0",
@@ -187,7 +188,7 @@ func stopBackgroundServers() {
 }
 
 func markBootStaleDevicesOffline() {
-	affected, err := services.ServiceGroupApp.DeviceService.MarkOnlineDevicesOffline()
+	affected, err := services.ServiceGroupApp.DeviceService.MarkStaleOnlineDevicesOffline(0)
 	if err != nil {
 		global.NAV_LOG.Warn("mark boot online devices offline failed", zap.Error(err))
 		return

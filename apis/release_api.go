@@ -166,6 +166,10 @@ func (a ReleaseApi) Download(c *gin.Context) {
 		c.Header("Content-Disposition", `attachment; filename="install-rain.sh"`)
 		c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", renderInstallScript(deployAssets.InstallRainScript, publicDownloadBase(c)))
 		return
+	case "install-hipnames.sh":
+		c.Header("Content-Disposition", `attachment; filename="install-hipnames.sh"`)
+		c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", renderInstallScript(deployAssets.InstallHipnamesScript, publicDownloadBase(c)))
+		return
 	}
 	item, err := releaseService.FindDownload(fileName)
 	if err != nil {

@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"navmesh-go/domains"
 	"navmesh-go/utils"
@@ -74,6 +75,39 @@ func (s EventService) Close(guid string) error {
 }
 
 func (s EventService) Record(input EventInput) {
+	s.RecordAt(input, domains.NowMilli())
+}
+
+func (s EventService) RecordSuppressed(input EventInput, window time.Duration) bool {
+	return s.RecordSuppressedAt(input, window, domains.NowMilli())
+}
+
+func (s EventService) RecordSuppressedAt(input EventInput, window time.Duration, now int64) bool {
+	if window <= 0 {
+		s.RecordAt(input, now)
+		return true
+	}
+	input.DeviceGuid = strings.TrimSpace(input.DeviceGuid)
+	input.EventType = strings.TrimSpace(input.EventType)
+	input.Title = strings.TrimSpace(input.Title)
+	if input.DeviceGuid == "" || input.EventType == "" || input.Title == "" {
+		s.RecordAt(input, now)
+		return true
+	}
+	if now <= 0 {
+		now = domains.NowMilli()
+	}
+	var count int64
+	if err := s.DB().Model(&domains.Event{}).
+		Where("device_guid = ? AND event_type = ? AND title = ? AND create_time >= ?", input.DeviceGuid, input.EventType, input.Title, now-window.Milliseconds()).
+		Count(&count).Error; err != nil || count > 0 {
+		return false
+	}
+	s.RecordAt(input, now)
+	return true
+}
+
+func (s EventService) RecordAt(input EventInput, now int64) {
 	input.EventType = strings.TrimSpace(input.EventType)
 	input.Title = strings.TrimSpace(input.Title)
 	if input.EventType == "" || input.EventType == ignoredServiceLogEventType || input.Title == "" {
@@ -83,8 +117,10 @@ func (s EventService) Record(input EventInput) {
 	if level == "" {
 		level = "info"
 	}
-	now := domains.NowMilli()
-	_ = s.Create(domains.Event{
+	if now <= 0 {
+		now = domains.NowMilli()
+	}
+	event := domains.Event{
 		BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: now, UpdateTime: now},
 		DeviceGuid:     strings.TrimSpace(input.DeviceGuid),
 		EventType:      input.EventType,
@@ -92,7 +128,14 @@ func (s EventService) Record(input EventInput) {
 		Title:          input.Title,
 		Message:        strings.TrimSpace(input.Message),
 		Status:         int(domains.StatusEnabled),
-	})
+	}
+	db := s.DB()
+	if db == nil {
+		return
+	}
+	if err := db.Create(&event).Error; err == nil && ServiceGroupApp.EventHub != nil {
+		ServiceGroupApp.EventHub.Publish(event)
+	}
 }
 
 func (s EventService) setStatus(guid string, status int) error {
