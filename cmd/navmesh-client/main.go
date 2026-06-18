@@ -36,10 +36,11 @@ import (
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/mem"
+	gopsnet "github.com/shirou/gopsutil/v4/net"
 )
 
 const (
-	clientVersion          = "v0.0.3"
+	clientVersion          = "v0.0.4"
 	clientTransportAuto    = "auto"
 	defaultTCPDataChannels = 32
 	releaseTypeNavmesh     = "navmesh"
@@ -79,6 +80,7 @@ type clientConfig struct {
 	HeartbeatFail  int
 	RequestTimeout time.Duration
 	ServiceName    string
+	TrafficIface   string
 }
 
 type registerResponse struct {
@@ -166,6 +168,14 @@ type systemSnapshot struct {
 	DiskUsedPct float64
 }
 
+type trafficSnapshot struct {
+	Interface  string
+	RXBytes    int64
+	TXBytes    int64
+	BootID     string
+	SampleTime int64
+}
+
 var upgradeState = struct {
 	sync.Mutex
 	taskGuid string
@@ -233,6 +243,7 @@ func parseFlags() clientConfig {
 	flag.StringVar(&cfg.HostIP, "hostIp", "", "上报的主机IP，默认自动探测")
 	flag.StringVar(&cfg.WanIP, "wanIp", "", "上报的外网IP，默认自动探测")
 	flag.StringVar(&cfg.LocalHost, "localHost", "127.0.0.1", "服务端请求回环目标时使用的本机地址")
+	flag.StringVar(&cfg.TrafficIface, "trafficIface", "auto", "4G流量统计网卡：auto 自动识别，none 禁用，也可指定 ppp0/wwan0")
 	flag.BoolVar(&cfg.SkipRegister, "skipRegister", false, "跳过HTTP设备注册，直接建立隧道")
 	flag.BoolVar(&cfg.InsecureQUIC, "insecure", true, "跳过QUIC服务器证书校验")
 	flag.StringVar(&cfg.Transport, "transport", clientTransportAuto, "隧道传输协议：auto、quic 或 tcp")
@@ -254,6 +265,7 @@ func parseFlags() clientConfig {
 	cfg.API = strings.TrimRight(strings.TrimSpace(cfg.API), "/")
 	cfg.Token = strings.TrimSpace(cfg.Token)
 	cfg.DeviceToken = strings.TrimSpace(cfg.DeviceToken)
+	cfg.TrafficIface = strings.TrimSpace(cfg.TrafficIface)
 	if cfg.API == "" {
 		cfg.API = "http://" + net.JoinHostPort(cfg.Server, "3007")
 	}
@@ -479,8 +491,9 @@ func backoffDelay(cfg clientConfig, failures int) time.Duration {
 
 func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error) {
 	snapshot := collectSystemSnapshot()
+	traffic := collectTrafficSnapshot(cfg.TrafficIface)
 	log.Printf(
-		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s wanIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s",
+		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s wanIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s traffic=%s",
 		cfg.API,
 		cfg.Sncode,
 		cfg.DeviceType,
@@ -495,6 +508,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 		cfg.SSHPort,
 		cfg.WebPort,
 		cfg.authMode(),
+		traffic.logFields(),
 	)
 	body := map[string]any{
 		"token":         cfg.authToken(),
@@ -512,6 +526,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 		"webDomain":     cfg.WebDomain,
 	}
 	snapshot.addTo(body)
+	traffic.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -1070,6 +1085,7 @@ func heartbeatRoundTripTimeout(cfg clientConfig) time.Duration {
 
 func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	snapshot := collectSystemSnapshot()
+	traffic := collectTrafficSnapshot(cfg.TrafficIface)
 	body := map[string]any{
 		"token":         cfg.authToken(),
 		"guid":          cfg.DeviceGuid,
@@ -1080,6 +1096,7 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		"clientVersion": clientVersion,
 	}
 	snapshot.addTo(body)
+	traffic.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -1782,6 +1799,160 @@ func (snapshot systemSnapshot) logFields() string {
 		formatBytes(snapshot.DiskFree),
 		snapshot.DiskUsedPct,
 	)
+}
+
+func collectTrafficSnapshot(preferredIface string) trafficSnapshot {
+	iface := selectTrafficInterface(preferredIface)
+	if iface == "" {
+		return trafficSnapshot{}
+	}
+	counters, err := gopsnet.IOCounters(true)
+	if err != nil {
+		return trafficSnapshot{}
+	}
+	for _, item := range counters {
+		if item.Name != iface {
+			continue
+		}
+		return trafficSnapshot{
+			Interface:  item.Name,
+			RXBytes:    int64(item.BytesRecv),
+			TXBytes:    int64(item.BytesSent),
+			BootID:     detectBootID(),
+			SampleTime: time.Now().UnixMilli(),
+		}
+	}
+	return trafficSnapshot{}
+}
+
+func (snapshot trafficSnapshot) addTo(body map[string]any) {
+	if strings.TrimSpace(snapshot.Interface) == "" {
+		return
+	}
+	body["trafficIface"] = snapshot.Interface
+	body["trafficRxBytes"] = snapshot.RXBytes
+	body["trafficTxBytes"] = snapshot.TXBytes
+	body["trafficSampleTime"] = snapshot.SampleTime
+	body["trafficBootId"] = snapshot.BootID
+}
+
+func (snapshot trafficSnapshot) logFields() string {
+	if strings.TrimSpace(snapshot.Interface) == "" {
+		return "disabled"
+	}
+	return fmt.Sprintf(
+		"iface=%s rx=%s tx=%s",
+		snapshot.Interface,
+		formatBytes(snapshot.RXBytes),
+		formatBytes(snapshot.TXBytes),
+	)
+}
+
+func selectTrafficInterface(preferredIface string) string {
+	preferredIface = strings.TrimSpace(preferredIface)
+	if isTrafficCollectionDisabled(preferredIface) {
+		return ""
+	}
+	counters, err := gopsnet.IOCounters(true)
+	if err != nil {
+		return ""
+	}
+	if preferredIface != "" && !strings.EqualFold(preferredIface, "auto") {
+		for _, item := range counters {
+			if item.Name == preferredIface {
+				return item.Name
+			}
+		}
+		return preferredIface
+	}
+	active := activeInterfaceNames()
+	for _, item := range counters {
+		if !active[item.Name] || isExcludedTrafficInterface(item.Name) {
+			continue
+		}
+		if isCellularTrafficInterface(item.Name) {
+			return item.Name
+		}
+	}
+	physical := make([]string, 0, len(counters))
+	for _, item := range counters {
+		if !active[item.Name] || isExcludedTrafficInterface(item.Name) || !isLikelyPhysicalInterface(item.Name) {
+			continue
+		}
+		physical = append(physical, item.Name)
+	}
+	if len(physical) == 1 {
+		return physical[0]
+	}
+	return ""
+}
+
+func isTrafficCollectionDisabled(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "none" || value == "off" || value == "false" || value == "disabled"
+}
+
+func activeInterfaceNames() map[string]bool {
+	result := map[string]bool{}
+	items, err := net.Interfaces()
+	if err != nil {
+		return result
+	}
+	for _, item := range items {
+		if item.Flags&net.FlagUp == 0 || item.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		result[item.Name] = true
+	}
+	return result
+}
+
+func isCellularTrafficInterface(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{"wwan", "wwp", "ppp", "rmnet", "usb", "mbim", "qmi"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return strings.Contains(name, "cell") || strings.Contains(name, "modem")
+}
+
+func isLikelyPhysicalInterface(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{"eth", "en", "wl", "ww", "ppp", "usb"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExcludedTrafficInterface(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || name == "lo" {
+		return true
+	}
+	for _, prefix := range []string{
+		"tun", "tap", "wg", "utun", "docker", "br-", "veth", "vmnet", "virbr",
+		"cni", "flannel", "kube", "tailscale", "zt", "awdl", "llw",
+	} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func detectBootID() string {
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	if bootTime, err := host.BootTime(); err == nil && bootTime > 0 {
+		return strconv.FormatUint(bootTime, 10)
+	}
+	return ""
 }
 
 func formatBytes(value int64) string {

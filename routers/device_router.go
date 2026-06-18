@@ -16,8 +16,10 @@ func (d *DeviceRouter) InitDeviceRouter(publicGroup *gin.RouterGroup, privateGro
 	{
 		devices.GET("list", deviceApi.List)
 		devices.GET("stats", deviceApi.Stats)
+		devices.GET("traffic/daily", deviceApi.TrafficDaily)
 		devices.GET("types/defaults", deviceApi.TypeDefaults)
 		devices.GET(":guid/service-logs/stream", deviceApi.StreamServiceLogs)
+		devices.GET(":guid/traffic/daily", deviceApi.TrafficDaily)
 		devices.GET(":guid", deviceApi.Get)
 		devices.PUT(":guid", deviceApi.Update)
 		devices.POST(":guid/enable", deviceApi.Enable)

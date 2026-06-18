@@ -27,6 +27,7 @@ var (
 	customDomainService  = services.ServiceGroupApp.CustomDomainService
 	deviceService        = services.ServiceGroupApp.DeviceService
 	deviceTokenService   = services.ServiceGroupApp.DeviceTokenService
+	deviceTrafficService = services.ServiceGroupApp.DeviceTrafficService
 	deviceUpgradeService = services.ServiceGroupApp.DeviceUpgradeService
 	eventService         = services.ServiceGroupApp.EventService
 	groupService         = services.ServiceGroupApp.GroupService

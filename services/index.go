@@ -14,6 +14,7 @@ type ServiceGroup struct {
 	CustomDomainService
 	DeviceService
 	DeviceTokenService
+	DeviceTrafficService
 	DeviceUpgradeService
 	EventService
 	GroupService

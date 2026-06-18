@@ -38,53 +38,63 @@ func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
 }
 
 type RegisterDeviceRequest struct {
-	Token         string  `json:"token"`
-	Guid          string  `json:"guid"`
-	SnCode        string  `json:"sncode"`
-	DeviceType    string  `json:"type"`
-	Alias         string  `json:"alias"`
-	Remark        string  `json:"remark"`
-	Hostname      string  `json:"hostname"`
-	HostIP        string  `json:"hostIp"`
-	WanIP         string  `json:"wanIp"`
-	ClientVersion string  `json:"clientVersion"`
-	OS            string  `json:"os"`
-	OSVersion     string  `json:"osVersion"`
-	Kernel        string  `json:"kernel"`
-	Arch          string  `json:"arch"`
-	MemoryTotal   int64   `json:"memoryTotal"`
-	MemoryUsed    int64   `json:"memoryUsed"`
-	MemoryFree    int64   `json:"memoryFree"`
-	DiskTotal     int64   `json:"diskTotal"`
-	DiskUsed      int64   `json:"diskUsed"`
-	DiskFree      int64   `json:"diskFree"`
-	DiskUsedPct   float64 `json:"diskUsedPct"`
-	SSHPort       int     `json:"sshPort"`
-	WebPort       int     `json:"webPort"`
-	WebDomain     string  `json:"webDomain"`
-	GroupGuid     string  `json:"groupGuid"`
-	Tags          string  `json:"tags"`
+	Token             string  `json:"token"`
+	Guid              string  `json:"guid"`
+	SnCode            string  `json:"sncode"`
+	DeviceType        string  `json:"type"`
+	Alias             string  `json:"alias"`
+	Remark            string  `json:"remark"`
+	Hostname          string  `json:"hostname"`
+	HostIP            string  `json:"hostIp"`
+	WanIP             string  `json:"wanIp"`
+	ClientVersion     string  `json:"clientVersion"`
+	OS                string  `json:"os"`
+	OSVersion         string  `json:"osVersion"`
+	Kernel            string  `json:"kernel"`
+	Arch              string  `json:"arch"`
+	MemoryTotal       int64   `json:"memoryTotal"`
+	MemoryUsed        int64   `json:"memoryUsed"`
+	MemoryFree        int64   `json:"memoryFree"`
+	DiskTotal         int64   `json:"diskTotal"`
+	DiskUsed          int64   `json:"diskUsed"`
+	DiskFree          int64   `json:"diskFree"`
+	DiskUsedPct       float64 `json:"diskUsedPct"`
+	TrafficIface      string  `json:"trafficIface"`
+	TrafficRXBytes    int64   `json:"trafficRxBytes"`
+	TrafficTXBytes    int64   `json:"trafficTxBytes"`
+	TrafficSampleTime int64   `json:"trafficSampleTime"`
+	TrafficBootID     string  `json:"trafficBootId"`
+	SSHPort           int     `json:"sshPort"`
+	WebPort           int     `json:"webPort"`
+	WebDomain         string  `json:"webDomain"`
+	GroupGuid         string  `json:"groupGuid"`
+	Tags              string  `json:"tags"`
 }
 
 type HeartbeatRequest struct {
-	Token         string  `json:"token"`
-	SnCode        string  `json:"sncode"`
-	Guid          string  `json:"guid"`
-	HostIP        string  `json:"hostIp"`
-	WanIP         string  `json:"wanIp"`
-	Hostname      string  `json:"hostname"`
-	ClientVersion string  `json:"clientVersion"`
-	OS            string  `json:"os"`
-	OSVersion     string  `json:"osVersion"`
-	Kernel        string  `json:"kernel"`
-	Arch          string  `json:"arch"`
-	MemoryTotal   int64   `json:"memoryTotal"`
-	MemoryUsed    int64   `json:"memoryUsed"`
-	MemoryFree    int64   `json:"memoryFree"`
-	DiskTotal     int64   `json:"diskTotal"`
-	DiskUsed      int64   `json:"diskUsed"`
-	DiskFree      int64   `json:"diskFree"`
-	DiskUsedPct   float64 `json:"diskUsedPct"`
+	Token             string  `json:"token"`
+	SnCode            string  `json:"sncode"`
+	Guid              string  `json:"guid"`
+	HostIP            string  `json:"hostIp"`
+	WanIP             string  `json:"wanIp"`
+	Hostname          string  `json:"hostname"`
+	ClientVersion     string  `json:"clientVersion"`
+	OS                string  `json:"os"`
+	OSVersion         string  `json:"osVersion"`
+	Kernel            string  `json:"kernel"`
+	Arch              string  `json:"arch"`
+	MemoryTotal       int64   `json:"memoryTotal"`
+	MemoryUsed        int64   `json:"memoryUsed"`
+	MemoryFree        int64   `json:"memoryFree"`
+	DiskTotal         int64   `json:"diskTotal"`
+	DiskUsed          int64   `json:"diskUsed"`
+	DiskFree          int64   `json:"diskFree"`
+	DiskUsedPct       float64 `json:"diskUsedPct"`
+	TrafficIface      string  `json:"trafficIface"`
+	TrafficRXBytes    int64   `json:"trafficRxBytes"`
+	TrafficTXBytes    int64   `json:"trafficTxBytes"`
+	TrafficSampleTime int64   `json:"trafficSampleTime"`
+	TrafficBootID     string  `json:"trafficBootId"`
 }
 
 type UpdateDeviceProfileRequest struct {
@@ -237,6 +247,15 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 		if err := s.recordHeartbeat(device.Guid, sourceIP, req.HostIP, device.WanIP, device.Location, now); err != nil {
 			return nil, err
 		}
+		if err := ServiceGroupApp.DeviceTrafficService.WithDB(s.DB()).RecordHeartbeatSample(device.Guid, HeartbeatRequest{
+			TrafficIface:      req.TrafficIface,
+			TrafficRXBytes:    req.TrafficRXBytes,
+			TrafficTXBytes:    req.TrafficTXBytes,
+			TrafficSampleTime: req.TrafficSampleTime,
+			TrafficBootID:     req.TrafficBootID,
+		}, now); err != nil {
+			global.NAV_LOG.Warn("record device traffic register sample failed", zap.String("deviceGuid", device.Guid), zap.Error(err))
+		}
 	}
 
 	return &DeviceRegisterResult{
@@ -348,6 +367,9 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 		return nil, err
 	}
 	s.recordDailyDiskUsageEvent(device.Guid, req, now)
+	if err := ServiceGroupApp.DeviceTrafficService.WithDB(s.DB()).RecordHeartbeatSample(device.Guid, req, now); err != nil {
+		global.NAV_LOG.Warn("record device traffic sample failed", zap.String("deviceGuid", device.Guid), zap.Error(err))
+	}
 	_ = s.DB().Where("guid = ?", device.Guid).First(&device).Error
 	return &device, nil
 }
@@ -522,6 +544,12 @@ func (s DeviceService) Delete(guid string) error {
 	s.closeDeviceRuntimeSessions(guid)
 	return s.DB().Transaction(func(tx *gorm.DB) error {
 		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.DeviceToken{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.DeviceTrafficState{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.DeviceTrafficDaily{}).Error; err != nil {
 			return err
 		}
 		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.SSHAlias{}).Error; err != nil {

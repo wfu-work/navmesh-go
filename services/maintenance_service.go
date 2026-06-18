@@ -19,6 +19,7 @@ type RetentionCleanupResult struct {
 	HTTPAccessLogs    int64 `json:"httpAccessLogs"`
 	TunnelSessions    int64 `json:"tunnelSessions"`
 	DeviceHeartbeats  int64 `json:"deviceHeartbeats"`
+	DeviceTrafficDays int64 `json:"deviceTrafficDays"`
 	DeviceConnections int64 `json:"deviceConnections"`
 }
 
@@ -53,6 +54,7 @@ func (s MaintenanceService) CleanupRetention() RetentionCleanupResult {
 		HTTPAccessLogs:    deleteBefore(&domains.HTTPAccessLog{}, "create_time", now, settingInt("http_access_retention_days", 30)),
 		TunnelSessions:    deleteBefore(&domains.TunnelSession{}, "start_time", now, settingInt("session_retention_days", 90)),
 		DeviceHeartbeats:  deleteBefore(&domains.DeviceHeartbeat{}, "create_time", now, settingInt("heartbeat_retention_days", 7)),
+		DeviceTrafficDays: deleteBefore(&domains.DeviceTrafficDaily{}, "last_seen_time", now, settingInt("traffic_daily_retention_days", 370)),
 		DeviceConnections: deleteBefore(&domains.DeviceConnection{}, "create_time", now, settingInt("device_connection_retention_days", 30)),
 	}
 }
@@ -65,6 +67,7 @@ func (s MaintenanceService) cleanupOnce(reason string) {
 		zap.Int64("httpAccessLogs", result.HTTPAccessLogs),
 		zap.Int64("tunnelSessions", result.TunnelSessions),
 		zap.Int64("deviceHeartbeats", result.DeviceHeartbeats),
+		zap.Int64("deviceTrafficDays", result.DeviceTrafficDays),
 		zap.Int64("deviceConnections", result.DeviceConnections),
 	)
 }

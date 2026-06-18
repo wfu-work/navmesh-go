@@ -88,6 +88,19 @@ func (d DeviceApi) Stats(c *gin.Context) {
 	response.Ok(stats, c)
 }
 
+func (d DeviceApi) TrafficDaily(c *gin.Context) {
+	params := utils.QueryParams(c)
+	if guid := strings.TrimSpace(c.Param("guid")); guid != "" {
+		params["deviceGuid"] = guid
+	}
+	items, summary, err := deviceTrafficService.Daily(params)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.Ok(gin.H{"items": items, "summary": summary}, c)
+}
+
 func (d DeviceApi) Get(c *gin.Context) {
 	device, tokens, err := deviceService.Get(c.Param("guid"))
 	if err != nil {
