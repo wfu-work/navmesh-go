@@ -86,6 +86,38 @@ func TestNormalizeTransport(t *testing.T) {
 	}
 }
 
+func TestNormalizeUpgradeReleaseTypeSupportsHipnamesAliases(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "hipnames", want: releaseTypeHipnames},
+		{value: "standalone", want: releaseTypeHipnames},
+		{value: "device_software", want: releaseTypeRain},
+		{value: "navmesh_client", want: releaseTypeNavmesh},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			if got := normalizeUpgradeReleaseType(tt.value); got != tt.want {
+				t.Fatalf("normalizeUpgradeReleaseType(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHipnamesUpgradeMessages(t *testing.T) {
+	upgrade := clientUpgradeCommand{ReleaseType: releaseTypeHipnames}
+	if got := upgradeDownloadMessage(upgrade); got != "正在下载单机版解算应用" {
+		t.Fatalf("upgradeDownloadMessage() = %q", got)
+	}
+	if got := upgradeVerifyMessage(upgrade); got != "正在校验单机版解算应用" {
+		t.Fatalf("upgradeVerifyMessage() = %q", got)
+	}
+	if got := upgradeVerifiedMessage(upgrade); got != "单机版解算应用校验完成" {
+		t.Fatalf("upgradeVerifiedMessage() = %q", got)
+	}
+}
+
 func TestNormalizeIPv4RejectsIPv6(t *testing.T) {
 	tests := []struct {
 		name  string

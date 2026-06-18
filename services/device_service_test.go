@@ -113,6 +113,36 @@ func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {
 	}
 }
 
+func TestDeviceStatsRespectsStatusFilter(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}); err != nil {
+		t.Fatalf("migrate devices: %v", err)
+	}
+
+	devices := []domains.Device{
+		{Sncode: "online-1", Alias: "online-1", Status: domains.DeviceStatusOnline, DeviceType: "ssh"},
+		{Sncode: "offline-1", Alias: "offline-1", Status: domains.DeviceStatusOffline, DeviceType: "ssh"},
+		{Sncode: "offline-2", Alias: "offline-2", Status: domains.DeviceStatusOffline, DeviceType: "ssh"},
+	}
+	if err := db.Create(&devices).Error; err != nil {
+		t.Fatalf("seed devices: %v", err)
+	}
+
+	stats, err := ServiceGroupApp.DeviceService.WithDB(db).Stats(map[string]string{
+		"status": "3",
+		"type":   "ssh",
+	})
+	if err != nil {
+		t.Fatalf("device stats: %v", err)
+	}
+	if stats.Total != 2 || stats.Online != 0 || stats.Offline != 2 {
+		t.Fatalf("stats = %+v, want total=2 online=0 offline=2", stats)
+	}
+}
+
 func assertOfflineEventCount(t *testing.T, db *gorm.DB, deviceGuid string, want int64) {
 	t.Helper()
 	var count int64

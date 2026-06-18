@@ -43,7 +43,7 @@ func TestRecordSuppressedLimitsEventsWithinWindow(t *testing.T) {
 	assertSuppressedEventCount(t, db, input, 2)
 }
 
-func TestRecordPublishesEventNotification(t *testing.T) {
+func TestRecordPublishesWebSocketNotificationsForMessageEvents(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
@@ -61,28 +61,54 @@ func TestRecordPublishesEventNotification(t *testing.T) {
 	ch := hub.Subscribe()
 	defer hub.Unsubscribe(ch)
 
-	input := EventInput{
-		DeviceGuid: "device-1",
-		EventType:  "device_offline",
-		Level:      "warning",
-		Title:      "设备离线提醒",
-		Message:    "heartbeat timeout",
+	cases := []EventInput{
+		{
+			DeviceGuid: "device-1",
+			EventType:  deviceOfflineEventType,
+			Level:      "warning",
+			Title:      "设备离线提醒",
+			Message:    "heartbeat timeout",
+		},
+		{
+			DeviceGuid: "device-1",
+			EventType:  diskUsageHighEventType,
+			Level:      "warning",
+			Title:      "磁盘空间不足",
+			Message:    "disk usage high",
+		},
+		{
+			DeviceGuid: "device-1",
+			EventType:  "client_upgrade",
+			Level:      "info",
+			Title:      "客户端升级成功",
+			Message:    "v0.0.4",
+		},
+		{
+			DeviceGuid: "device-1",
+			EventType:  "vpn_restart",
+			Level:      "info",
+			Title:      "VPN 重启指令已创建",
+			Message:    "等待客户端心跳执行",
+		},
 	}
-	ServiceGroupApp.EventService.WithDB(db).RecordAt(input, 1000)
 
-	select {
-	case notification := <-ch:
-		if notification.Type != "event.created" {
-			t.Fatalf("notification type = %q, want event.created", notification.Type)
+	for index, input := range cases {
+		ServiceGroupApp.EventService.WithDB(db).RecordAt(input, int64(1000+index))
+
+		select {
+		case notification := <-ch:
+			if notification.Type != "event.created" {
+				t.Fatalf("notification type = %q, want event.created", notification.Type)
+			}
+			if notification.Data.Guid == "" {
+				t.Fatal("notification event guid should be set")
+			}
+			if notification.Data.EventType != input.EventType {
+				t.Fatalf("notification event type = %q, want %q", notification.Data.EventType, input.EventType)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("expected event notification for %s", input.EventType)
 		}
-		if notification.Data.Guid == "" {
-			t.Fatal("notification event guid should be set")
-		}
-		if notification.Data.EventType != input.EventType {
-			t.Fatalf("notification event type = %q, want %q", notification.Data.EventType, input.EventType)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected event notification")
 	}
 }
 

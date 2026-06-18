@@ -40,13 +40,16 @@ import (
 )
 
 const (
-	clientVersion          = "v0.0.4"
-	clientTransportAuto    = "auto"
-	defaultTCPDataChannels = 32
-	releaseTypeNavmesh     = "navmesh"
-	releaseTypeRain        = "rain"
-	defaultRainInstallDir  = "/mnt/navfirst/nav-rain-go"
-	defaultRainServiceName = "raind"
+	clientVersion              = "v0.0.4"
+	clientTransportAuto        = "auto"
+	defaultTCPDataChannels     = 32
+	releaseTypeNavmesh         = "navmesh"
+	releaseTypeRain            = "rain"
+	releaseTypeHipnames        = "hipnames"
+	defaultRainInstallDir      = "/mnt/navfirst/nav-rain-go"
+	defaultRainServiceName     = "raind"
+	defaultHipnamesInstallDir  = "/mnt/navfirst/nav-hipnames"
+	defaultHipnamesServiceName = "hipnames"
 )
 
 var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
@@ -1248,6 +1251,9 @@ func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, report
 	if upgrade.ReleaseType == releaseTypeRain {
 		return performRainUpgrade(cfg, upgrade, reporter)
 	}
+	if upgrade.ReleaseType == releaseTypeHipnames {
+		return performHipnamesUpgrade(cfg, upgrade, reporter)
+	}
 	return performNavmeshClientUpgrade(cfg, upgrade, reporter)
 }
 
@@ -1321,6 +1327,54 @@ func performRainUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter
 	}
 	reporter.Success("北斗降雨应用已升级并重启")
 	log.Printf("rain upgrade installed task=%s installDir=%s service=%s", upgrade.TaskGuid, defaultRainInstallDir, defaultRainServiceName)
+	return nil
+}
+
+func performHipnamesUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter *clientUpgradeReporter) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("hipnames upgrade only supports linux hosts")
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return fmt.Errorf("systemctl not found: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "navmesh-hipnames-upgrade-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	packagePath := filepath.Join(tmpDir, "hipnames-package")
+	extractDir := filepath.Join(tmpDir, "extract")
+	reporter.Running("正在下载单机版解算应用", 8, 0)
+	if err := downloadUpgradeBinary(cfg, upgrade, packagePath, reporter); err != nil {
+		return err
+	}
+	reporter.Running("正在解压单机版解算应用", 84, reporter.downloadedSize)
+	appPath, err := extractHipnamesPackage(packagePath, extractDir)
+	if err != nil {
+		return err
+	}
+	appName := filepath.Base(appPath)
+	reporter.Running("正在停止 hipnames 服务", 90, reporter.downloadedSize)
+	stopSystemdService(defaultHipnamesServiceName)
+	reporter.Running("正在安装单机版解算应用", 94, reporter.downloadedSize)
+	if err := copyDirContents(filepath.Dir(appPath), defaultHipnamesInstallDir); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Join(defaultHipnamesInstallDir, appName), 0o755); err != nil {
+		return err
+	}
+	if err := writeSimpleSystemdService(defaultHipnamesServiceName, "NavFirst Hipnames", defaultHipnamesInstallDir, appName); err != nil {
+		return err
+	}
+	if err := enableSystemdService(defaultHipnamesServiceName); err != nil {
+		return err
+	}
+	reporter.Running("正在重启 hipnames 服务", 98, reporter.downloadedSize)
+	if err := restartSystemdService(defaultHipnamesServiceName); err != nil {
+		return err
+	}
+	reporter.Success("单机版解算应用已升级并重启")
+	log.Printf("hipnames upgrade installed task=%s installDir=%s service=%s app=%s", upgrade.TaskGuid, defaultHipnamesInstallDir, defaultHipnamesServiceName, appName)
 	return nil
 }
 
@@ -1403,22 +1457,31 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 }
 
 func upgradeDownloadMessage(upgrade clientUpgradeCommand) string {
-	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeRain {
+	switch normalizeUpgradeReleaseType(upgrade.ReleaseType) {
+	case releaseTypeRain:
 		return "正在下载北斗降雨应用"
+	case releaseTypeHipnames:
+		return "正在下载单机版解算应用"
 	}
 	return "正在下载客户端二进制"
 }
 
 func upgradeVerifyMessage(upgrade clientUpgradeCommand) string {
-	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeRain {
+	switch normalizeUpgradeReleaseType(upgrade.ReleaseType) {
+	case releaseTypeRain:
 		return "正在校验北斗降雨应用"
+	case releaseTypeHipnames:
+		return "正在校验单机版解算应用"
 	}
 	return "正在校验客户端二进制"
 }
 
 func upgradeVerifiedMessage(upgrade clientUpgradeCommand) string {
-	if normalizeUpgradeReleaseType(upgrade.ReleaseType) == releaseTypeRain {
+	switch normalizeUpgradeReleaseType(upgrade.ReleaseType) {
+	case releaseTypeRain:
 		return "北斗降雨应用校验完成"
+	case releaseTypeHipnames:
+		return "单机版解算应用校验完成"
 	}
 	return "客户端二进制校验完成"
 }
@@ -1511,6 +1574,8 @@ func normalizeUpgradeReleaseType(value string) string {
 		return releaseTypeNavmesh
 	case releaseTypeRain, "device_software":
 		return releaseTypeRain
+	case releaseTypeHipnames, "standalone":
+		return releaseTypeHipnames
 	default:
 		return strings.ToLower(strings.TrimSpace(value))
 	}
@@ -1527,6 +1592,23 @@ func extractRainPackage(packagePath string, extractDir string) (string, error) {
 		return findRainApp(extractDir)
 	}
 	target := filepath.Join(extractDir, "navRainApp")
+	if err := copyFile(packagePath, target, 0o755); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func extractHipnamesPackage(packagePath string, extractDir string) (string, error) {
+	if err := os.MkdirAll(extractDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := unzipFile(packagePath, extractDir); err == nil {
+		return findHipnamesApp(extractDir)
+	}
+	if err := untarGzipFile(packagePath, extractDir); err == nil {
+		return findHipnamesApp(extractDir)
+	}
+	target := filepath.Join(extractDir, "hipnames")
 	if err := copyFile(packagePath, target, 0o755); err != nil {
 		return "", err
 	}
@@ -1552,6 +1634,58 @@ func findRainApp(root string) (string, error) {
 		return "", errors.New("navRainApp not found in package")
 	}
 	return found, nil
+}
+
+func findHipnamesApp(root string) (string, error) {
+	for _, name := range []string{"navHipnames", "nav-hipnames", "hipnames", "hipnamesApp", "navHipnamesApp"} {
+		if found, err := findFileByName(root, name); err != nil {
+			return "", err
+		} else if found != "" {
+			return found, nil
+		}
+	}
+	if found, err := findFirstExecutable(root); err != nil {
+		return "", err
+	} else if found != "" {
+		return found, nil
+	}
+	return "", errors.New("hipnames executable not found in package")
+}
+
+func findFileByName(root string, name string) (string, error) {
+	var found string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if found != "" || entry.IsDir() || entry.Name() != name {
+			return nil
+		}
+		found = path
+		return nil
+	})
+	return found, err
+}
+
+func findFirstExecutable(root string) (string, error) {
+	var found string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if found != "" || entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&0o111 != 0 {
+			found = path
+		}
+		return nil
+	})
+	return found, err
 }
 
 func unzipFile(src string, dst string) error {
@@ -1719,6 +1853,45 @@ func restartSystemdService(serviceName string) error {
 		return err
 	}
 	return nil
+}
+
+func enableSystemdService(serviceName string) error {
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	if err := exec.Command("systemctl", "enable", serviceName).Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeSimpleSystemdService(serviceName string, description string, workDir string, execName string) error {
+	serviceName = strings.TrimSpace(serviceName)
+	execName = strings.TrimSpace(execName)
+	if serviceName == "" || execName == "" {
+		return errors.New("service name and executable name are required")
+	}
+	if !serviceLogNamePattern.MatchString(serviceName + ".service") {
+		return fmt.Errorf("invalid service name: %s", serviceName)
+	}
+	servicePath := filepath.Join("/etc/systemd/system", serviceName+".service")
+	content := fmt.Sprintf(`[Unit]
+Description=%s
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%s
+ExecStart=%s
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+`, description, workDir, filepath.Join(workDir, execName))
+	return os.WriteFile(servicePath, []byte(content), 0o644)
 }
 
 func restartClientService(cfg clientConfig) {

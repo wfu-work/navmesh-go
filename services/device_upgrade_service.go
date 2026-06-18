@@ -534,7 +534,7 @@ func releaseMatchesDevicePlatform(release domains.Release, device domains.Device
 
 func isOnlineUpgradeableReleaseType(value string) bool {
 	switch normalizeUpgradeReleaseType(value) {
-	case domains.ReleaseTypeNavmesh, domains.ReleaseTypeRain:
+	case domains.ReleaseTypeNavmesh, domains.ReleaseTypeRain, domains.ReleaseTypeHipnames:
 		return true
 	default:
 		return false
@@ -547,6 +547,9 @@ func releaseUpgradeDisabledReason(release domains.Release, device domains.Device
 	}
 	if normalizeUpgradeReleaseType(release.ReleaseType) == domains.ReleaseTypeRain && !clientVersionAtLeast(device.ClientVersion, 0, 0, 3) {
 		return "设备客户端版本不支持北斗降雨在线升级"
+	}
+	if normalizeUpgradeReleaseType(release.ReleaseType) == domains.ReleaseTypeHipnames && !clientVersionAtLeast(device.ClientVersion, 0, 0, 4) {
+		return "设备客户端版本不支持单机版解算在线升级"
 	}
 	return ""
 }
@@ -605,6 +608,8 @@ func normalizeUpgradeReleaseType(value string) string {
 		return domains.ReleaseTypeNavmesh
 	case domains.ReleaseTypeRain, "device_software":
 		return domains.ReleaseTypeRain
+	case domains.ReleaseTypeHipnames, "standalone":
+		return domains.ReleaseTypeHipnames
 	default:
 		return strings.ToLower(strings.TrimSpace(value))
 	}
@@ -612,8 +617,11 @@ func normalizeUpgradeReleaseType(value string) string {
 
 func upgradeEventTitle(releaseType string, success bool) string {
 	name := "客户端"
-	if normalizeUpgradeReleaseType(releaseType) == domains.ReleaseTypeRain {
+	switch normalizeUpgradeReleaseType(releaseType) {
+	case domains.ReleaseTypeRain:
 		name = "北斗降雨"
+	case domains.ReleaseTypeHipnames:
+		name = "单机版解算"
 	}
 	if success {
 		return name + "升级成功"

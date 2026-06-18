@@ -59,6 +59,30 @@ func TestReleaseUpgradeDisabledReasonRequiresRainCapableClient(t *testing.T) {
 	}
 }
 
+func TestReleaseUpgradeDisabledReasonRequiresHipnamesCapableClient(t *testing.T) {
+	release := domains.Release{ReleaseType: domains.ReleaseTypeHipnames, DeviceType: "hipnames", OS: "linux", Arch: "arm64"}
+	device := domains.Device{DeviceType: "hipnames", OS: "linux", Arch: "arm64", ClientVersion: "v0.0.3"}
+
+	if got := releaseUpgradeDisabledReason(release, device); got != "设备客户端版本不支持单机版解算在线升级" {
+		t.Fatalf("releaseUpgradeDisabledReason() = %q", got)
+	}
+
+	device.ClientVersion = "v0.0.4"
+	if got := releaseUpgradeDisabledReason(release, device); got != "" {
+		t.Fatalf("releaseUpgradeDisabledReason() = %q, want empty", got)
+	}
+}
+
+func TestHipnamesReleaseTypeSupportsOnlineUpgrade(t *testing.T) {
+	for _, value := range []string{domains.ReleaseTypeHipnames, "standalone"} {
+		t.Run(value, func(t *testing.T) {
+			if !isOnlineUpgradeableReleaseType(value) {
+				t.Fatalf("isOnlineUpgradeableReleaseType(%q) = false, want true", value)
+			}
+		})
+	}
+}
+
 func TestReportProgress(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -442,12 +442,12 @@ func (s DeviceService) List(params map[string]string) ([]domains.Device, int64, 
 
 func (s DeviceService) Stats(params map[string]string) (*DeviceStats, error) {
 	stats := &DeviceStats{}
-	if err := s.deviceListQuery(params, false).Count(&stats.Total).Error; err != nil {
+	if err := s.deviceListQuery(params, true).Count(&stats.Total).Error; err != nil {
 		return nil, err
 	}
 	countStatus := func(status int) int64 {
 		var count int64
-		_ = s.deviceListQuery(params, false).Where("status = ?", status).Count(&count).Error
+		_ = s.deviceListQuery(params, true).Where("status = ?", status).Count(&count).Error
 		return count
 	}
 	stats.Registered = countStatus(domains.DeviceStatusRegistered)
