@@ -17,7 +17,13 @@ type EventService struct {
 	commonServices.CrudService[domains.Event]
 }
 
-const ignoredServiceLogEventType = "service_log"
+const (
+	ignoredServiceLogEventType           = "service_log"
+	httpGatewayOpenTCPFailedEventType    = "open_tcp_failed"
+	httpGatewayOpenTCPFailedEventTitle   = "open http target failed"
+	httpGatewaySessionRejectedEventType  = "session_rejected"
+	httpGatewaySessionRejectedEventTitle = "http connection rejected"
+)
 
 func (s EventService) WithDB(db *gorm.DB) EventService {
 	s.CrudService = *s.CrudService.WithDB(db)
@@ -34,6 +40,7 @@ type EventInput struct {
 
 func (s EventService) List(params map[string]string) ([]domains.Event, int64, error) {
 	db := s.DB().Model(&domains.Event{}).Where("event_type <> ?", ignoredServiceLogEventType)
+	db = withoutEventCenterNoise(db)
 	if deviceGuid := strings.TrimSpace(params["deviceGuid"]); deviceGuid != "" {
 		db = db.Where("device_guid = ?", deviceGuid)
 	}
@@ -110,7 +117,7 @@ func (s EventService) RecordSuppressedAt(input EventInput, window time.Duration,
 func (s EventService) RecordAt(input EventInput, now int64) {
 	input.EventType = strings.TrimSpace(input.EventType)
 	input.Title = strings.TrimSpace(input.Title)
-	if input.EventType == "" || input.EventType == ignoredServiceLogEventType || input.Title == "" {
+	if input.EventType == "" || input.EventType == ignoredServiceLogEventType || input.Title == "" || isEventCenterNoise(input) {
 		return
 	}
 	level := strings.TrimSpace(input.Level)
@@ -147,4 +154,19 @@ func (s EventService) setStatus(guid string, status int) error {
 		"status":      status,
 		"update_time": domains.NowMilli(),
 	}).Error
+}
+
+func withoutEventCenterNoise(db *gorm.DB) *gorm.DB {
+	return db.Where(
+		"NOT ((event_type = ? AND title = ?) OR (event_type = ? AND title = ?))",
+		httpGatewayOpenTCPFailedEventType,
+		httpGatewayOpenTCPFailedEventTitle,
+		httpGatewaySessionRejectedEventType,
+		httpGatewaySessionRejectedEventTitle,
+	)
+}
+
+func isEventCenterNoise(input EventInput) bool {
+	return (input.EventType == httpGatewayOpenTCPFailedEventType && input.Title == httpGatewayOpenTCPFailedEventTitle) ||
+		(input.EventType == httpGatewaySessionRejectedEventType && input.Title == httpGatewaySessionRejectedEventTitle)
 }

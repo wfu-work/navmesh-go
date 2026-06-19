@@ -19,6 +19,8 @@ func TestSamePlatformLinuxDistributionAliases(t *testing.T) {
 		{current: "ubuntu 20.04", target: "linux"},
 		{current: "Ubuntu 22.04.4 LTS", target: "linux"},
 		{current: "ubuntu/linux", target: "linux"},
+		{current: "GNU/Linux", target: "linux"},
+		{current: "linux-gnu", target: "linux"},
 		{current: "debian", target: "linux"},
 		{current: "debian 12.14", target: "linux"},
 		{current: "centos", target: "linux"},

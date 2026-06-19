@@ -2,7 +2,6 @@ package httpgateway
 
 import (
 	"context"
-	"errors"
 	"html/template"
 	"io"
 	"net"
@@ -330,10 +329,6 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	if err != nil {
 		statusCode = statusCodeForProxyError(err)
 		finish("proxy_error: " + err.Error())
-		var dialErr *tunnelDialError
-		if errors.As(err, &dialErr) {
-			recordHTTPGatewayOpenFailed(rt.device.Guid, dialErr.Unwrap())
-		}
 		return nil, err
 	}
 	statusCode = resp.StatusCode
@@ -380,13 +375,6 @@ func tunnelDialContext(manager *tunnel.Manager) func(context.Context, string, st
 		}
 		permit, err := services.DefaultRuntimePolicy.Acquire(info.Device.Guid, info.SourceIP)
 		if err != nil {
-			services.ServiceGroupApp.EventService.Record(services.EventInput{
-				DeviceGuid: info.Device.Guid,
-				EventType:  "session_rejected",
-				Level:      "warn",
-				Title:      "http connection rejected",
-				Message:    err.Error(),
-			})
 			return nil, err
 		}
 		streamCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -440,19 +428,6 @@ func (e *tunnelDialError) Unwrap() error {
 		return nil
 	}
 	return e.err
-}
-
-func recordHTTPGatewayOpenFailed(deviceGuid string, err error) {
-	if err == nil {
-		return
-	}
-	services.ServiceGroupApp.EventService.Record(services.EventInput{
-		DeviceGuid: deviceGuid,
-		EventType:  "open_tcp_failed",
-		Level:      "error",
-		Title:      "open http target failed",
-		Message:    err.Error(),
-	})
 }
 
 type tunnelHTTPConn struct {

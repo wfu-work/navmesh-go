@@ -659,6 +659,7 @@ func normalizePlatformName(value string) string {
 		"osx":       "darwin",
 		"win32":     "windows",
 		"win64":     "windows",
+		"linux":     "linux",
 		"ubuntu":    "linux",
 		"debian":    "linux",
 		"centos":    "linux",
