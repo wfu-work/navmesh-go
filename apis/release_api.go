@@ -35,6 +35,8 @@ func (a ReleaseApi) Upload(c *gin.Context) {
 		return
 	}
 	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "upload", Resource: "release", ResourceID: item.Guid, Message: item.FileName, SourceIP: c.ClientIP()})
+	eventService.Record(services.EventInput{EventType: "release_published", Level: "info", Title: services.ReleasePublishedTitle(item), Message: services.ReleasePublishedMessage(item)})
+	go emailService.NotifyReleasePublished(item, publicReleaseDownloadURL(c, item))
 	response.Ok(item, c)
 }
 

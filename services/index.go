@@ -17,9 +17,11 @@ type ServiceGroup struct {
 	DeviceTrafficService
 	DeviceUpgradeService
 	EventService
+	EmailService
 	GroupService
 	MappingService
 	MaintenanceService
+	MessageService
 	SessionService
 	SettingService
 	SSHService

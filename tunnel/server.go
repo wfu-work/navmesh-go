@@ -219,6 +219,7 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		s.manager.Touch(device.Guid)
+		services.ServiceGroupApp.DeviceService.TouchOnline(device.Guid)
 		switch next.Type {
 		case FrameTypeHeartbeat, FrameTypePing:
 			_ = writeFrameToWriter(conn, Frame{Type: FrameTypePong, OK: true, RequestID: next.RequestID})
@@ -236,6 +237,7 @@ func (s *Server) handleStream(ctx context.Context, deviceGuid string, stream *qu
 		return
 	}
 	s.manager.Touch(deviceGuid)
+	services.ServiceGroupApp.DeviceService.TouchOnline(deviceGuid)
 	switch frame.Type {
 	case FrameTypeHeartbeat, FrameTypePing:
 		_ = writeFrame(stream, Frame{Type: FrameTypePong, OK: true, RequestID: frame.RequestID})

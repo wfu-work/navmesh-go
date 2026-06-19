@@ -13,6 +13,7 @@ type ApiGroup struct {
 	GroupApi
 	MappingApi
 	MaintenanceApi
+	MessageApi
 	SessionApi
 	SettingApi
 	SSHApi
@@ -30,9 +31,11 @@ var (
 	deviceTrafficService = services.ServiceGroupApp.DeviceTrafficService
 	deviceUpgradeService = services.ServiceGroupApp.DeviceUpgradeService
 	eventService         = services.ServiceGroupApp.EventService
+	emailService         = services.ServiceGroupApp.EmailService
 	groupService         = services.ServiceGroupApp.GroupService
 	mappingService       = services.ServiceGroupApp.MappingService
 	maintenanceService   = services.ServiceGroupApp.MaintenanceService
+	messageService       = services.ServiceGroupApp.MessageService
 	sessionService       = services.ServiceGroupApp.SessionService
 	settingService       = services.ServiceGroupApp.SettingService
 	sshService           = services.ServiceGroupApp.SSHService

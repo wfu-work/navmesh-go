@@ -252,6 +252,10 @@ func (s DeviceUpgradeService) List(deviceGuid string, params map[string]string) 
 	if releaseGuid := strings.TrimSpace(params["releaseGuid"]); releaseGuid != "" {
 		db = db.Where("release_guid = ?", releaseGuid)
 	}
+	if releaseTypeParam := strings.TrimSpace(params["releaseType"]); releaseTypeParam != "" {
+		releaseType := normalizeUpgradeReleaseType(releaseTypeParam)
+		db = db.Where("release_type = ? OR ((release_type = '' OR release_type IS NULL) AND ? = ?)", releaseType, releaseType, domains.ReleaseTypeNavmesh)
+	}
 	if status := utils.Str2Int(params["status"]); status > 0 {
 		db = db.Where("status = ?", status)
 	}
@@ -642,12 +646,14 @@ func sameDeviceType(current string, target string) bool {
 }
 
 func normalizePlatformName(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.NewReplacer("_", " ", "-", " ", "/", " ").Replace(value)
+	raw := strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("_", " ", "-", " ", "/", " ").Replace(raw)
+	value = strings.Join(strings.Fields(value), " ")
 	aliases := map[string]string{
 		"aarch64":   "arm64",
 		"armv8":     "arm64",
 		"x86_64":    "amd64",
+		"x86 64":    "amd64",
 		"x64":       "amd64",
 		"macos":     "darwin",
 		"osx":       "darwin",
@@ -664,6 +670,9 @@ func normalizePlatformName(value string) string {
 		"opensuse":  "linux",
 		"suse":      "linux",
 		"alpine":    "linux",
+	}
+	if normalized, ok := aliases[raw]; ok {
+		return normalized
 	}
 	if normalized, ok := aliases[value]; ok {
 		return normalized

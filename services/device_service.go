@@ -27,9 +27,11 @@ type DeviceService struct {
 }
 
 const (
-	diskUsageHighEventType = "disk_usage_high"
-	diskUsageHighThreshold = 90.0
-	deviceOfflineEventType = "device_offline"
+	diskUsageHighEventType              = "disk_usage_high"
+	diskUsageHighThreshold              = 90.0
+	deviceOfflineEventType              = "device_offline"
+	deviceOfflineEventSuppressionWindow = 6 * time.Hour
+	deviceOnlineTouchMinInterval        = 15 * time.Second
 )
 
 func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
@@ -624,6 +626,23 @@ func (s DeviceService) Authenticate(token, guid, sncode, sourceIP, hostIP, wanIP
 	return s.Heartbeat(req, sourceIP)
 }
 
+func (s DeviceService) TouchOnline(guid string) {
+	guid = strings.TrimSpace(guid)
+	if guid == "" || s.DB() == nil {
+		return
+	}
+	now := domains.NowMilli()
+	cutoff := now - deviceOnlineTouchMinInterval.Milliseconds()
+	_ = s.DB().Model(&domains.Device{}).
+		Where("guid = ? AND status <> ?", guid, domains.DeviceStatusDisabled).
+		Where("status <> ? OR last_seen_time = 0 OR last_seen_time < ?", domains.DeviceStatusOnline, cutoff).
+		Updates(map[string]any{
+			"status":         domains.DeviceStatusOnline,
+			"last_seen_time": now,
+			"update_time":    now,
+		}).Error
+}
+
 func (s DeviceService) MarkOnlineDevicesOffline() (int64, error) {
 	now := domains.NowMilli()
 	result := s.DB().Model(&domains.Device{}).
@@ -679,13 +698,15 @@ func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, e
 		if timeout != 300*time.Second {
 			message = fmt.Sprintf("设备心跳超过 %s 未更新，请检查设备网络或 navmesh-client 运行状态。", timeout)
 		}
-		ServiceGroupApp.EventService.WithDB(s.DB()).RecordAt(EventInput{
+		if !ServiceGroupApp.EventService.WithDB(s.DB()).RecordSuppressed(EventInput{
 			DeviceGuid: device.Guid,
 			EventType:  deviceOfflineEventType,
 			Level:      "warn",
 			Title:      "device heartbeat offline",
 			Message:    message,
-		}, now)
+		}, deviceOfflineEventSuppressionWindow) {
+			continue
+		}
 		created++
 	}
 	return created, nil
@@ -921,6 +942,11 @@ func (s DeviceService) recordDailyDiskUsageEvent(deviceGuid string, req Heartbea
 		Title:      "磁盘空间不足",
 		Message:    message,
 	}, now)
+	var device domains.Device
+	if err := s.DB().Where("guid = ?", deviceGuid).First(&device).Error; err != nil {
+		return
+	}
+	go ServiceGroupApp.EmailService.NotifyDiskUsageHigh(&device, req, message, now)
 }
 
 func (s DeviceService) hasDeviceOfflineEventSinceLastSeen(deviceGuid string, lastSeenTime int64) bool {

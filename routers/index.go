@@ -17,6 +17,7 @@ type RouterGroup struct {
 	GroupRouter
 	MappingRouter
 	MaintenanceRouter
+	MessageRouter
 	SessionRouter
 	SettingRouter
 	SSHRouter
@@ -33,6 +34,7 @@ var (
 	groupApi        = apis.ApiGroupApp.GroupApi
 	mappingApi      = apis.ApiGroupApp.MappingApi
 	maintenanceApi  = apis.ApiGroupApp.MaintenanceApi
+	messageApi      = apis.ApiGroupApp.MessageApi
 	sessionApi      = apis.ApiGroupApp.SessionApi
 	settingApi      = apis.ApiGroupApp.SettingApi
 	sshApi          = apis.ApiGroupApp.SSHApi
@@ -49,6 +51,7 @@ func (r *RouterGroup) InitRouters(publicGroup *gin.RouterGroup, privateGroup *gi
 	r.InitGroupRouter(privateGroup)
 	r.InitMappingRouter(privateGroup)
 	r.InitMaintenanceRouter(privateGroup)
+	r.InitMessageRouter(privateGroup)
 	r.InitSessionRouter(privateGroup)
 	r.InitSettingRouter(privateGroup)
 	r.InitSSHRouter(privateGroup)

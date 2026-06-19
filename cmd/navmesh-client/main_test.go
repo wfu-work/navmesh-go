@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/quic-go/quic-go"
+	gopsnet "github.com/shirou/gopsutil/v4/net"
 )
 
 func TestBridgePrefersHalfClose(t *testing.T) {
@@ -160,6 +161,46 @@ func TestIsPublicIPv4RejectsIPv6AndPrivateIP(t *testing.T) {
 func TestDefaultTCPDataChannelsSupportsResourceHeavyPages(t *testing.T) {
 	if defaultTCPDataChannels < 32 {
 		t.Fatalf("defaultTCPDataChannels = %d, want at least 32", defaultTCPDataChannels)
+	}
+}
+
+func TestSelectTrafficInterfaceFromCountersPrefersSingleActivePhysicalWithTraffic(t *testing.T) {
+	counters := []gopsnet.IOCountersStat{
+		{Name: "lo", BytesRecv: 100, BytesSent: 100},
+		{Name: "eth0"},
+		{Name: "eth1", BytesRecv: 1607687512, BytesSent: 3818216370},
+		{Name: "docker0"},
+	}
+	active := map[string]bool{
+		"lo":      true,
+		"eth0":    true,
+		"eth1":    true,
+		"docker0": true,
+	}
+	if got := selectTrafficInterfaceFromCounters(counters, active); got != "eth1" {
+		t.Fatalf("selectTrafficInterfaceFromCounters() = %q, want eth1", got)
+	}
+}
+
+func TestSelectTrafficInterfaceFromCountersPrefersCellularName(t *testing.T) {
+	counters := []gopsnet.IOCountersStat{
+		{Name: "eth1", BytesRecv: 1607687512, BytesSent: 3818216370},
+		{Name: "wwan0"},
+	}
+	active := map[string]bool{"eth1": true, "wwan0": true}
+	if got := selectTrafficInterfaceFromCounters(counters, active); got != "wwan0" {
+		t.Fatalf("selectTrafficInterfaceFromCounters() = %q, want wwan0", got)
+	}
+}
+
+func TestSelectTrafficInterfaceFromCountersKeepsAmbiguousPhysicalInterfacesDisabled(t *testing.T) {
+	counters := []gopsnet.IOCountersStat{
+		{Name: "eth0", BytesRecv: 10, BytesSent: 10},
+		{Name: "eth1", BytesRecv: 20, BytesSent: 20},
+	}
+	active := map[string]bool{"eth0": true, "eth1": true}
+	if got := selectTrafficInterfaceFromCounters(counters, active); got != "" {
+		t.Fatalf("selectTrafficInterfaceFromCounters() = %q, want empty", got)
 	}
 }
 

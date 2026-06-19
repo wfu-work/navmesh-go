@@ -4,6 +4,10 @@ import (
 	"testing"
 
 	"navmesh-go/domains"
+
+	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func TestSamePlatformLinuxDistributionAliases(t *testing.T) {
@@ -14,6 +18,7 @@ func TestSamePlatformLinuxDistributionAliases(t *testing.T) {
 		{current: "ubuntu", target: "linux"},
 		{current: "ubuntu 20.04", target: "linux"},
 		{current: "Ubuntu 22.04.4 LTS", target: "linux"},
+		{current: "ubuntu/linux", target: "linux"},
 		{current: "debian", target: "linux"},
 		{current: "debian 12.14", target: "linux"},
 		{current: "centos", target: "linux"},
@@ -21,6 +26,25 @@ func TestSamePlatformLinuxDistributionAliases(t *testing.T) {
 		{current: "alpine", target: "linux"},
 		{current: "rocky linux 9", target: "linux"},
 		{current: "almaLinux 9.4", target: "linux"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.current, func(t *testing.T) {
+			if !samePlatform(tt.current, tt.target) {
+				t.Fatalf("samePlatform(%q, %q) = false; want true", tt.current, tt.target)
+			}
+		})
+	}
+}
+
+func TestSamePlatformArchitectureAliases(t *testing.T) {
+	tests := []struct {
+		current string
+		target  string
+	}{
+		{current: "x86_64", target: "amd64"},
+		{current: "x86-64", target: "amd64"},
+		{current: "aarch64", target: "arm64"},
 	}
 
 	for _, tt := range tests {
@@ -83,6 +107,50 @@ func TestHipnamesReleaseTypeSupportsOnlineUpgrade(t *testing.T) {
 	}
 }
 
+func TestListUpgradeTasksFiltersReleaseType(t *testing.T) {
+	db := setupDeviceUpgradeTestDB(t)
+	service := DeviceUpgradeService{}.WithDB(db)
+	deviceGuid := "device-upgrade-filter"
+	tasks := []domains.DeviceUpgradeTask{
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "task-client", CreateTime: 300},
+			DeviceGuid:     deviceGuid,
+			ReleaseType:    domains.ReleaseTypeNavmesh,
+			Version:        "v0.0.5",
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "task-rain", CreateTime: 200},
+			DeviceGuid:     deviceGuid,
+			ReleaseType:    domains.ReleaseTypeRain,
+			Version:        "v1.0.1",
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "task-legacy-client", CreateTime: 100},
+			DeviceGuid:     deviceGuid,
+			Version:        "v0.0.4",
+		},
+	}
+	if err := db.Create(&tasks).Error; err != nil {
+		t.Fatalf("create tasks: %v", err)
+	}
+
+	rainItems, rainTotal, err := service.List(deviceGuid, map[string]string{"releaseType": "rain", "page": "1", "size": "10"})
+	if err != nil {
+		t.Fatalf("list rain tasks: %v", err)
+	}
+	if rainTotal != 1 || len(rainItems) != 1 || rainItems[0].Guid != "task-rain" {
+		t.Fatalf("rain tasks = total %d items %+v, want task-rain only", rainTotal, rainItems)
+	}
+
+	clientItems, clientTotal, err := service.List(deviceGuid, map[string]string{"releaseType": "navmesh", "page": "1", "size": "10"})
+	if err != nil {
+		t.Fatalf("list client tasks: %v", err)
+	}
+	if clientTotal != 2 || len(clientItems) != 2 {
+		t.Fatalf("client tasks = total %d len %d, want 2", clientTotal, len(clientItems))
+	}
+}
+
 func TestReportProgress(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -106,4 +174,16 @@ func TestReportProgress(t *testing.T) {
 			}
 		})
 	}
+}
+
+func setupDeviceUpgradeTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.DeviceUpgradeTask{}); err != nil {
+		t.Fatalf("migrate upgrade tasks: %v", err)
+	}
+	return db
 }

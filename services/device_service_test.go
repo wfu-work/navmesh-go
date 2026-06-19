@@ -49,7 +49,7 @@ func TestRecordStaleOfflineEventsWaitsForDelayAndDedupes(t *testing.T) {
 	service := ServiceGroupApp.DeviceService.WithDB(db)
 	now := domains.NowMilli()
 	recent := domains.Device{Sncode: "recent", Alias: "recent", Status: domains.DeviceStatusOffline, LastSeenTime: now - 299*time.Second.Milliseconds()}
-	stale := domains.Device{Sncode: "stale", Alias: "stale", Status: domains.DeviceStatusOffline, LastSeenTime: now - 301*time.Second.Milliseconds()}
+	stale := domains.Device{Sncode: "stale", Alias: "stale", Status: domains.DeviceStatusOffline, LastSeenTime: now - 10*time.Minute.Milliseconds()}
 	if err := db.Create(&recent).Error; err != nil {
 		t.Fatalf("seed recent device: %v", err)
 	}
@@ -89,6 +89,57 @@ func TestRecordStaleOfflineEventsWaitsForDelayAndDedupes(t *testing.T) {
 		t.Fatalf("created acked duplicate events = %d, want 0", created)
 	}
 	assertOfflineEventCount(t, db, stale.Guid, 1)
+
+	if err := db.Model(&domains.Device{}).
+		Where("guid = ?", stale.Guid).
+		Updates(map[string]any{
+			"status":         domains.DeviceStatusOffline,
+			"last_seen_time": domains.NowMilli() - 10*time.Minute.Milliseconds(),
+		}).Error; err != nil {
+		t.Fatalf("simulate device flapping offline: %v", err)
+	}
+	created, err = service.RecordStaleOfflineEvents(300 * time.Second)
+	if err != nil {
+		t.Fatalf("record offline events after flap: %v", err)
+	}
+	if created != 0 {
+		t.Fatalf("created suppressed flap event = %d, want 0", created)
+	}
+	assertOfflineEventCount(t, db, stale.Guid, 1)
+}
+
+func TestTouchOnlineRefreshesLastSeenAndStatus(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}); err != nil {
+		t.Fatalf("migrate devices: %v", err)
+	}
+
+	now := domains.NowMilli()
+	device := domains.Device{
+		Sncode:       "device-1",
+		Alias:        "device-1",
+		Status:       domains.DeviceStatusOffline,
+		LastSeenTime: now - time.Hour.Milliseconds(),
+	}
+	if err := db.Create(&device).Error; err != nil {
+		t.Fatalf("seed device: %v", err)
+	}
+
+	ServiceGroupApp.DeviceService.WithDB(db).TouchOnline(device.Guid)
+
+	var updated domains.Device
+	if err := db.Where("guid = ?", device.Guid).First(&updated).Error; err != nil {
+		t.Fatalf("load device: %v", err)
+	}
+	if updated.Status != domains.DeviceStatusOnline {
+		t.Fatalf("status = %d, want online", updated.Status)
+	}
+	if updated.LastSeenTime <= device.LastSeenTime {
+		t.Fatalf("lastSeenTime = %d, want newer than %d", updated.LastSeenTime, device.LastSeenTime)
+	}
 }
 
 func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {

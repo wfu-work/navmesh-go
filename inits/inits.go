@@ -76,6 +76,10 @@ func registerTables() {
 		domains.AccessPolicy{},
 		domains.DeviceGroup{},
 		domains.Event{},
+		domains.MessageEmailConfig{},
+		domains.MessageTemplate{},
+		domains.MessageRecipient{},
+		domains.MessageSendRecord{},
 		domains.AuditLog{},
 		domains.Setting{},
 	)
@@ -85,6 +89,7 @@ func registerTables() {
 	}
 	seedDefaultSettings()
 	services.ServiceGroupApp.GroupService.SeedDefaults()
+	services.ServiceGroupApp.MessageService.SeedDefaults()
 	global.NAV_LOG.Info("register navmesh business table success")
 }
 

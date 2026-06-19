@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	clientVersion              = "v0.0.4"
+	clientVersion              = "v0.0.5"
 	clientTransportAuto        = "auto"
 	defaultTCPDataChannels     = 32
 	releaseTypeNavmesh         = "navmesh"
@@ -2038,7 +2038,10 @@ func selectTrafficInterface(preferredIface string) string {
 		}
 		return preferredIface
 	}
-	active := activeInterfaceNames()
+	return selectTrafficInterfaceFromCounters(counters, activeInterfaceNames())
+}
+
+func selectTrafficInterfaceFromCounters(counters []gopsnet.IOCountersStat, active map[string]bool) string {
 	for _, item := range counters {
 		if !active[item.Name] || isExcludedTrafficInterface(item.Name) {
 			continue
@@ -2048,16 +2051,27 @@ func selectTrafficInterface(preferredIface string) string {
 		}
 	}
 	physical := make([]string, 0, len(counters))
+	physicalWithTraffic := make([]string, 0, len(counters))
 	for _, item := range counters {
 		if !active[item.Name] || isExcludedTrafficInterface(item.Name) || !isLikelyPhysicalInterface(item.Name) {
 			continue
 		}
 		physical = append(physical, item.Name)
+		if hasInterfaceTraffic(item) {
+			physicalWithTraffic = append(physicalWithTraffic, item.Name)
+		}
+	}
+	if len(physicalWithTraffic) == 1 {
+		return physicalWithTraffic[0]
 	}
 	if len(physical) == 1 {
 		return physical[0]
 	}
 	return ""
+}
+
+func hasInterfaceTraffic(item gopsnet.IOCountersStat) bool {
+	return item.BytesRecv > 0 || item.BytesSent > 0
 }
 
 func isTrafficCollectionDisabled(value string) bool {
