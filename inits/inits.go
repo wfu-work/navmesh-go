@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/robfig/cron/v3"
 	"github.com/wfu-work/nav-common-go-lib/global"
 	commonInits "github.com/wfu-work/nav-common-go-lib/inits"
+	"github.com/wfu-work/nav-common-go-lib/scheduleds"
 	"go.uber.org/zap"
 )
 
@@ -28,7 +30,7 @@ var tunnelServer *tunnel.Server
 var sshServer *sshgateway.Server
 var httpMappingServer *httpgateway.Server
 var tcpMappingServer *tcpgateway.Server
-var maintenanceCancel context.CancelFunc
+var maintenanceTimer scheduleds.Timer
 var deviceOfflineCancel context.CancelFunc
 
 //go:embed config.yaml
@@ -44,6 +46,7 @@ func Init() {
 	sysInit.OnRouterInit(func(publicGroup *gin.RouterGroup, privateGroup *gin.RouterGroup) {
 		routers.RouterGroupApp.InitRouters(publicGroup, privateGroup)
 	})
+	sysInit.OnScheInit(registerScheduledJobs)
 	sysInit.OnOtherInit(startBackgroundServers)
 	sysInit.OnShutInit(stopBackgroundServers)
 	sysInit.OnWebInit(func(router *gin.Engine) {
@@ -178,7 +181,6 @@ func seedDefaultSettings() {
 func startBackgroundServers() {
 	services.RegisterDeviceConnectionCloser(tunnel.DefaultManager)
 	markBootStaleDevicesOffline()
-	startMaintenanceJobs()
 	startDeviceOfflineCleaner()
 	startTunnelServer()
 	startSSHServer()
@@ -206,15 +208,14 @@ func markBootStaleDevicesOffline() {
 	}
 }
 
-func startMaintenanceJobs() {
-	ctx, cancel := context.WithCancel(context.Background())
-	maintenanceCancel = cancel
-	services.ServiceGroupApp.MaintenanceService.StartRetentionCleaner(ctx)
+func registerScheduledJobs(timer scheduleds.Timer, options []cron.Option) {
+	maintenanceTimer = timer
+	services.ServiceGroupApp.MaintenanceService.RegisterRetentionCleaner(timer, options)
 }
 
 func stopMaintenanceJobs() {
-	if maintenanceCancel != nil {
-		maintenanceCancel()
+	if maintenanceTimer != nil {
+		services.ServiceGroupApp.MaintenanceService.StopRetentionCleaner(maintenanceTimer)
 	}
 }
 

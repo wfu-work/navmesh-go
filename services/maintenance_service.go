@@ -1,18 +1,33 @@
 package services
 
 import (
-	"context"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"navmesh-go/domains"
 
+	"github.com/robfig/cron/v3"
 	"github.com/wfu-work/nav-common-go-lib/global"
+	"github.com/wfu-work/nav-common-go-lib/scheduleds"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 )
 
 type MaintenanceService struct{}
+
+const (
+	retentionCleanerCronName = "NavMeshRetention"
+	retentionCleanerTaskName = "retention_cleanup"
+	retentionCleanerSpec     = "@every 1m"
+	retentionMinimumInterval = time.Minute
+)
+
+var (
+	retentionCleanerLastRun atomic.Int64
+	retentionCleanerRunning atomic.Bool
+)
 
 type RetentionCleanupResult struct {
 	AuditLogs         int64 `json:"auditLogs"`
@@ -23,28 +38,27 @@ type RetentionCleanupResult struct {
 	DeviceConnections int64 `json:"deviceConnections"`
 }
 
-func (s MaintenanceService) StartRetentionCleaner(ctx context.Context) {
-	if !settingBool("retention_cleanup_enabled", true) {
-		global.NAV_LOG.Info("navmesh retention cleaner disabled")
+func (s MaintenanceService) RegisterRetentionCleaner(timer scheduleds.Timer, options []cron.Option) {
+	if timer == nil {
+		global.NAV_LOG.Warn("navmesh retention cleaner timer is nil")
 		return
 	}
-	interval := settingDuration("retention_cleanup_interval", 24*time.Hour)
-	if interval < time.Minute {
-		interval = time.Minute
+	timer.RemoveTaskByName(retentionCleanerCronName, retentionCleanerTaskName)
+	if _, err := timer.AddTaskByFunc(retentionCleanerCronName, retentionCleanerSpec, func() {
+		s.cleanupDue("scheduled")
+	}, retentionCleanerTaskName, options...); err != nil {
+		global.NAV_LOG.Warn("register navmesh retention cleaner failed", zap.Error(err))
+		return
 	}
-	go func() {
-		s.cleanupOnce("startup")
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.cleanupOnce("ticker")
-			}
-		}
-	}()
+	global.NAV_LOG.Info("register navmesh retention cleaner", zap.String("spec", retentionCleanerSpec))
+	s.cleanupDue("startup")
+}
+
+func (s MaintenanceService) StopRetentionCleaner(timer scheduleds.Timer) {
+	if timer == nil {
+		return
+	}
+	timer.Clear(retentionCleanerCronName)
 }
 
 func (s MaintenanceService) CleanupRetention() RetentionCleanupResult {
@@ -52,11 +66,34 @@ func (s MaintenanceService) CleanupRetention() RetentionCleanupResult {
 	return RetentionCleanupResult{
 		AuditLogs:         deleteBefore(&domains.AuditLog{}, "create_time", now, settingInt("audit_retention_days", 90)),
 		HTTPAccessLogs:    deleteBefore(&domains.HTTPAccessLog{}, "create_time", now, settingInt("http_access_retention_days", 30)),
-		TunnelSessions:    deleteBefore(&domains.TunnelSession{}, "start_time", now, settingInt("session_retention_days", 90)),
+		TunnelSessions:    deleteBefore(&domains.TunnelSession{}, "end_time", now, settingInt("session_retention_days", 90), closedRows),
 		DeviceHeartbeats:  deleteBefore(&domains.DeviceHeartbeat{}, "create_time", now, settingInt("heartbeat_retention_days", 7)),
 		DeviceTrafficDays: deleteBefore(&domains.DeviceTrafficDaily{}, "last_seen_time", now, settingInt("traffic_daily_retention_days", 370)),
-		DeviceConnections: deleteBefore(&domains.DeviceConnection{}, "create_time", now, settingInt("device_connection_retention_days", 30)),
+		DeviceConnections: deleteBefore(&domains.DeviceConnection{}, "update_time", now, settingInt("device_connection_retention_days", 30), closedRows),
 	}
+}
+
+func (s MaintenanceService) cleanupDue(reason string) {
+	if !settingBool("retention_cleanup_enabled", true) {
+		return
+	}
+	interval := retentionCleanupInterval()
+	now := domains.NowMilli()
+	lastRun := retentionCleanerLastRun.Load()
+	if lastRun > 0 && now-lastRun < interval.Milliseconds() {
+		return
+	}
+	if !retentionCleanerRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer retentionCleanerRunning.Store(false)
+	now = domains.NowMilli()
+	lastRun = retentionCleanerLastRun.Load()
+	if lastRun > 0 && now-lastRun < interval.Milliseconds() {
+		return
+	}
+	s.cleanupOnce(reason)
+	retentionCleanerLastRun.Store(now)
 }
 
 func (s MaintenanceService) cleanupOnce(reason string) {
@@ -72,17 +109,33 @@ func (s MaintenanceService) cleanupOnce(reason string) {
 	)
 }
 
-func deleteBefore(model any, column string, now int64, days int) int64 {
+func deleteBefore(model any, column string, now int64, days int, scopes ...func(*gorm.DB) *gorm.DB) int64 {
 	if days <= 0 {
 		return 0
 	}
 	cutoff := now - int64(days)*24*60*60*1000
-	tx := global.NAV_DB.Where(column+" < ?", cutoff).Delete(model)
+	db := global.NAV_DB.Where(column+" < ?", cutoff)
+	for _, scope := range scopes {
+		db = scope(db)
+	}
+	tx := db.Delete(model)
 	if tx.Error != nil {
 		global.NAV_LOG.Warn("navmesh retention delete failed", zap.String("column", column), zap.Error(tx.Error))
 		return 0
 	}
 	return tx.RowsAffected
+}
+
+func closedRows(db *gorm.DB) *gorm.DB {
+	return db.Where("status = ?", int(domains.StatusDisabled))
+}
+
+func retentionCleanupInterval() time.Duration {
+	interval := settingDuration("retention_cleanup_interval", 24*time.Hour)
+	if interval < retentionMinimumInterval {
+		return retentionMinimumInterval
+	}
+	return interval
 }
 
 func settingBool(key string, def bool) bool {
