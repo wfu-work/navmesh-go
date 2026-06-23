@@ -443,6 +443,34 @@ func TestReleasePublishedTemplateVariables(t *testing.T) {
 	assertVar(t, vars, "eventTitle", "边缘客户端版本已发布")
 }
 
+func TestDeviceOfflineTemplateVariables(t *testing.T) {
+	lastSeenAt := int64(1710000000000)
+	eventAt := int64(1710000600000)
+	device := &domains.Device{
+		BaseDataEntity: commonDomains.BaseDataEntity{Guid: "device-guid"},
+		Sncode:         "SN-001",
+		Alias:          "边缘站点",
+		DeviceType:     "ssh",
+		HostIP:         "192.168.1.10",
+		WanIP:          "203.0.113.10",
+		ClientVersion:  "v1.2.3",
+		LastSeenTime:   lastSeenAt,
+	}
+
+	vars := DeviceOfflineTemplateVariables(device, "设备心跳超过 300 秒未更新", eventAt)
+
+	assertVar(t, vars, "eventTitle", "设备离线")
+	assertVar(t, vars, "eventMessage", "设备心跳超过 300 秒未更新")
+	assertVar(t, vars, "deviceAlias", "边缘站点")
+	assertVar(t, vars, "deviceSncode", "SN-001")
+	assertVar(t, vars, "deviceType", "ssh")
+	assertVar(t, vars, "hostIp", "192.168.1.10")
+	assertVar(t, vars, "wanIp", "203.0.113.10")
+	assertVar(t, vars, "clientVersion", "v1.2.3")
+	assertVar(t, vars, "lastSeenTime", formatTemplateTime(lastSeenAt))
+	assertVar(t, vars, "time", formatTemplateTime(eventAt))
+}
+
 func TestDiskUsageHighTemplateVariables(t *testing.T) {
 	device := &domains.Device{
 		BaseDataEntity: commonDomains.BaseDataEntity{Guid: "device-guid"},

@@ -223,6 +223,31 @@ func TestInferNetworkTypeSupportsCellularWifiAndEthernet(t *testing.T) {
 	}
 }
 
+func TestDetectNetworkSignalTreatsWlanIfaceAsCellularWhenOnlyCellularSignalExists(t *testing.T) {
+	snapshot := detectNetworkSignalWithCollectors(
+		"wlan0",
+		func(iface string) (networkSnapshot, bool) {
+			return networkSnapshot{
+				NetworkType:  "cellular",
+				NetworkIface: iface,
+				CellularRSRP: -92,
+				CellularRSRQ: -10,
+				CellularSINR: 16,
+			}, true
+		},
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{}, false
+		},
+	)
+
+	if snapshot.NetworkType != "cellular" || snapshot.NetworkIface != "wlan0" {
+		t.Fatalf("detectNetworkSignalWithCollectors() = type=%q iface=%q, want cellular wlan0", snapshot.NetworkType, snapshot.NetworkIface)
+	}
+	if snapshot.CellularRSRP != -92 || snapshot.SignalDBM != -92 || snapshot.SignalPct == 0 {
+		t.Fatalf("detectNetworkSignalWithCollectors() cellular metrics = rsrp=%d signal=%d pct=%d, want derived cellular signal", snapshot.CellularRSRP, snapshot.SignalDBM, snapshot.SignalPct)
+	}
+}
+
 func TestNetworkSnapshotNormalizesSignalAndLinkMetrics(t *testing.T) {
 	snapshot := networkSnapshot{
 		NetworkType:   "4g",
@@ -242,6 +267,21 @@ func TestNetworkSnapshotNormalizesSignalAndLinkMetrics(t *testing.T) {
 	}
 	if snapshot.RXRateBps != 0 || snapshot.TXRateBps != 2048 {
 		t.Fatalf("normalized rates = rx=%d tx=%d", snapshot.RXRateBps, snapshot.TXRateBps)
+	}
+}
+
+func TestNetworkSnapshotDerivesSignalFromWifiRSSI(t *testing.T) {
+	snapshot := networkSnapshot{
+		NetworkType:  "wifi",
+		NetworkIface: "wlan0",
+		WifiRSSI:     -70,
+	}.normalized()
+
+	if snapshot.SignalDBM != -70 {
+		t.Fatalf("signalDbm = %d, want wifi rssi -70", snapshot.SignalDBM)
+	}
+	if snapshot.SignalPct != 66 {
+		t.Fatalf("signalPct = %d, want derived percent 66", snapshot.SignalPct)
 	}
 }
 

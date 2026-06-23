@@ -2077,23 +2077,36 @@ func collectNetworkSnapshot(ctx context.Context, cfg clientConfig, traffic traff
 }
 
 func detectNetworkSignal(iface string) networkSnapshot {
+	return detectNetworkSignalWithCollectors(iface, collectCellularSignal, collectWifiSignal)
+}
+
+func detectNetworkSignalWithCollectors(
+	iface string,
+	collectCellular func(string) (networkSnapshot, bool),
+	collectWifi func(string) (networkSnapshot, bool),
+) networkSnapshot {
 	iface = strings.TrimSpace(iface)
 	if isCellularTrafficInterface(iface) {
-		if snapshot, ok := collectCellularSignal(iface); ok {
+		if snapshot, ok := collectCellular(iface); ok {
 			return snapshot.normalized()
 		}
 		return networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
 	}
 	if isWifiInterface(iface) {
-		if snapshot, ok := collectWifiSignal(iface); ok {
+		if snapshot, ok := collectWifi(iface); ok {
+			return snapshot.normalized()
+		}
+		// Some 4G modules expose their traffic on wlan-style interface names.
+		// If WiFi signal collection has no evidence, let cellular collectors decide.
+		if snapshot, ok := collectCellular(iface); ok {
 			return snapshot.normalized()
 		}
 		return networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
 	}
-	if snapshot, ok := collectCellularSignal(""); ok {
+	if snapshot, ok := collectCellular(""); ok {
 		return snapshot.normalized()
 	}
-	if snapshot, ok := collectWifiSignal(""); ok {
+	if snapshot, ok := collectWifi(""); ok {
 		return snapshot.normalized()
 	}
 	return networkSnapshot{NetworkType: inferNetworkType(iface), NetworkIface: iface}
@@ -2191,6 +2204,9 @@ func collectWifiSignal(iface string) (networkSnapshot, bool) {
 	if snapshot, ok := collectWifiSignalIW(iface); ok {
 		return snapshot, true
 	}
+	if snapshot, ok := collectWifiSignalIWConfig(iface); ok {
+		return snapshot, true
+	}
 	return networkSnapshot{}, false
 }
 
@@ -2254,6 +2270,41 @@ func collectWifiSignalIW(iface string) (networkSnapshot, bool) {
 		snapshot.SignalPct = signalPercentFromDBM(rssi)
 	}
 	return snapshot, snapshot.SignalDBM != 0 || snapshot.WifiSSID != ""
+}
+
+func collectWifiSignalIWConfig(iface string) (networkSnapshot, bool) {
+	if _, err := exec.LookPath("iwconfig"); err != nil {
+		return networkSnapshot{}, false
+	}
+	args := []string{}
+	if iface != "" {
+		args = append(args, iface)
+	}
+	out, err := runCommandOutput(1200*time.Millisecond, "iwconfig", args...)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return networkSnapshot{}, false
+	}
+	if iface == "" {
+		iface = firstRegexSubmatch(out, `(?m)^(\S+)\s+IEEE`)
+	}
+	snapshot := networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
+	snapshot.WifiSSID = firstRegexSubmatch(out, `ESSID:"([^"]*)"`)
+	rssi := firstIntRegex(out, `(?i)Signal level[=:\s]+(-?\d+)`)
+	if rssi != 0 {
+		snapshot.SignalDBM = rssi
+		snapshot.WifiRSSI = rssi
+		snapshot.SignalPct = signalPercentFromDBM(rssi)
+	}
+	if snapshot.SignalPct == 0 {
+		snapshot.SignalPct = firstIntRegex(out, `(?i)Link Quality[=:\s]+(\d+)\s*/\s*100`)
+	}
+	if snapshot.SignalPct == 0 {
+		quality := firstIntRegex(out, `(?i)Link Quality[=:\s]+(\d+)\s*/\s*70`)
+		if quality > 0 {
+			snapshot.SignalPct = quality * 100 / 70
+		}
+	}
+	return snapshot, snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 || snapshot.WifiSSID != ""
 }
 
 func cellularDevicePath(iface string) string {

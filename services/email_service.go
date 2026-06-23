@@ -80,6 +80,10 @@ type EmailRecipientInput struct {
 	Email string
 }
 
+var sendTemplateEmail = func(s EmailService, input EmailTemplateInput) (*EmailSendResult, error) {
+	return s.SendTemplate(input)
+}
+
 func (s EmailService) SendHTML(input EmailHTMLSendInput) (*EmailSendResult, error) {
 	subject := strings.TrimSpace(input.Subject)
 	if subject == "" {
@@ -400,7 +404,7 @@ func (s EmailService) NotifyReleasePublished(release *domains.Release, downloadU
 	}
 	title := ReleasePublishedTitle(release)
 	variables := ReleasePublishedTemplateVariables(release, downloadURL)
-	result, err := s.SendTemplate(EmailTemplateInput{
+	result, err := sendTemplateEmail(s, EmailTemplateInput{
 		Code:      TemplateCodeReleasePublished,
 		Title:     title,
 		Variables: variables,
@@ -420,12 +424,37 @@ func (s EmailService) NotifyReleasePublished(release *domains.Release, downloadU
 	}
 }
 
+func (s EmailService) NotifyDeviceOffline(device *domains.Device, message string, now int64) {
+	if device == nil {
+		return
+	}
+	variables := DeviceOfflineTemplateVariables(device, message, now)
+	result, err := sendTemplateEmail(s, EmailTemplateInput{
+		Code:      TemplateCodeDeviceOfflineNotice,
+		Title:     "设备离线通知",
+		Variables: variables,
+	})
+	if err != nil {
+		if global.NAV_LOG != nil {
+			fields := []zap.Field{zap.String("deviceGuid", device.Guid), zap.Error(err)}
+			if result != nil {
+				fields = append(fields, zap.Int("successes", result.Successes), zap.Int("failures", result.Failures))
+			}
+			global.NAV_LOG.Warn("send device offline email failed", fields...)
+		}
+		return
+	}
+	if global.NAV_LOG != nil {
+		global.NAV_LOG.Info("send device offline email success", zap.String("deviceGuid", device.Guid), zap.Int("recipients", result.Recipients), zap.Int("successes", result.Successes))
+	}
+}
+
 func (s EmailService) NotifyDiskUsageHigh(device *domains.Device, req HeartbeatRequest, message string, now int64) {
 	if device == nil {
 		return
 	}
 	variables := DiskUsageHighTemplateVariables(device, req, message, now)
-	result, err := s.SendTemplate(EmailTemplateInput{
+	result, err := sendTemplateEmail(s, EmailTemplateInput{
 		Code:      TemplateCodeDiskUsageHighNotice,
 		Title:     "磁盘阈值通知",
 		Variables: variables,

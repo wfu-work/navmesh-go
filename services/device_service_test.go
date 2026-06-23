@@ -42,6 +42,7 @@ func TestRecordDailyDiskUsageEventLimitsOnePerDay(t *testing.T) {
 }
 
 func TestRecordStaleOfflineEventsWaitsForDelayAndDedupes(t *testing.T) {
+	stubTemplateEmailSender(t, nil)
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
@@ -110,6 +111,61 @@ func TestRecordStaleOfflineEventsWaitsForDelayAndDedupes(t *testing.T) {
 		t.Fatalf("created suppressed flap event = %d, want 0", created)
 	}
 	assertOfflineEventCount(t, db, stale.Guid, 1)
+}
+
+func TestRecordStaleOfflineEventsSendsDeviceOfflineEmail(t *testing.T) {
+	emails := make(chan EmailTemplateInput, 1)
+	stubTemplateEmailSender(t, emails)
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}, &domains.Event{}); err != nil {
+		t.Fatalf("migrate tables: %v", err)
+	}
+
+	service := ServiceGroupApp.DeviceService.WithDB(db)
+	stale := domains.Device{
+		Sncode:        "mail-offline",
+		Alias:         "邮件离线设备",
+		DeviceType:    "ssh",
+		Status:        domains.DeviceStatusOffline,
+		LastSeenTime:  domains.NowMilli() - 10*time.Minute.Milliseconds(),
+		ClientVersion: "v0.0.5",
+	}
+	if err := db.Create(&stale).Error; err != nil {
+		t.Fatalf("seed stale device: %v", err)
+	}
+
+	created, err := service.RecordStaleOfflineEvents(300 * time.Second)
+	if err != nil {
+		t.Fatalf("record offline events: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created events = %d, want 1", created)
+	}
+	input := waitForTemplateEmail(t, emails)
+	if input.Code != TemplateCodeDeviceOfflineNotice {
+		t.Fatalf("email template code = %q, want %q", input.Code, TemplateCodeDeviceOfflineNotice)
+	}
+	assertVar(t, input.Variables, "deviceAlias", "邮件离线设备")
+	assertVar(t, input.Variables, "deviceSncode", "mail-offline")
+	if input.Variables["lastSeenTime"] == "" || input.Variables["lastSeenTime"] == "-" {
+		t.Fatalf("lastSeenTime variable = %q, want formatted time", input.Variables["lastSeenTime"])
+	}
+
+	created, err = service.RecordStaleOfflineEvents(300 * time.Second)
+	if err != nil {
+		t.Fatalf("record offline events again: %v", err)
+	}
+	if created != 0 {
+		t.Fatalf("created duplicate events = %d, want 0", created)
+	}
+	select {
+	case extra := <-emails:
+		t.Fatalf("unexpected duplicate offline email: %#v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func TestTouchOnlineRefreshesLastSeenAndStatus(t *testing.T) {
@@ -292,6 +348,20 @@ func TestHeartbeatRecordsNetworkQualitySnapshot(t *testing.T) {
 	}
 }
 
+func TestNetworkSnapshotDerivesSignalFromWifiRSSI(t *testing.T) {
+	snapshot := networkSnapshotFromHeartbeat(HeartbeatRequest{
+		NetworkType:  "wifi",
+		NetworkIface: "wlan0",
+		WifiRSSI:     -70,
+	})
+	if snapshot.SignalDBM != -70 {
+		t.Fatalf("signalDbm = %d, want wifi rssi -70", snapshot.SignalDBM)
+	}
+	if snapshot.SignalPct != 66 {
+		t.Fatalf("signalPct = %d, want derived percent 66", snapshot.SignalPct)
+	}
+}
+
 func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -367,5 +437,30 @@ func assertDiskUsageEventCount(t *testing.T, db *gorm.DB, deviceGuid string, wan
 	}
 	if count != want {
 		t.Fatalf("disk usage event count = %d, want %d", count, want)
+	}
+}
+
+func stubTemplateEmailSender(t *testing.T, emails chan<- EmailTemplateInput) {
+	t.Helper()
+	previous := sendTemplateEmail
+	sendTemplateEmail = func(_ EmailService, input EmailTemplateInput) (*EmailSendResult, error) {
+		if emails != nil {
+			emails <- input
+		}
+		return &EmailSendResult{Recipients: 1, Successes: 1, Subject: input.Title}, nil
+	}
+	t.Cleanup(func() {
+		sendTemplateEmail = previous
+	})
+}
+
+func waitForTemplateEmail(t *testing.T, emails <-chan EmailTemplateInput) EmailTemplateInput {
+	t.Helper()
+	select {
+	case input := <-emails:
+		return input
+	case <-time.After(time.Second):
+		t.Fatal("expected offline email")
+		return EmailTemplateInput{}
 	}
 }

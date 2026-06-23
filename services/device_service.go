@@ -856,6 +856,7 @@ func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, e
 			continue
 		}
 		created++
+		go ServiceGroupApp.EmailService.NotifyDeviceOffline(&device, message, now)
 	}
 	return created, nil
 }
@@ -1123,6 +1124,12 @@ func normalizeHeartbeatNetworkSnapshot(snapshot heartbeatNetworkSnapshot) heartb
 	if snapshot.SignalPct > 100 {
 		snapshot.SignalPct = 100
 	}
+	if snapshot.SignalPct == 0 {
+		snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP, snapshot.WifiRSSI))
+	}
+	if snapshot.SignalDBM == 0 {
+		snapshot.SignalDBM = firstNonZeroInt(snapshot.WifiRSSI, snapshot.CellularRSRP)
+	}
 	if snapshot.PingLatencyMs < 0 {
 		snapshot.PingLatencyMs = 0
 	}
@@ -1139,6 +1146,29 @@ func normalizeHeartbeatNetworkSnapshot(snapshot heartbeatNetworkSnapshot) heartb
 		snapshot.TXRateBps = 0
 	}
 	return snapshot
+}
+
+func signalPercentFromDBM(dbm int) int {
+	if dbm == 0 {
+		return 0
+	}
+	switch {
+	case dbm <= -110:
+		return 0
+	case dbm >= -50:
+		return 100
+	default:
+		return (dbm + 110) * 100 / 60
+	}
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func normalizeNetworkType(value string) string {
