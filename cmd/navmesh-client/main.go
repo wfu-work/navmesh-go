@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -179,9 +181,39 @@ type trafficSnapshot struct {
 	SampleTime int64
 }
 
+type networkSnapshot struct {
+	NetworkType   string
+	NetworkIface  string
+	SignalDBM     int
+	SignalPct     int
+	CellularRSRP  int
+	CellularRSRQ  int
+	CellularSINR  int
+	WifiSSID      string
+	WifiRSSI      int
+	PingTarget    string
+	PingLatencyMs int64
+	PingLossPct   float64
+	RXRateBps     int64
+	TXRateBps     int64
+}
+
+type trafficRateState struct {
+	Interface  string
+	RXBytes    int64
+	TXBytes    int64
+	SampleTime int64
+	BootID     string
+}
+
 var upgradeState = struct {
 	sync.Mutex
 	taskGuid string
+}{}
+
+var networkQualityState = struct {
+	sync.Mutex
+	traffic trafficRateState
 }{}
 
 var vpnRestartState = struct {
@@ -495,8 +527,9 @@ func backoffDelay(cfg clientConfig, failures int) time.Duration {
 func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error) {
 	snapshot := collectSystemSnapshot()
 	traffic := collectTrafficSnapshot(cfg.TrafficIface)
+	network := collectNetworkSnapshot(ctx, cfg, traffic)
 	log.Printf(
-		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s wanIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s traffic=%s",
+		"registering device api=%s sncode=%s type=%s alias=%s hostname=%s hostIp=%s wanIp=%s os=%s kernel=%s memoryUsed=%d diskUsed=%d sshPort=%d webPort=%d auth=%s traffic=%s network=%s",
 		cfg.API,
 		cfg.Sncode,
 		cfg.DeviceType,
@@ -512,6 +545,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 		cfg.WebPort,
 		cfg.authMode(),
 		traffic.logFields(),
+		network.logFields(),
 	)
 	body := map[string]any{
 		"token":         cfg.authToken(),
@@ -530,6 +564,7 @@ func registerDevice(ctx context.Context, cfg clientConfig) (clientConfig, error)
 	}
 	snapshot.addTo(body)
 	traffic.addTo(body)
+	network.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -1089,6 +1124,7 @@ func heartbeatRoundTripTimeout(cfg clientConfig) time.Duration {
 func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	snapshot := collectSystemSnapshot()
 	traffic := collectTrafficSnapshot(cfg.TrafficIface)
+	network := collectNetworkSnapshot(ctx, cfg, traffic)
 	body := map[string]any{
 		"token":         cfg.authToken(),
 		"guid":          cfg.DeviceGuid,
@@ -1100,6 +1136,7 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 	}
 	snapshot.addTo(body)
 	traffic.addTo(body)
+	network.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -2019,6 +2056,501 @@ func (snapshot trafficSnapshot) logFields() string {
 		formatBytes(snapshot.RXBytes),
 		formatBytes(snapshot.TXBytes),
 	)
+}
+
+func collectNetworkSnapshot(ctx context.Context, cfg clientConfig, traffic trafficSnapshot) networkSnapshot {
+	snapshot := detectNetworkSignal(traffic.Interface)
+	if snapshot.NetworkIface == "" {
+		snapshot.NetworkIface = strings.TrimSpace(traffic.Interface)
+	}
+	if snapshot.NetworkType == "" {
+		snapshot.NetworkType = inferNetworkType(snapshot.NetworkIface)
+	}
+	rxRate, txRate := updateTrafficRates(traffic)
+	snapshot.RXRateBps = rxRate
+	snapshot.TXRateBps = txRate
+	target, latency, loss := probeHeartbeatLatency(ctx, cfg)
+	snapshot.PingTarget = target
+	snapshot.PingLatencyMs = latency
+	snapshot.PingLossPct = loss
+	return snapshot.normalized()
+}
+
+func detectNetworkSignal(iface string) networkSnapshot {
+	iface = strings.TrimSpace(iface)
+	if isCellularTrafficInterface(iface) {
+		if snapshot, ok := collectCellularSignal(iface); ok {
+			return snapshot.normalized()
+		}
+		return networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+	}
+	if isWifiInterface(iface) {
+		if snapshot, ok := collectWifiSignal(iface); ok {
+			return snapshot.normalized()
+		}
+		return networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
+	}
+	if snapshot, ok := collectCellularSignal(""); ok {
+		return snapshot.normalized()
+	}
+	if snapshot, ok := collectWifiSignal(""); ok {
+		return snapshot.normalized()
+	}
+	return networkSnapshot{NetworkType: inferNetworkType(iface), NetworkIface: iface}
+}
+
+func collectCellularSignal(iface string) (networkSnapshot, bool) {
+	for _, collector := range []func(string) (networkSnapshot, bool){
+		collectCellularSignalMMCLI,
+		collectCellularSignalQMICLI,
+		collectCellularSignalUQMI,
+	} {
+		if snapshot, ok := collector(iface); ok {
+			if snapshot.NetworkIface == "" {
+				snapshot.NetworkIface = iface
+			}
+			snapshot.NetworkType = "cellular"
+			return snapshot, true
+		}
+	}
+	return networkSnapshot{}, false
+}
+
+func collectCellularSignalMMCLI(iface string) (networkSnapshot, bool) {
+	if _, err := exec.LookPath("mmcli"); err != nil {
+		return networkSnapshot{}, false
+	}
+	modem := "0"
+	if out, err := runCommandOutput(1200*time.Millisecond, "mmcli", "-L"); err == nil {
+		if parsed := firstRegexSubmatch(out, `/Modem/([0-9]+)`); parsed != "" {
+			modem = parsed
+		}
+	}
+	out, err := runCommandOutput(1500*time.Millisecond, "mmcli", "-m", modem, "--signal-get")
+	if err != nil || strings.TrimSpace(out) == "" {
+		out, err = runCommandOutput(1500*time.Millisecond, "mmcli", "-m", modem)
+		if err != nil {
+			return networkSnapshot{}, false
+		}
+	}
+	snapshot := networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+	snapshot.SignalDBM = firstIntRegex(out, `(?i)(?:rssi)[^-\d]*(-?\d+)`)
+	snapshot.CellularRSRP = firstIntRegex(out, `(?i)(?:rsrp)[^-\d]*(-?\d+)`)
+	snapshot.CellularRSRQ = firstIntRegex(out, `(?i)(?:rsrq)[^-\d]*(-?\d+)`)
+	snapshot.CellularSINR = firstIntRegex(out, `(?i)(?:sinr|snr)[^-\d]*(-?\d+)`)
+	snapshot.SignalPct = firstIntRegex(out, `(?i)(?:signal quality|quality)[^0-9]+(\d+)\s*%`)
+	if snapshot.SignalPct == 0 {
+		snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP))
+	}
+	return snapshot, snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 || snapshot.CellularRSRP != 0
+}
+
+func collectCellularSignalQMICLI(iface string) (networkSnapshot, bool) {
+	if _, err := exec.LookPath("qmicli"); err != nil || iface == "" {
+		return networkSnapshot{}, false
+	}
+	device := cellularDevicePath(iface)
+	out, err := runCommandOutput(1500*time.Millisecond, "qmicli", "-d", device, "--nas-get-signal-strength")
+	if err != nil {
+		return networkSnapshot{}, false
+	}
+	snapshot := networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+	snapshot.SignalDBM = firstIntRegex(out, `(?i)(?:rssi)[^-\d]*(-?\d+)`)
+	snapshot.CellularRSRP = firstIntRegex(out, `(?i)(?:rsrp)[^-\d]*(-?\d+)`)
+	snapshot.CellularRSRQ = firstIntRegex(out, `(?i)(?:rsrq)[^-\d]*(-?\d+)`)
+	snapshot.CellularSINR = firstIntRegex(out, `(?i)(?:sinr|snr)[^-\d]*(-?\d+)`)
+	snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP))
+	return snapshot, snapshot.SignalDBM != 0 || snapshot.CellularRSRP != 0
+}
+
+func collectCellularSignalUQMI(iface string) (networkSnapshot, bool) {
+	if _, err := exec.LookPath("uqmi"); err != nil || iface == "" {
+		return networkSnapshot{}, false
+	}
+	device := cellularDevicePath(iface)
+	snapshot := networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+	if out, err := runCommandOutput(1500*time.Millisecond, "uqmi", "-d", device, "--get-signal-info"); err == nil {
+		snapshot.SignalDBM = firstIntRegex(out, `(?i)(?:rssi)[^-\d]*(-?\d+)`)
+		snapshot.CellularRSRP = firstIntRegex(out, `(?i)(?:rsrp)[^-\d]*(-?\d+)`)
+		snapshot.CellularRSRQ = firstIntRegex(out, `(?i)(?:rsrq)[^-\d]*(-?\d+)`)
+		snapshot.CellularSINR = firstIntRegex(out, `(?i)(?:sinr|snr)[^-\d]*(-?\d+)`)
+	}
+	if snapshot.SignalDBM == 0 {
+		if out, err := runCommandOutput(1500*time.Millisecond, "uqmi", "-d", device, "--get-signal-strength"); err == nil {
+			snapshot.SignalDBM = firstIntRegex(out, `(-?\d+)`)
+		}
+	}
+	snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP))
+	return snapshot, snapshot.SignalDBM != 0 || snapshot.CellularRSRP != 0
+}
+
+func collectWifiSignal(iface string) (networkSnapshot, bool) {
+	if snapshot, ok := collectWifiSignalProc(iface); ok {
+		return snapshot, true
+	}
+	if snapshot, ok := collectWifiSignalIW(iface); ok {
+		return snapshot, true
+	}
+	return networkSnapshot{}, false
+}
+
+func collectWifiSignalProc(iface string) (networkSnapshot, bool) {
+	if runtime.GOOS != "linux" {
+		return networkSnapshot{}, false
+	}
+	data, err := os.ReadFile("/proc/net/wireless")
+	if err != nil {
+		return networkSnapshot{}, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		name, rest, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if iface != "" && name != iface {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) < 3 {
+			continue
+		}
+		level := parseFloat(strings.Trim(fields[2], "."))
+		rssi := int(math.Round(level))
+		if rssi > 0 {
+			rssi -= 256
+		}
+		return networkSnapshot{
+			NetworkType:  "wifi",
+			NetworkIface: name,
+			SignalDBM:    rssi,
+			SignalPct:    signalPercentFromDBM(rssi),
+			WifiRSSI:     rssi,
+		}, true
+	}
+	return networkSnapshot{}, false
+}
+
+func collectWifiSignalIW(iface string) (networkSnapshot, bool) {
+	if _, err := exec.LookPath("iw"); err != nil {
+		return networkSnapshot{}, false
+	}
+	if iface == "" {
+		if out, err := runCommandOutput(1200*time.Millisecond, "iw", "dev"); err == nil {
+			if parsed := firstRegexSubmatch(out, `Interface\s+(\S+)`); parsed != "" {
+				iface = parsed
+			}
+		}
+	}
+	if iface == "" {
+		return networkSnapshot{}, false
+	}
+	snapshot := networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
+	if out, err := runCommandOutput(1200*time.Millisecond, "iw", "dev", iface, "link"); err == nil {
+		snapshot.WifiSSID = firstRegexSubmatch(out, `(?m)^\s*SSID:\s*(.+?)\s*$`)
+		rssi := firstIntRegex(out, `(?i)signal:\s*(-?\d+)`)
+		snapshot.SignalDBM = rssi
+		snapshot.WifiRSSI = rssi
+		snapshot.SignalPct = signalPercentFromDBM(rssi)
+	}
+	return snapshot, snapshot.SignalDBM != 0 || snapshot.WifiSSID != ""
+}
+
+func cellularDevicePath(iface string) string {
+	if iface != "" {
+		for _, candidate := range []string{"/dev/cdc-wdm" + trailingDigits(iface), "/dev/cdc-wdm0"} {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+	return "/dev/cdc-wdm0"
+}
+
+func trailingDigits(value string) string {
+	i := len(value)
+	for i > 0 && value[i-1] >= '0' && value[i-1] <= '9' {
+		i--
+	}
+	if i == len(value) {
+		return "0"
+	}
+	return value[i:]
+}
+
+func updateTrafficRates(traffic trafficSnapshot) (int64, int64) {
+	if traffic.Interface == "" || traffic.SampleTime <= 0 {
+		return 0, 0
+	}
+	networkQualityState.Lock()
+	defer networkQualityState.Unlock()
+	prev := networkQualityState.traffic
+	networkQualityState.traffic = trafficRateState{
+		Interface:  traffic.Interface,
+		RXBytes:    traffic.RXBytes,
+		TXBytes:    traffic.TXBytes,
+		SampleTime: traffic.SampleTime,
+		BootID:     traffic.BootID,
+	}
+	if prev.Interface != traffic.Interface || prev.SampleTime <= 0 {
+		return 0, 0
+	}
+	if prev.BootID != "" && traffic.BootID != "" && prev.BootID != traffic.BootID {
+		return 0, 0
+	}
+	elapsedMs := traffic.SampleTime - prev.SampleTime
+	if elapsedMs <= 0 {
+		return 0, 0
+	}
+	rxDelta := traffic.RXBytes - prev.RXBytes
+	txDelta := traffic.TXBytes - prev.TXBytes
+	if rxDelta < 0 || txDelta < 0 {
+		return 0, 0
+	}
+	return bytesPerIntervalToBps(rxDelta, elapsedMs), bytesPerIntervalToBps(txDelta, elapsedMs)
+}
+
+func bytesPerIntervalToBps(bytesValue int64, elapsedMs int64) int64 {
+	if bytesValue <= 0 || elapsedMs <= 0 {
+		return 0
+	}
+	return bytesValue * 8 * 1000 / elapsedMs
+}
+
+func probeHeartbeatLatency(ctx context.Context, cfg clientConfig) (string, int64, float64) {
+	target := heartbeatProbeTarget(cfg)
+	if target == "" {
+		return "", 0, 0
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, minDuration(cfg.RequestTimeout, 3*time.Second))
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, target, nil)
+	if err != nil {
+		return target, 0, 100
+	}
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return target, 0, 100
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	_ = resp.Body.Close()
+	return target, time.Since(start).Milliseconds(), 0
+}
+
+func heartbeatProbeTarget(cfg clientConfig) string {
+	base := strings.TrimSpace(cfg.API)
+	if base == "" {
+		return ""
+	}
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.Path = "/api/device/heartbeat"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func (snapshot networkSnapshot) addTo(body map[string]any) {
+	snapshot = snapshot.normalized()
+	if snapshot.NetworkType != "" {
+		body["networkType"] = snapshot.NetworkType
+	}
+	if snapshot.NetworkIface != "" {
+		body["networkIface"] = snapshot.NetworkIface
+	}
+	if snapshot.SignalDBM != 0 {
+		body["signalDbm"] = snapshot.SignalDBM
+	}
+	if snapshot.SignalPct > 0 {
+		body["signalPct"] = snapshot.SignalPct
+	}
+	if snapshot.CellularRSRP != 0 {
+		body["cellularRsrp"] = snapshot.CellularRSRP
+	}
+	if snapshot.CellularRSRQ != 0 {
+		body["cellularRsrq"] = snapshot.CellularRSRQ
+	}
+	if snapshot.CellularSINR != 0 {
+		body["cellularSinr"] = snapshot.CellularSINR
+	}
+	if snapshot.WifiSSID != "" {
+		body["wifiSsid"] = snapshot.WifiSSID
+	}
+	if snapshot.WifiRSSI != 0 {
+		body["wifiRssi"] = snapshot.WifiRSSI
+	}
+	if snapshot.PingTarget != "" {
+		body["pingTarget"] = snapshot.PingTarget
+	}
+	if snapshot.PingLatencyMs > 0 {
+		body["pingLatencyMs"] = snapshot.PingLatencyMs
+	}
+	if snapshot.PingLossPct > 0 {
+		body["pingLossPct"] = snapshot.PingLossPct
+	}
+	if snapshot.RXRateBps > 0 {
+		body["rxRateBps"] = snapshot.RXRateBps
+	}
+	if snapshot.TXRateBps > 0 {
+		body["txRateBps"] = snapshot.TXRateBps
+	}
+}
+
+func (snapshot networkSnapshot) logFields() string {
+	snapshot = snapshot.normalized()
+	if snapshot.NetworkType == "" && snapshot.NetworkIface == "" {
+		return "unknown"
+	}
+	return fmt.Sprintf(
+		"type=%s iface=%s signal=%ddBm/%d%% ping=%dms rxRate=%s/s txRate=%s/s",
+		valueOrDash(snapshot.NetworkType),
+		valueOrDash(snapshot.NetworkIface),
+		snapshot.SignalDBM,
+		snapshot.SignalPct,
+		snapshot.PingLatencyMs,
+		formatBytes(snapshot.RXRateBps/8),
+		formatBytes(snapshot.TXRateBps/8),
+	)
+}
+
+func (snapshot networkSnapshot) normalized() networkSnapshot {
+	snapshot.NetworkType = normalizeNetworkType(snapshot.NetworkType)
+	snapshot.NetworkIface = strings.TrimSpace(snapshot.NetworkIface)
+	snapshot.WifiSSID = strings.TrimSpace(snapshot.WifiSSID)
+	snapshot.PingTarget = strings.TrimSpace(snapshot.PingTarget)
+	if snapshot.SignalPct < 0 {
+		snapshot.SignalPct = 0
+	}
+	if snapshot.SignalPct > 100 {
+		snapshot.SignalPct = 100
+	}
+	if snapshot.SignalPct == 0 {
+		snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP, snapshot.WifiRSSI))
+	}
+	if snapshot.SignalDBM == 0 {
+		snapshot.SignalDBM = firstNonZeroInt(snapshot.WifiRSSI, snapshot.CellularRSRP)
+	}
+	if snapshot.PingLatencyMs < 0 {
+		snapshot.PingLatencyMs = 0
+	}
+	if snapshot.PingLossPct < 0 {
+		snapshot.PingLossPct = 0
+	}
+	if snapshot.PingLossPct > 100 {
+		snapshot.PingLossPct = 100
+	}
+	if snapshot.RXRateBps < 0 {
+		snapshot.RXRateBps = 0
+	}
+	if snapshot.TXRateBps < 0 {
+		snapshot.TXRateBps = 0
+	}
+	return snapshot
+}
+
+func inferNetworkType(iface string) string {
+	iface = strings.ToLower(strings.TrimSpace(iface))
+	switch {
+	case iface == "":
+		return ""
+	case isCellularTrafficInterface(iface):
+		return "cellular"
+	case isWifiInterface(iface):
+		return "wifi"
+	case strings.HasPrefix(iface, "eth") || strings.HasPrefix(iface, "en"):
+		return "ethernet"
+	default:
+		return "unknown"
+	}
+}
+
+func normalizeNetworkType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "cell", "cellular", "4g", "5g", "lte", "wwan", "mobile":
+		return "cellular"
+	case "wifi", "wi-fi", "wlan", "wireless":
+		return "wifi"
+	case "ethernet", "eth", "lan", "wired":
+		return "ethernet"
+	case "unknown":
+		return "unknown"
+	default:
+		return ""
+	}
+}
+
+func isWifiInterface(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.HasPrefix(name, "wl") || strings.HasPrefix(name, "wlan") || strings.Contains(name, "wifi")
+}
+
+func signalPercentFromDBM(dbm int) int {
+	if dbm == 0 {
+		return 0
+	}
+	switch {
+	case dbm <= -110:
+		return 0
+	case dbm >= -50:
+		return 100
+	default:
+		return (dbm + 110) * 100 / 60
+	}
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func runCommandOutput(timeout time.Duration, name string, args ...string) (string, error) {
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func firstRegexSubmatch(value string, pattern string) string {
+	matches := regexp.MustCompile(pattern).FindStringSubmatch(value)
+	if len(matches) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(matches[1])
+}
+
+func firstIntRegex(value string, pattern string) int {
+	match := firstRegexSubmatch(value, pattern)
+	if match == "" {
+		return 0
+	}
+	parsed, _ := strconv.Atoi(strings.TrimSpace(match))
+	return parsed
+}
+
+func parseFloat(value string) float64 {
+	parsed, _ := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	return parsed
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
 }
 
 func selectTrafficInterface(preferredIface string) string {

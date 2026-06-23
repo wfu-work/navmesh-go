@@ -1,11 +1,15 @@
 package services
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"navmesh-go/domains"
+	"navmesh-go/utils"
 
+	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
+	"github.com/wfu-work/nav-common-go-lib/global"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -139,6 +143,152 @@ func TestTouchOnlineRefreshesLastSeenAndStatus(t *testing.T) {
 	}
 	if updated.LastSeenTime <= device.LastSeenTime {
 		t.Fatalf("lastSeenTime = %d, want newer than %d", updated.LastSeenTime, device.LastSeenTime)
+	}
+}
+
+func TestGetHydratesWebDomainsAndLastMetricAt(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}, &domains.DeviceToken{}, &domains.PortMapping{}, &domains.DeviceHeartbeat{}, &domains.DeviceTrafficState{}); err != nil {
+		t.Fatalf("migrate tables: %v", err)
+	}
+	device := domains.Device{
+		Sncode:    "device-detail-1",
+		Alias:     "device-detail-1",
+		WebDomain: "fallback.example.com",
+		Status:    domains.DeviceStatusOnline,
+	}
+	if err := db.Create(&device).Error; err != nil {
+		t.Fatalf("seed device: %v", err)
+	}
+	mappings := []domains.PortMapping{
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: 1000, UpdateTime: 1000},
+			DeviceGuid:     device.Guid,
+			PublicHost:     "old.example.com",
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: 3000, UpdateTime: 3000},
+			DeviceGuid:     device.Guid,
+			PublicHost:     "new.example.com",
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: 4000, UpdateTime: 4000},
+			DeviceGuid:     device.Guid,
+			PublicHost:     "disabled.example.com",
+			Status:         int(domains.StatusDisabled),
+		},
+	}
+	if err := db.Create(&mappings).Error; err != nil {
+		t.Fatalf("seed mappings: %v", err)
+	}
+	if err := db.Create(&domains.DeviceHeartbeat{DeviceGuid: device.Guid, CreateTime: 2000}).Error; err != nil {
+		t.Fatalf("seed heartbeat: %v", err)
+	}
+	if err := db.Create(&domains.DeviceTrafficState{DeviceGuid: device.Guid, Interface: "wwan0", SampleTime: 5000, UpdateTime: 4500}).Error; err != nil {
+		t.Fatalf("seed traffic state: %v", err)
+	}
+
+	detail, err := ServiceGroupApp.DeviceService.WithDB(db).Get(device.Guid)
+	if err != nil {
+		t.Fatalf("get device detail: %v", err)
+	}
+	if detail.Device.WebDomain != "new.example.com, old.example.com" {
+		t.Fatalf("webDomain = %q, want enabled mapping domains ordered by update time", detail.Device.WebDomain)
+	}
+	if got := strings.Join(detail.Device.WebDomains, ","); got != "new.example.com,old.example.com" {
+		t.Fatalf("webDomains = %q", got)
+	}
+	if detail.Device.LastMetricAt != 5000 {
+		t.Fatalf("lastMetricAt = %d, want latest metric sample 5000", detail.Device.LastMetricAt)
+	}
+}
+
+func TestHeartbeatRecordsNetworkQualitySnapshot(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}, &domains.DeviceGroup{}, &domains.DeviceToken{}, &domains.DeviceHeartbeat{}, &domains.DeviceTrafficState{}, &domains.DeviceTrafficDaily{}, &domains.Event{}); err != nil {
+		t.Fatalf("migrate tables: %v", err)
+	}
+	oldDB := global.NAV_DB
+	global.NAV_DB = db
+	t.Cleanup(func() {
+		global.NAV_DB = oldDB
+	})
+	if err := db.Create(&domains.DeviceGroup{
+		Key:    "ssh",
+		Name:   "SSH",
+		Status: int(domains.StatusEnabled),
+	}).Error; err != nil {
+		t.Fatalf("seed device group: %v", err)
+	}
+
+	device := domains.Device{
+		Sncode:     "device-network-1",
+		Alias:      "device-network-1",
+		DeviceType: "ssh",
+		Status:     domains.DeviceStatusOnline,
+	}
+	if err := db.Create(&device).Error; err != nil {
+		t.Fatalf("seed device: %v", err)
+	}
+	token := "device-token"
+	if err := db.Create(&domains.DeviceToken{
+		DeviceGuid: device.Guid,
+		Token:      token,
+		TokenHash:  utils.HashToken(token),
+		Name:       "test",
+		Status:     domains.DeviceTokenStatusEnabled,
+	}).Error; err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+
+	req := HeartbeatRequest{
+		Guid:          device.Guid,
+		Token:         token,
+		NetworkType:   "4g",
+		NetworkIface:  "wwan0",
+		SignalDBM:     -82,
+		SignalPct:     120,
+		CellularRSRP:  -95,
+		CellularRSRQ:  -11,
+		CellularSINR:  18,
+		PingTarget:    "https://api.example.com/api/device/heartbeat",
+		PingLatencyMs: 37,
+		PingLossPct:   -1,
+		RXRateBps:     120000,
+		TXRateBps:     34000,
+	}
+	if _, err := ServiceGroupApp.DeviceService.WithDB(db).Heartbeat(req, "198.51.100.10"); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	var updated domains.Device
+	if err := db.Where("guid = ?", device.Guid).First(&updated).Error; err != nil {
+		t.Fatalf("load device: %v", err)
+	}
+	if updated.NetworkType != "cellular" || updated.NetworkIface != "wwan0" || updated.SignalDBM != -82 || updated.SignalPct != 100 {
+		t.Fatalf("device network snapshot = %+v, want normalized cellular wwan0 signal", updated)
+	}
+	if updated.CellularRSRP != -95 || updated.CellularRSRQ != -11 || updated.CellularSINR != 18 {
+		t.Fatalf("device cellular metrics = rsrp=%d rsrq=%d sinr=%d", updated.CellularRSRP, updated.CellularRSRQ, updated.CellularSINR)
+	}
+	if updated.PingLatencyMs != 37 || updated.PingLossPct != 0 || updated.RXRateBps != 120000 || updated.TXRateBps != 34000 {
+		t.Fatalf("device link metrics = latency=%d loss=%.1f rx=%d tx=%d", updated.PingLatencyMs, updated.PingLossPct, updated.RXRateBps, updated.TXRateBps)
+	}
+
+	var heartbeat domains.DeviceHeartbeat
+	if err := db.Where("device_guid = ?", device.Guid).First(&heartbeat).Error; err != nil {
+		t.Fatalf("load heartbeat: %v", err)
+	}
+	if heartbeat.NetworkType != "cellular" || heartbeat.SignalPct != 100 || heartbeat.RXRateBps != 120000 {
+		t.Fatalf("heartbeat network snapshot = %+v", heartbeat)
 	}
 }
 

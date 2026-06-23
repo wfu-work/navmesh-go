@@ -61,6 +61,20 @@ type RegisterDeviceRequest struct {
 	DiskUsed          int64   `json:"diskUsed"`
 	DiskFree          int64   `json:"diskFree"`
 	DiskUsedPct       float64 `json:"diskUsedPct"`
+	NetworkType       string  `json:"networkType"`
+	NetworkIface      string  `json:"networkIface"`
+	SignalDBM         int     `json:"signalDbm"`
+	SignalPct         int     `json:"signalPct"`
+	CellularRSRP      int     `json:"cellularRsrp"`
+	CellularRSRQ      int     `json:"cellularRsrq"`
+	CellularSINR      int     `json:"cellularSinr"`
+	WifiSSID          string  `json:"wifiSsid"`
+	WifiRSSI          int     `json:"wifiRssi"`
+	PingTarget        string  `json:"pingTarget"`
+	PingLatencyMs     int64   `json:"pingLatencyMs"`
+	PingLossPct       float64 `json:"pingLossPct"`
+	RXRateBps         int64   `json:"rxRateBps"`
+	TXRateBps         int64   `json:"txRateBps"`
 	TrafficIface      string  `json:"trafficIface"`
 	TrafficRXBytes    int64   `json:"trafficRxBytes"`
 	TrafficTXBytes    int64   `json:"trafficTxBytes"`
@@ -92,6 +106,20 @@ type HeartbeatRequest struct {
 	DiskUsed          int64   `json:"diskUsed"`
 	DiskFree          int64   `json:"diskFree"`
 	DiskUsedPct       float64 `json:"diskUsedPct"`
+	NetworkType       string  `json:"networkType"`
+	NetworkIface      string  `json:"networkIface"`
+	SignalDBM         int     `json:"signalDbm"`
+	SignalPct         int     `json:"signalPct"`
+	CellularRSRP      int     `json:"cellularRsrp"`
+	CellularRSRQ      int     `json:"cellularRsrq"`
+	CellularSINR      int     `json:"cellularSinr"`
+	WifiSSID          string  `json:"wifiSsid"`
+	WifiRSSI          int     `json:"wifiRssi"`
+	PingTarget        string  `json:"pingTarget"`
+	PingLatencyMs     int64   `json:"pingLatencyMs"`
+	PingLossPct       float64 `json:"pingLossPct"`
+	RXRateBps         int64   `json:"rxRateBps"`
+	TXRateBps         int64   `json:"txRateBps"`
 	TrafficIface      string  `json:"trafficIface"`
 	TrafficRXBytes    int64   `json:"trafficRxBytes"`
 	TrafficTXBytes    int64   `json:"trafficTxBytes"`
@@ -117,6 +145,16 @@ type DeviceStats struct {
 type DeviceVPNRestartCommand struct {
 	RequestedAt int64  `json:"requestedAt"`
 	Message     string `json:"message"`
+}
+
+type DeviceDetailDevice struct {
+	domains.Device
+	WebDomains []string `json:"webDomains"`
+}
+
+type DeviceDetailResult struct {
+	Device DeviceDetailDevice    `json:"device"`
+	Tokens []domains.DeviceToken `json:"tokens"`
 }
 
 type DeviceRegisterResult struct {
@@ -219,6 +257,10 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 	device.DiskUsed = req.DiskUsed
 	device.DiskFree = req.DiskFree
 	device.DiskUsedPct = req.DiskUsedPct
+	applyNetworkSnapshotToDevice(&device, networkSnapshotFromRegister(req))
+	if hasRegisterMetrics(req) {
+		device.LastMetricAt = now
+	}
 	device.SourceIP = sourceIP
 	device.SSHPort = req.SSHPort
 	device.WebPort = req.WebPort
@@ -246,7 +288,7 @@ func (s DeviceService) Register(req RegisterDeviceRequest, sourceIP string) (*De
 		}
 	}
 	if !isBootstrapToken {
-		if err := s.recordHeartbeat(device.Guid, sourceIP, req.HostIP, device.WanIP, device.Location, now); err != nil {
+		if err := s.recordHeartbeat(device.Guid, sourceIP, req.HostIP, device.WanIP, device.Location, networkSnapshotFromRegister(req), now); err != nil {
 			return nil, err
 		}
 		if err := ServiceGroupApp.DeviceTrafficService.WithDB(s.DB()).RecordHeartbeatSample(device.Guid, HeartbeatRequest{
@@ -362,10 +404,15 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	if req.DiskUsedPct > 0 {
 		updates["disk_used_pct"] = req.DiskUsedPct
 	}
+	networkSnapshot := networkSnapshotFromHeartbeat(req)
+	addNetworkSnapshotUpdates(updates, networkSnapshot)
+	if hasHeartbeatMetrics(req, networkSnapshot) {
+		updates["last_metric_at"] = now
+	}
 	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", device.Guid).Updates(updates).Error; err != nil {
 		return nil, err
 	}
-	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, now); err != nil {
+	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, networkSnapshot, now); err != nil {
 		return nil, err
 	}
 	s.recordDailyDiskUsageEvent(device.Guid, req, now)
@@ -527,14 +574,21 @@ func (s DeviceService) deviceListQuery(params map[string]string, includeStatus b
 	return db
 }
 
-func (s DeviceService) Get(guid string) (*domains.Device, []domains.DeviceToken, error) {
+func (s DeviceService) Get(guid string) (*DeviceDetailResult, error) {
 	var device domains.Device
 	if err := s.DB().Where("guid = ?", strings.TrimSpace(guid)).First(&device).Error; err != nil {
-		return nil, nil, errors.New("device not found")
+		return nil, errors.New("device not found")
 	}
+	s.hydrateDeviceDetail(&device)
 	var tokens []domains.DeviceToken
 	tokens, _ = s.tokenService().ListByDevice(device.Guid)
-	return &device, tokens, nil
+	return &DeviceDetailResult{
+		Device: DeviceDetailDevice{
+			Device:     device,
+			WebDomains: splitDeviceWebDomains(device.WebDomain),
+		},
+		Tokens: tokens,
+	}, nil
 }
 
 func (s DeviceService) Delete(guid string) error {
@@ -611,6 +665,100 @@ func (s DeviceService) Enable(guid string) error {
 func (s DeviceService) TypeDefaults() []domains.DeviceGroup {
 	items, _, _ := ServiceGroupApp.GroupService.List(map[string]string{"all": "true", "status": "1"})
 	return items
+}
+
+func (s DeviceService) hydrateDeviceDetail(device *domains.Device) {
+	if device == nil || strings.TrimSpace(device.Guid) == "" {
+		return
+	}
+	if webDomain := s.deviceWebMappingDomain(*device); webDomain != "" {
+		device.WebDomain = webDomain
+	}
+	if device.LastMetricAt <= 0 {
+		device.LastMetricAt = s.lastMetricAt(device.Guid)
+	}
+}
+
+func (s DeviceService) deviceWebMappingDomain(device domains.Device) string {
+	var mappings []domains.PortMapping
+	if err := s.DB().
+		Where("device_guid = ? AND status = ?", device.Guid, int(domains.StatusEnabled)).
+		Order("update_time DESC, id DESC").
+		Find(&mappings).Error; err != nil {
+		return firstDeviceText(publicHost(device.Sncode, device.WebDomain), device.WebDomain)
+	}
+	hosts := make([]string, 0, len(mappings))
+	seen := map[string]struct{}{}
+	for _, mapping := range mappings {
+		host := strings.TrimSpace(mapping.PublicHost)
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
+	if len(hosts) > 0 {
+		return strings.Join(hosts, ", ")
+	}
+	return firstDeviceText(publicHost(device.Sncode, device.WebDomain), device.WebDomain)
+}
+
+func (s DeviceService) lastMetricAt(deviceGuid string) int64 {
+	var lastHeartbeat domains.DeviceHeartbeat
+	last := int64(0)
+	if err := s.DB().
+		Where("device_guid = ?", deviceGuid).
+		Order("create_time DESC").
+		Limit(1).
+		First(&lastHeartbeat).Error; err == nil && lastHeartbeat.CreateTime > last {
+		last = lastHeartbeat.CreateTime
+	}
+	var trafficState domains.DeviceTrafficState
+	if err := s.DB().
+		Where("device_guid = ?", deviceGuid).
+		Order("sample_time DESC, update_time DESC").
+		Limit(1).
+		First(&trafficState).Error; err == nil {
+		if trafficState.SampleTime > last {
+			last = trafficState.SampleTime
+		}
+		if trafficState.UpdateTime > last {
+			last = trafficState.UpdateTime
+		}
+	}
+	return last
+}
+
+func splitDeviceWebDomains(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '，' || r == '\n' || r == '\t'
+	})
+	result := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	return result
+}
+
+func firstDeviceText(values ...string) string {
+	for _, value := range values {
+		if text := strings.TrimSpace(value); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func (s DeviceService) Authenticate(token, guid, sncode, sourceIP, hostIP, wanIP, hostname, clientVersion string) (*domains.Device, error) {
@@ -909,14 +1057,240 @@ func (s DeviceService) tokenService() DeviceTokenService {
 	return ServiceGroupApp.DeviceTokenService.WithDB(s.DB())
 }
 
-func (s DeviceService) recordHeartbeat(deviceGuid, sourceIP, hostIP, wanIP, location string, now int64) error {
+type heartbeatNetworkSnapshot struct {
+	NetworkType   string
+	NetworkIface  string
+	SignalDBM     int
+	SignalPct     int
+	CellularRSRP  int
+	CellularRSRQ  int
+	CellularSINR  int
+	WifiSSID      string
+	WifiRSSI      int
+	PingTarget    string
+	PingLatencyMs int64
+	PingLossPct   float64
+	RXRateBps     int64
+	TXRateBps     int64
+}
+
+func networkSnapshotFromRegister(req RegisterDeviceRequest) heartbeatNetworkSnapshot {
+	return normalizeHeartbeatNetworkSnapshot(heartbeatNetworkSnapshot{
+		NetworkType:   req.NetworkType,
+		NetworkIface:  req.NetworkIface,
+		SignalDBM:     req.SignalDBM,
+		SignalPct:     req.SignalPct,
+		CellularRSRP:  req.CellularRSRP,
+		CellularRSRQ:  req.CellularRSRQ,
+		CellularSINR:  req.CellularSINR,
+		WifiSSID:      req.WifiSSID,
+		WifiRSSI:      req.WifiRSSI,
+		PingTarget:    req.PingTarget,
+		PingLatencyMs: req.PingLatencyMs,
+		PingLossPct:   req.PingLossPct,
+		RXRateBps:     req.RXRateBps,
+		TXRateBps:     req.TXRateBps,
+	})
+}
+
+func networkSnapshotFromHeartbeat(req HeartbeatRequest) heartbeatNetworkSnapshot {
+	return normalizeHeartbeatNetworkSnapshot(heartbeatNetworkSnapshot{
+		NetworkType:   req.NetworkType,
+		NetworkIface:  req.NetworkIface,
+		SignalDBM:     req.SignalDBM,
+		SignalPct:     req.SignalPct,
+		CellularRSRP:  req.CellularRSRP,
+		CellularRSRQ:  req.CellularRSRQ,
+		CellularSINR:  req.CellularSINR,
+		WifiSSID:      req.WifiSSID,
+		WifiRSSI:      req.WifiRSSI,
+		PingTarget:    req.PingTarget,
+		PingLatencyMs: req.PingLatencyMs,
+		PingLossPct:   req.PingLossPct,
+		RXRateBps:     req.RXRateBps,
+		TXRateBps:     req.TXRateBps,
+	})
+}
+
+func normalizeHeartbeatNetworkSnapshot(snapshot heartbeatNetworkSnapshot) heartbeatNetworkSnapshot {
+	snapshot.NetworkType = normalizeNetworkType(snapshot.NetworkType)
+	snapshot.NetworkIface = truncateString(strings.TrimSpace(snapshot.NetworkIface), 64)
+	snapshot.WifiSSID = truncateString(strings.TrimSpace(snapshot.WifiSSID), 128)
+	snapshot.PingTarget = truncateString(strings.TrimSpace(snapshot.PingTarget), 255)
+	if snapshot.SignalPct < 0 {
+		snapshot.SignalPct = 0
+	}
+	if snapshot.SignalPct > 100 {
+		snapshot.SignalPct = 100
+	}
+	if snapshot.PingLatencyMs < 0 {
+		snapshot.PingLatencyMs = 0
+	}
+	if snapshot.PingLossPct < 0 {
+		snapshot.PingLossPct = 0
+	}
+	if snapshot.PingLossPct > 100 {
+		snapshot.PingLossPct = 100
+	}
+	if snapshot.RXRateBps < 0 {
+		snapshot.RXRateBps = 0
+	}
+	if snapshot.TXRateBps < 0 {
+		snapshot.TXRateBps = 0
+	}
+	return snapshot
+}
+
+func normalizeNetworkType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "cell", "cellular", "4g", "5g", "lte", "wwan", "mobile":
+		return "cellular"
+	case "wifi", "wi-fi", "wlan", "wireless":
+		return "wifi"
+	case "ethernet", "eth", "lan", "wired":
+		return "ethernet"
+	case "unknown":
+		return "unknown"
+	default:
+		return ""
+	}
+}
+
+func truncateString(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max > 0 && len(value) > max {
+		return value[:max]
+	}
+	return value
+}
+
+func applyNetworkSnapshotToDevice(device *domains.Device, snapshot heartbeatNetworkSnapshot) {
+	if device == nil {
+		return
+	}
+	device.NetworkType = snapshot.NetworkType
+	device.NetworkIface = snapshot.NetworkIface
+	device.SignalDBM = snapshot.SignalDBM
+	device.SignalPct = snapshot.SignalPct
+	device.CellularRSRP = snapshot.CellularRSRP
+	device.CellularRSRQ = snapshot.CellularRSRQ
+	device.CellularSINR = snapshot.CellularSINR
+	device.WifiSSID = snapshot.WifiSSID
+	device.WifiRSSI = snapshot.WifiRSSI
+	device.PingTarget = snapshot.PingTarget
+	device.PingLatencyMs = snapshot.PingLatencyMs
+	device.PingLossPct = snapshot.PingLossPct
+	device.RXRateBps = snapshot.RXRateBps
+	device.TXRateBps = snapshot.TXRateBps
+}
+
+func addNetworkSnapshotUpdates(updates map[string]any, snapshot heartbeatNetworkSnapshot) {
+	hasSnapshot := hasHeartbeatNetworkSnapshot(snapshot)
+	if snapshot.NetworkType != "" {
+		updates["network_type"] = snapshot.NetworkType
+	}
+	if snapshot.NetworkIface != "" {
+		updates["network_iface"] = snapshot.NetworkIface
+	}
+	if snapshot.SignalDBM != 0 {
+		updates["signal_dbm"] = snapshot.SignalDBM
+	}
+	if snapshot.SignalPct > 0 {
+		updates["signal_pct"] = snapshot.SignalPct
+	}
+	if snapshot.CellularRSRP != 0 {
+		updates["cellular_rsrp"] = snapshot.CellularRSRP
+	}
+	if snapshot.CellularRSRQ != 0 {
+		updates["cellular_rsrq"] = snapshot.CellularRSRQ
+	}
+	if snapshot.CellularSINR != 0 {
+		updates["cellular_sinr"] = snapshot.CellularSINR
+	}
+	if snapshot.WifiSSID != "" {
+		updates["wifi_ssid"] = snapshot.WifiSSID
+	}
+	if snapshot.WifiRSSI != 0 {
+		updates["wifi_rssi"] = snapshot.WifiRSSI
+	}
+	if snapshot.PingTarget != "" {
+		updates["ping_target"] = snapshot.PingTarget
+	}
+	if hasSnapshot {
+		updates["ping_latency_ms"] = snapshot.PingLatencyMs
+		updates["ping_loss_pct"] = snapshot.PingLossPct
+		updates["rx_rate_bps"] = snapshot.RXRateBps
+		updates["tx_rate_bps"] = snapshot.TXRateBps
+	}
+}
+
+func hasHeartbeatNetworkSnapshot(snapshot heartbeatNetworkSnapshot) bool {
+	return snapshot.NetworkType != "" ||
+		snapshot.NetworkIface != "" ||
+		snapshot.SignalDBM != 0 ||
+		snapshot.SignalPct != 0 ||
+		snapshot.CellularRSRP != 0 ||
+		snapshot.CellularRSRQ != 0 ||
+		snapshot.CellularSINR != 0 ||
+		snapshot.WifiSSID != "" ||
+		snapshot.WifiRSSI != 0 ||
+		snapshot.PingTarget != "" ||
+		snapshot.PingLatencyMs != 0 ||
+		snapshot.PingLossPct != 0 ||
+		snapshot.RXRateBps != 0 ||
+		snapshot.TXRateBps != 0
+}
+
+func hasRegisterMetrics(req RegisterDeviceRequest) bool {
+	return req.MemoryTotal > 0 ||
+		req.MemoryUsed > 0 ||
+		req.MemoryFree > 0 ||
+		req.DiskTotal > 0 ||
+		req.DiskUsed > 0 ||
+		req.DiskFree > 0 ||
+		req.DiskUsedPct > 0 ||
+		req.TrafficRXBytes > 0 ||
+		req.TrafficTXBytes > 0 ||
+		req.TrafficSampleTime > 0 ||
+		hasHeartbeatNetworkSnapshot(networkSnapshotFromRegister(req))
+}
+
+func hasHeartbeatMetrics(req HeartbeatRequest, snapshot heartbeatNetworkSnapshot) bool {
+	return req.MemoryTotal > 0 ||
+		req.MemoryUsed > 0 ||
+		req.MemoryFree > 0 ||
+		req.DiskTotal > 0 ||
+		req.DiskUsed > 0 ||
+		req.DiskFree > 0 ||
+		req.DiskUsedPct > 0 ||
+		req.TrafficRXBytes > 0 ||
+		req.TrafficTXBytes > 0 ||
+		req.TrafficSampleTime > 0 ||
+		hasHeartbeatNetworkSnapshot(snapshot)
+}
+
+func (s DeviceService) recordHeartbeat(deviceGuid, sourceIP, hostIP, wanIP, location string, network heartbeatNetworkSnapshot, now int64) error {
 	return s.DB().Create(&domains.DeviceHeartbeat{
-		DeviceGuid: deviceGuid,
-		SourceIP:   sourceIP,
-		HostIP:     hostIP,
-		WanIP:      wanIP,
-		Location:   location,
-		CreateTime: now,
+		DeviceGuid:    deviceGuid,
+		SourceIP:      sourceIP,
+		HostIP:        hostIP,
+		WanIP:         wanIP,
+		Location:      location,
+		NetworkType:   network.NetworkType,
+		NetworkIface:  network.NetworkIface,
+		SignalDBM:     network.SignalDBM,
+		SignalPct:     network.SignalPct,
+		CellularRSRP:  network.CellularRSRP,
+		CellularRSRQ:  network.CellularRSRQ,
+		CellularSINR:  network.CellularSINR,
+		WifiSSID:      network.WifiSSID,
+		WifiRSSI:      network.WifiRSSI,
+		PingTarget:    network.PingTarget,
+		PingLatencyMs: network.PingLatencyMs,
+		PingLossPct:   network.PingLossPct,
+		RXRateBps:     network.RXRateBps,
+		TXRateBps:     network.TXRateBps,
+		CreateTime:    now,
 	}).Error
 }
 

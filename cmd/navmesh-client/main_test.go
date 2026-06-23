@@ -204,6 +204,74 @@ func TestSelectTrafficInterfaceFromCountersKeepsAmbiguousPhysicalInterfacesDisab
 	}
 }
 
+func TestInferNetworkTypeSupportsCellularWifiAndEthernet(t *testing.T) {
+	tests := []struct {
+		iface string
+		want  string
+	}{
+		{iface: "wwan0", want: "cellular"},
+		{iface: "wlan0", want: "wifi"},
+		{iface: "eth0", want: "ethernet"},
+		{iface: "tun0", want: "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.iface, func(t *testing.T) {
+			if got := inferNetworkType(tt.iface); got != tt.want {
+				t.Fatalf("inferNetworkType(%q) = %q, want %q", tt.iface, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNetworkSnapshotNormalizesSignalAndLinkMetrics(t *testing.T) {
+	snapshot := networkSnapshot{
+		NetworkType:   "4g",
+		NetworkIface:  " wwan0 ",
+		SignalPct:     150,
+		PingLatencyMs: -1,
+		PingLossPct:   120,
+		RXRateBps:     -1,
+		TXRateBps:     2048,
+	}.normalized()
+
+	if snapshot.NetworkType != "cellular" || snapshot.NetworkIface != "wwan0" {
+		t.Fatalf("normalized network identity = type=%q iface=%q", snapshot.NetworkType, snapshot.NetworkIface)
+	}
+	if snapshot.SignalPct != 100 || snapshot.PingLatencyMs != 0 || snapshot.PingLossPct != 100 {
+		t.Fatalf("normalized quality = signal=%d latency=%d loss=%.1f", snapshot.SignalPct, snapshot.PingLatencyMs, snapshot.PingLossPct)
+	}
+	if snapshot.RXRateBps != 0 || snapshot.TXRateBps != 2048 {
+		t.Fatalf("normalized rates = rx=%d tx=%d", snapshot.RXRateBps, snapshot.TXRateBps)
+	}
+}
+
+func TestUpdateTrafficRatesCalculatesBpsAndHandlesReset(t *testing.T) {
+	networkQualityState.Lock()
+	networkQualityState.traffic = trafficRateState{}
+	networkQualityState.Unlock()
+
+	rx, tx := updateTrafficRates(trafficSnapshot{Interface: "wwan0", RXBytes: 1000, TXBytes: 2000, SampleTime: 1000, BootID: "boot-1"})
+	if rx != 0 || tx != 0 {
+		t.Fatalf("first traffic rate = rx=%d tx=%d, want zero baseline", rx, tx)
+	}
+	rx, tx = updateTrafficRates(trafficSnapshot{Interface: "wwan0", RXBytes: 1600, TXBytes: 2300, SampleTime: 2000, BootID: "boot-1"})
+	if rx != 4800 || tx != 2400 {
+		t.Fatalf("traffic rate = rx=%d tx=%d, want rx=4800 tx=2400", rx, tx)
+	}
+	rx, tx = updateTrafficRates(trafficSnapshot{Interface: "wwan0", RXBytes: 100, TXBytes: 100, SampleTime: 3000, BootID: "boot-2"})
+	if rx != 0 || tx != 0 {
+		t.Fatalf("reset traffic rate = rx=%d tx=%d, want zero", rx, tx)
+	}
+}
+
+func TestHeartbeatProbeTargetUsesDeviceHeartbeatEndpoint(t *testing.T) {
+	got := heartbeatProbeTarget(clientConfig{API: "https://example.com/base?x=1"})
+	want := "https://example.com/api/device/heartbeat"
+	if got != want {
+		t.Fatalf("heartbeatProbeTarget() = %q, want %q", got, want)
+	}
+}
+
 type halfCloseBufferConn struct {
 	mu              sync.Mutex
 	readBuffer      *bytes.Buffer

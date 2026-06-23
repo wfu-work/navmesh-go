@@ -122,6 +122,15 @@ func TestHTTPGatewayFailuresDoNotEnterEventCenter(t *testing.T) {
 	}
 
 	service := ServiceGroupApp.EventService.WithDB(db)
+	oldHub := ServiceGroupApp.EventHub
+	hub := NewEventHub()
+	ServiceGroupApp.EventHub = hub
+	t.Cleanup(func() {
+		ServiceGroupApp.EventHub = oldHub
+	})
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
 	events := []EventInput{
 		{
 			DeviceGuid: "device-1",
@@ -132,9 +141,23 @@ func TestHTTPGatewayFailuresDoNotEnterEventCenter(t *testing.T) {
 		},
 		{
 			DeviceGuid: "device-1",
+			EventType:  httpGatewayOpenTCPFailedEventType,
+			Level:      "error",
+			Title:      "HTTP 映射连接失败",
+			Message:    "device tunnel offline",
+		},
+		{
+			DeviceGuid: "device-1",
 			EventType:  httpGatewaySessionRejectedEventType,
 			Level:      "warn",
 			Title:      httpGatewaySessionRejectedEventTitle,
+			Message:    "max device sessions exceeded",
+		},
+		{
+			DeviceGuid: "device-1",
+			EventType:  httpGatewaySessionRejectedEventType,
+			Level:      "warn",
+			Title:      "HTTP 会话拒绝",
 			Message:    "max device sessions exceeded",
 		},
 		{
@@ -164,6 +187,26 @@ func TestHTTPGatewayFailuresDoNotEnterEventCenter(t *testing.T) {
 		t.Fatalf("stored events = %d, want 2", stored)
 	}
 
+	legacyNoise := []domains.Event{
+		{
+			EventType: httpGatewayOpenTCPFailedEventType,
+			Level:     "error",
+			Title:     "HTTP 映射连接失败",
+			Status:    int(domains.StatusEnabled),
+		},
+		{
+			EventType: httpGatewaySessionRejectedEventType,
+			Level:     "warn",
+			Title:     "HTTP 会话拒绝",
+			Status:    int(domains.StatusEnabled),
+		},
+	}
+	for _, event := range legacyNoise {
+		if err := db.Create(&event).Error; err != nil {
+			t.Fatalf("create legacy noise event: %v", err)
+		}
+	}
+
 	items, total, err := service.List(map[string]string{"page": "1", "size": "20"})
 	if err != nil {
 		t.Fatalf("list events: %v", err)
@@ -178,6 +221,21 @@ func TestHTTPGatewayFailuresDoNotEnterEventCenter(t *testing.T) {
 		if isEventCenterNoise(EventInput{EventType: item.EventType, Title: item.Title}) {
 			t.Fatalf("noise event should not be listed: %#v", item)
 		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case notification := <-ch:
+			if isEventCenterNoise(EventInput{EventType: notification.Data.EventType, Title: notification.Data.Title}) {
+				t.Fatalf("noise event should not publish websocket notification: %#v", notification.Data)
+			}
+		default:
+			t.Fatalf("expected websocket notification for stored event %d", i+1)
+		}
+	}
+	select {
+	case notification := <-ch:
+		t.Fatalf("unexpected websocket notification: %#v", notification.Data)
+	default:
 	}
 }
 

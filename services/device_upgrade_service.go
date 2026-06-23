@@ -307,17 +307,20 @@ func (s DeviceUpgradeService) ListBatches(params map[string]string) ([]DeviceUpg
 func (s DeviceUpgradeService) batchSummary(batch domains.DeviceUpgradeBatch) DeviceUpgradeBatchSummary {
 	summary := DeviceUpgradeBatchSummary{DeviceUpgradeBatch: batch}
 	var rows []struct {
-		Status int
-		Count  int
+		Status      int
+		Count       int
+		ProgressSum int
 	}
 	_ = s.DB().Model(&domains.DeviceUpgradeTask{}).
-		Select("status, COUNT(*) AS count").
+		Select("status, COUNT(*) AS count, SUM(progress) AS progress_sum").
 		Where("batch_guid = ?", batch.Guid).
 		Group("status").
 		Scan(&rows).Error
 	total := 0
+	progressSum := 0
 	for _, row := range rows {
 		total += row.Count
+		progressSum += row.ProgressSum
 		switch row.Status {
 		case domains.DeviceUpgradeStatusPending:
 			summary.PendingCount = row.Count
@@ -336,7 +339,7 @@ func (s DeviceUpgradeService) batchSummary(batch domains.DeviceUpgradeBatch) Dev
 	}
 	summary.FinishedCount = summary.SuccessCount + summary.FailedCount + summary.CanceledCount
 	if summary.TotalCount > 0 {
-		summary.Progress = clampInt(summary.FinishedCount*100/summary.TotalCount, 0, 100)
+		summary.Progress = clampInt(progressSum/summary.TotalCount, 0, 100)
 	}
 	switch {
 	case summary.TotalCount == 0:

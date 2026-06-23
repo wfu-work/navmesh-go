@@ -23,6 +23,7 @@ const (
 	httpGatewayOpenTCPFailedEventTitle   = "open http target failed"
 	httpGatewaySessionRejectedEventType  = "session_rejected"
 	httpGatewaySessionRejectedEventTitle = "http connection rejected"
+	httpEventTitleMarker                 = "http"
 )
 
 func (s EventService) WithDB(db *gorm.DB) EventService {
@@ -90,13 +91,16 @@ func (s EventService) RecordSuppressed(input EventInput, window time.Duration) b
 }
 
 func (s EventService) RecordSuppressedAt(input EventInput, window time.Duration, now int64) bool {
+	input.EventType = strings.TrimSpace(input.EventType)
+	input.Title = strings.TrimSpace(input.Title)
+	if shouldIgnoreEventInput(input) {
+		return false
+	}
 	if window <= 0 {
 		s.RecordAt(input, now)
 		return true
 	}
 	input.DeviceGuid = strings.TrimSpace(input.DeviceGuid)
-	input.EventType = strings.TrimSpace(input.EventType)
-	input.Title = strings.TrimSpace(input.Title)
 	if input.DeviceGuid == "" || input.EventType == "" || input.Title == "" {
 		s.RecordAt(input, now)
 		return true
@@ -117,7 +121,7 @@ func (s EventService) RecordSuppressedAt(input EventInput, window time.Duration,
 func (s EventService) RecordAt(input EventInput, now int64) {
 	input.EventType = strings.TrimSpace(input.EventType)
 	input.Title = strings.TrimSpace(input.Title)
-	if input.EventType == "" || input.EventType == ignoredServiceLogEventType || input.Title == "" || isEventCenterNoise(input) {
+	if shouldIgnoreEventInput(input) {
 		return
 	}
 	level := strings.TrimSpace(input.Level)
@@ -158,15 +162,26 @@ func (s EventService) setStatus(guid string, status int) error {
 
 func withoutEventCenterNoise(db *gorm.DB) *gorm.DB {
 	return db.Where(
-		"NOT ((event_type = ? AND title = ?) OR (event_type = ? AND title = ?))",
+		"NOT ((event_type = ? AND LOWER(title) LIKE ?) OR (event_type = ? AND LOWER(title) LIKE ?))",
 		httpGatewayOpenTCPFailedEventType,
-		httpGatewayOpenTCPFailedEventTitle,
+		"%"+httpEventTitleMarker+"%",
 		httpGatewaySessionRejectedEventType,
-		httpGatewaySessionRejectedEventTitle,
+		"%"+httpEventTitleMarker+"%",
 	)
 }
 
+func shouldIgnoreEventInput(input EventInput) bool {
+	return input.EventType == "" ||
+		input.EventType == ignoredServiceLogEventType ||
+		input.Title == "" ||
+		isEventCenterNoise(input)
+}
+
 func isEventCenterNoise(input EventInput) bool {
-	return (input.EventType == httpGatewayOpenTCPFailedEventType && input.Title == httpGatewayOpenTCPFailedEventTitle) ||
-		(input.EventType == httpGatewaySessionRejectedEventType && input.Title == httpGatewaySessionRejectedEventTitle)
+	return (input.EventType == httpGatewayOpenTCPFailedEventType && isHTTPEventTitle(input.Title)) ||
+		(input.EventType == httpGatewaySessionRejectedEventType && isHTTPEventTitle(input.Title))
+}
+
+func isHTTPEventTitle(title string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(title)), httpEventTitleMarker)
 }

@@ -102,12 +102,12 @@ func (d DeviceApi) TrafficDaily(c *gin.Context) {
 }
 
 func (d DeviceApi) Get(c *gin.Context) {
-	device, tokens, err := deviceService.Get(c.Param("guid"))
+	result, err := deviceService.Get(c.Param("guid"))
 	if err != nil {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
-	response.Ok(gin.H{"device": device, "tokens": tokens}, c)
+	response.Ok(result, c)
 }
 
 func (d DeviceApi) Update(c *gin.Context) {
@@ -175,7 +175,7 @@ func (d DeviceApi) StreamServiceLogs(c *gin.Context) {
 		c.String(http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, _, err := deviceService.Get(guid); err != nil {
+	if _, err := deviceService.Get(guid); err != nil {
 		c.String(http.StatusNotFound, err.Error())
 		return
 	}
