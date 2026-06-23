@@ -224,6 +224,7 @@ func TestInferNetworkTypeSupportsCellularWifiAndEthernet(t *testing.T) {
 }
 
 func TestDetectNetworkSignalTreatsWlanIfaceAsCellularWhenOnlyCellularSignalExists(t *testing.T) {
+	restoreWirelessCapabilityProbe(t, func(string) bool { return true })
 	snapshot := detectNetworkSignalWithCollectors(
 		"wlan0",
 		func(iface string) (networkSnapshot, bool) {
@@ -245,6 +246,40 @@ func TestDetectNetworkSignalTreatsWlanIfaceAsCellularWhenOnlyCellularSignalExist
 	}
 	if snapshot.CellularRSRP != -92 || snapshot.SignalDBM != -92 || snapshot.SignalPct == 0 {
 		t.Fatalf("detectNetworkSignalWithCollectors() cellular metrics = rsrp=%d signal=%d pct=%d, want derived cellular signal", snapshot.CellularRSRP, snapshot.SignalDBM, snapshot.SignalPct)
+	}
+}
+
+func TestDetectNetworkSignalTreatsWlanIfaceWithoutWirelessCapabilitiesAsCellular(t *testing.T) {
+	restoreWirelessCapabilityProbe(t, func(string) bool { return false })
+	snapshot := detectNetworkSignalWithCollectors(
+		"wlan0",
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{}, false
+		},
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{}, false
+		},
+	)
+
+	if snapshot.NetworkType != "cellular" || snapshot.NetworkIface != "wlan0" {
+		t.Fatalf("detectNetworkSignalWithCollectors() = type=%q iface=%q, want cellular wlan0", snapshot.NetworkType, snapshot.NetworkIface)
+	}
+}
+
+func TestDetectNetworkSignalKeepsWlanIfaceAsWifiWhenWirelessCapabilitiesExist(t *testing.T) {
+	restoreWirelessCapabilityProbe(t, func(string) bool { return true })
+	snapshot := detectNetworkSignalWithCollectors(
+		"wlan0",
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{}, false
+		},
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{}, false
+		},
+	)
+
+	if snapshot.NetworkType != "wifi" || snapshot.NetworkIface != "wlan0" {
+		t.Fatalf("detectNetworkSignalWithCollectors() = type=%q iface=%q, want wifi wlan0", snapshot.NetworkType, snapshot.NetworkIface)
 	}
 }
 
@@ -379,4 +414,13 @@ func (c *quicCancelReadConn) Close() error {
 
 func (c *quicCancelReadConn) CancelRead(quic.StreamErrorCode) {
 	c.cancelReadCount++
+}
+
+func restoreWirelessCapabilityProbe(t *testing.T, probe func(string) bool) {
+	t.Helper()
+	previous := interfaceHasWirelessCapabilities
+	interfaceHasWirelessCapabilities = probe
+	t.Cleanup(func() {
+		interfaceHasWirelessCapabilities = previous
+	})
 }

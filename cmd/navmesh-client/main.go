@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	clientVersion              = "v0.0.5"
+	clientVersion              = "v0.0.6"
 	clientTransportAuto        = "auto"
 	defaultTCPDataChannels     = 32
 	releaseTypeNavmesh         = "navmesh"
@@ -55,6 +55,7 @@ const (
 )
 
 var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
+var interfaceHasWirelessCapabilities = defaultInterfaceHasWirelessCapabilities
 
 type clientConfig struct {
 	Server         string
@@ -2093,11 +2094,18 @@ func detectNetworkSignalWithCollectors(
 		return networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
 	}
 	if isWifiInterface(iface) {
+		if !interfaceHasWirelessCapabilities(iface) {
+			if snapshot, ok := collectCellular(iface); ok {
+				return snapshot.normalized()
+			}
+			if snapshot, ok := collectWifi(iface); ok {
+				return snapshot.normalized()
+			}
+			return networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+		}
 		if snapshot, ok := collectWifi(iface); ok {
 			return snapshot.normalized()
 		}
-		// Some 4G modules expose their traffic on wlan-style interface names.
-		// If WiFi signal collection has no evidence, let cellular collectors decide.
 		if snapshot, ok := collectCellular(iface); ok {
 			return snapshot.normalized()
 		}
@@ -2536,6 +2544,23 @@ func normalizeNetworkType(value string) string {
 func isWifiInterface(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	return strings.HasPrefix(name, "wl") || strings.HasPrefix(name, "wlan") || strings.Contains(name, "wifi")
+}
+
+func defaultInterfaceHasWirelessCapabilities(name string) bool {
+	name = strings.TrimSpace(name)
+	if runtime.GOOS != "linux" || name == "" {
+		return true
+	}
+	base := filepath.Join("/sys/class/net", name)
+	for _, path := range []string{filepath.Join(base, "wireless"), filepath.Join(base, "phy80211")} {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(base, "uevent")); err == nil {
+		return strings.Contains(strings.ToLower(string(data)), "devtype=wlan")
+	}
+	return false
 }
 
 func signalPercentFromDBM(dbm int) int {
