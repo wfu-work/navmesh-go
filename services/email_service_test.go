@@ -298,6 +298,65 @@ func TestMessageServiceEnabledRecipientsByMessageTypeFiltersSelections(t *testin
 	}
 }
 
+func TestMessageServiceEnabledRecipientsByMessageTypeAndDeviceFiltersDeviceScope(t *testing.T) {
+	db := setupMessageServiceTestDB(t)
+	service := MessageService{}.WithDB(db)
+	recipients := []domains.MessageRecipient{
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "recipient-all", UpdateTime: 400},
+			Name:           "全部设备通知人员",
+			Email:          "all@example.com",
+			MessageTypes:   TemplateCodeDeviceOfflineNotice,
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "recipient-device-a", UpdateTime: 300},
+			Name:           "设备A通知人员",
+			Email:          "device-a@example.com",
+			MessageTypes:   TemplateCodeDeviceOfflineNotice + "," + TemplateCodeDiskUsageHighNotice,
+			DeviceGuids:    "device-a, device-b, device-a",
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "recipient-device-c", UpdateTime: 200},
+			Name:           "设备C通知人员",
+			Email:          "device-c@example.com",
+			MessageTypes:   TemplateCodeDeviceOfflineNotice,
+			DeviceGuids:    "device-c",
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "recipient-release", UpdateTime: 100},
+			Name:           "版本通知人员",
+			Email:          "release@example.com",
+			MessageTypes:   TemplateCodeReleasePublished,
+			DeviceGuids:    "device-a",
+			Status:         int(domains.StatusEnabled),
+		},
+	}
+	for _, recipient := range recipients {
+		if err := db.Create(&recipient).Error; err != nil {
+			t.Fatalf("create recipient: %v", err)
+		}
+	}
+
+	got, err := service.EnabledRecipientsByMessageTypeAndDevice(TemplateCodeDeviceOfflineNotice, "device-a")
+	if err != nil {
+		t.Fatalf("EnabledRecipientsByMessageTypeAndDevice() error = %v", err)
+	}
+	if gotGuids := recipientGuids(got); strings.Join(gotGuids, ",") != "recipient-all,recipient-device-a" {
+		t.Fatalf("device-a recipients = %#v, want all and device-a", gotGuids)
+	}
+
+	got, err = service.EnabledRecipientsByMessageTypeAndDevice(TemplateCodeDeviceOfflineNotice, "device-c")
+	if err != nil {
+		t.Fatalf("EnabledRecipientsByMessageTypeAndDevice() error = %v", err)
+	}
+	if gotGuids := recipientGuids(got); strings.Join(gotGuids, ",") != "recipient-all,recipient-device-c" {
+		t.Fatalf("device-c recipients = %#v, want all and device-c", gotGuids)
+	}
+}
+
 func TestMessageServiceEnabledRecipientsByGuidsFiltersRecipients(t *testing.T) {
 	db := setupMessageServiceTestDB(t)
 	service := MessageService{}.WithDB(db)
@@ -332,6 +391,25 @@ func TestMessageServiceEnabledRecipientsByGuidsFiltersRecipients(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Guid != "recipient-enabled" {
 		t.Fatalf("EnabledRecipientsByGuids() = %#v", got)
+	}
+}
+
+func TestMessageServiceSaveRecipientNormalizesDeviceGuids(t *testing.T) {
+	db := setupMessageServiceTestDB(t)
+	service := MessageService{}.WithDB(db)
+
+	got, err := service.SaveRecipient(SaveMessageRecipientRequest{
+		Name:         "离线通知人员",
+		Email:        "offline@example.com",
+		MessageTypes: TemplateCodeDeviceOfflineNotice,
+		DeviceGuids:  " device-a,device-b,device-a,, ",
+		Status:       int(domains.StatusEnabled),
+	})
+	if err != nil {
+		t.Fatalf("SaveRecipient() error = %v", err)
+	}
+	if got.DeviceGuids != "device-a,device-b" {
+		t.Fatalf("DeviceGuids = %q, want normalized device list", got.DeviceGuids)
 	}
 }
 
@@ -508,6 +586,14 @@ func assertVar(t *testing.T, values map[string]string, key string, want string) 
 	if got := values[key]; got != want {
 		t.Fatalf("variable %s = %q, want %q", key, got, want)
 	}
+}
+
+func recipientGuids(recipients []domains.MessageRecipient) []string {
+	out := make([]string, 0, len(recipients))
+	for _, recipient := range recipients {
+		out = append(out, recipient.Guid)
+	}
+	return out
 }
 
 func setupMessageServiceTestDB(t *testing.T) *gorm.DB {

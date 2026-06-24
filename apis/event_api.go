@@ -30,6 +30,16 @@ func (e EventApi) Ack(c *gin.Context) {
 	response.Ok(true, c)
 }
 
+func (e EventApi) AckAll(c *gin.Context) {
+	affected, err := eventService.AckAll()
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "ack_all", Resource: "event", ResourceID: "all", SourceIP: c.ClientIP()})
+	response.Ok(gin.H{"affected": affected}, c)
+}
+
 func (e EventApi) Close(c *gin.Context) {
 	guid := c.Param("guid")
 	if err := eventService.Close(guid); err != nil {

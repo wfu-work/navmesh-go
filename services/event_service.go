@@ -78,6 +78,18 @@ func (s EventService) Ack(guid string) error {
 	return s.setStatus(guid, int(domains.StatusDisabled))
 }
 
+func (s EventService) AckAll() (int64, error) {
+	db := s.DB().Model(&domains.Event{}).
+		Where("status = ?", int(domains.StatusEnabled)).
+		Where("event_type <> ?", ignoredServiceLogEventType)
+	db = withoutEventCenterNoise(db)
+	result := db.Updates(map[string]any{
+		"status":      int(domains.StatusDisabled),
+		"update_time": domains.NowMilli(),
+	})
+	return result.RowsAffected, result.Error
+}
+
 func (s EventService) Close(guid string) error {
 	return s.setStatus(guid, int(domains.StatusDisabled))
 }

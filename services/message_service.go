@@ -64,6 +64,7 @@ type SaveMessageRecipientRequest struct {
 	Phone        string `json:"phone"`
 	Role         string `json:"role"`
 	MessageTypes string `json:"messageTypes"`
+	DeviceGuids  string `json:"deviceGuids"`
 	Tags         string `json:"tags"`
 	Remark       string `json:"remark"`
 	Status       int    `json:"status"`
@@ -301,6 +302,7 @@ func (s MessageService) SaveRecipient(req SaveMessageRecipientRequest) (*domains
 	row.Phone = req.Phone
 	row.Role = req.Role
 	row.MessageTypes = normalizeMessageTypes(req.MessageTypes)
+	row.DeviceGuids = normalizeCSVList(req.DeviceGuids)
 	row.Tags = normalizeTags(req.Tags)
 	row.Remark = req.Remark
 	row.Status = req.Status
@@ -334,6 +336,24 @@ func (s MessageService) EnabledRecipientsByMessageType(messageType string) ([]do
 	filtered := make([]domains.MessageRecipient, 0, len(rows))
 	for _, row := range rows {
 		if recipientAcceptsMessageType(row.MessageTypes, messageType) {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered, nil
+}
+
+func (s MessageService) EnabledRecipientsByMessageTypeAndDevice(messageType string, deviceGuid string) ([]domains.MessageRecipient, error) {
+	rows, err := s.EnabledRecipientsByMessageType(messageType)
+	if err != nil {
+		return nil, err
+	}
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" {
+		return rows, nil
+	}
+	filtered := make([]domains.MessageRecipient, 0, len(rows))
+	for _, row := range rows {
+		if recipientAcceptsDevice(row.DeviceGuids, deviceGuid) {
 			filtered = append(filtered, row)
 		}
 	}
@@ -636,6 +656,7 @@ func normalizeRecipientRequest(req SaveMessageRecipientRequest) SaveMessageRecip
 	req.Phone = strings.TrimSpace(req.Phone)
 	req.Role = strings.TrimSpace(req.Role)
 	req.MessageTypes = normalizeMessageTypes(req.MessageTypes)
+	req.DeviceGuids = normalizeCSVList(req.DeviceGuids)
 	req.Tags = strings.TrimSpace(req.Tags)
 	req.Remark = strings.TrimSpace(req.Remark)
 	if req.Status == 0 {
@@ -673,6 +694,10 @@ func normalizeStringList(values []string) []string {
 	return out
 }
 
+func normalizeCSVList(value string) string {
+	return strings.Join(normalizeStringList(strings.Split(value, ",")), ",")
+}
+
 func recipientAcceptsMessageType(messageTypes string, messageType string) bool {
 	messageType = strings.ToLower(strings.TrimSpace(messageType))
 	if messageType == "" {
@@ -680,6 +705,23 @@ func recipientAcceptsMessageType(messageTypes string, messageType string) bool {
 	}
 	for _, item := range strings.Split(messageTypes, ",") {
 		if strings.ToLower(strings.TrimSpace(item)) == messageType {
+			return true
+		}
+	}
+	return false
+}
+
+func recipientAcceptsDevice(deviceGuids string, deviceGuid string) bool {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" {
+		return true
+	}
+	deviceGuids = normalizeCSVList(deviceGuids)
+	if deviceGuids == "" {
+		return true
+	}
+	for _, item := range strings.Split(deviceGuids, ",") {
+		if strings.TrimSpace(item) == deviceGuid {
 			return true
 		}
 	}

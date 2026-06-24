@@ -6,6 +6,7 @@ import (
 
 	"navmesh-go/domains"
 
+	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -239,6 +240,68 @@ func TestHTTPGatewayFailuresDoNotEnterEventCenter(t *testing.T) {
 	}
 }
 
+func TestAckAllMarksOnlyVisibleOpenEventsRead(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Event{}); err != nil {
+		t.Fatalf("migrate events: %v", err)
+	}
+
+	now := int64(1000)
+	rows := []domains.Event{
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "visible-open", CreateTime: now, UpdateTime: now},
+			DeviceGuid:     "device-1",
+			EventType:      deviceOfflineEventType,
+			Level:          "warning",
+			Title:          "设备离线提醒",
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "visible-closed", CreateTime: now, UpdateTime: now},
+			DeviceGuid:     "device-1",
+			EventType:      diskUsageHighEventType,
+			Level:          "warning",
+			Title:          "磁盘空间不足",
+			Status:         int(domains.StatusDisabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "service-log-open", CreateTime: now, UpdateTime: now},
+			DeviceGuid:     "device-1",
+			EventType:      ignoredServiceLogEventType,
+			Level:          "info",
+			Title:          "service log",
+			Status:         int(domains.StatusEnabled),
+		},
+		{
+			BaseDataEntity: commonDomains.BaseDataEntity{Guid: "http-noise-open", CreateTime: now, UpdateTime: now},
+			DeviceGuid:     "device-1",
+			EventType:      httpGatewayOpenTCPFailedEventType,
+			Level:          "error",
+			Title:          "HTTP 映射连接失败",
+			Status:         int(domains.StatusEnabled),
+		},
+	}
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatalf("create events: %v", err)
+	}
+
+	affected, err := ServiceGroupApp.EventService.WithDB(db).AckAll()
+	if err != nil {
+		t.Fatalf("ack all events: %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("affected rows = %d, want 1", affected)
+	}
+
+	assertEventStatus(t, db, "visible-open", int(domains.StatusDisabled))
+	assertEventStatus(t, db, "visible-closed", int(domains.StatusDisabled))
+	assertEventStatus(t, db, "service-log-open", int(domains.StatusEnabled))
+	assertEventStatus(t, db, "http-noise-open", int(domains.StatusEnabled))
+}
+
 func assertSuppressedEventCount(t *testing.T, db *gorm.DB, input EventInput, want int64) {
 	t.Helper()
 	var count int64
@@ -249,5 +312,16 @@ func assertSuppressedEventCount(t *testing.T, db *gorm.DB, input EventInput, wan
 	}
 	if count != want {
 		t.Fatalf("event count = %d, want %d", count, want)
+	}
+}
+
+func assertEventStatus(t *testing.T, db *gorm.DB, guid string, want int) {
+	t.Helper()
+	var row domains.Event
+	if err := db.Where("guid = ?", guid).First(&row).Error; err != nil {
+		t.Fatalf("find event %s: %v", guid, err)
+	}
+	if row.Status != want {
+		t.Fatalf("event %s status = %d, want %d", guid, row.Status, want)
 	}
 }

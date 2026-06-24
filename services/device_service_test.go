@@ -362,6 +362,35 @@ func TestNetworkSnapshotDerivesSignalFromWifiRSSI(t *testing.T) {
 	}
 }
 
+func TestCarrierLocationReconcilesWlanWifiSnapshotToCellular(t *testing.T) {
+	snapshot := reconcileNetworkSnapshotWithLocation(networkSnapshotFromHeartbeat(HeartbeatRequest{
+		NetworkType:  "wifi",
+		NetworkIface: "wlan0",
+		RXRateBps:    3000,
+		TXRateBps:    1400,
+	}), "中国 移动")
+
+	if snapshot.NetworkType != "cellular" {
+		t.Fatalf("networkType = %q, want cellular for mobile carrier wlan snapshot", snapshot.NetworkType)
+	}
+	if snapshot.NetworkIface != "wlan0" || snapshot.RXRateBps != 3000 || snapshot.TXRateBps != 1400 {
+		t.Fatalf("snapshot = %+v, want iface and rate preserved", snapshot)
+	}
+}
+
+func TestCarrierLocationKeepsWifiSnapshotWithWifiMetrics(t *testing.T) {
+	snapshot := reconcileNetworkSnapshotWithLocation(networkSnapshotFromHeartbeat(HeartbeatRequest{
+		NetworkType:  "wifi",
+		NetworkIface: "wlan0",
+		WifiSSID:     "site-wifi",
+		WifiRSSI:     -68,
+	}), "中国 移动")
+
+	if snapshot.NetworkType != "wifi" {
+		t.Fatalf("networkType = %q, want wifi when wifi metrics exist", snapshot.NetworkType)
+	}
+}
+
 func TestResolveDeviceWanIPOnlyReturnsIPv4(t *testing.T) {
 	tests := []struct {
 		name     string

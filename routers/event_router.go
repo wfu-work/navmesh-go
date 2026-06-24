@@ -19,6 +19,7 @@ func (e *EventRouter) InitEventRouter(publicGroup *gin.RouterGroup, privateGroup
 	group := privateGroup.Group("events")
 	{
 		group.GET("list", eventApi.List)
+		group.POST("ack-all", eventApi.AckAll)
 		group.POST(":guid/ack", eventApi.Ack)
 		group.POST(":guid/close", eventApi.Close)
 	}

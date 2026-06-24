@@ -404,7 +404,7 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	if req.DiskUsedPct > 0 {
 		updates["disk_used_pct"] = req.DiskUsedPct
 	}
-	networkSnapshot := networkSnapshotFromHeartbeat(req)
+	networkSnapshot := reconcileNetworkSnapshotWithLocation(networkSnapshotFromHeartbeat(req), location)
 	addNetworkSnapshotUpdates(updates, networkSnapshot)
 	if hasHeartbeatMetrics(req, networkSnapshot) {
 		updates["last_metric_at"] = now
@@ -1146,6 +1146,44 @@ func normalizeHeartbeatNetworkSnapshot(snapshot heartbeatNetworkSnapshot) heartb
 		snapshot.TXRateBps = 0
 	}
 	return snapshot
+}
+
+func reconcileNetworkSnapshotWithLocation(snapshot heartbeatNetworkSnapshot, location string) heartbeatNetworkSnapshot {
+	if shouldTreatWifiSnapshotAsCellular(snapshot, location) {
+		snapshot.NetworkType = "cellular"
+	}
+	return snapshot
+}
+
+func shouldTreatWifiSnapshotAsCellular(snapshot heartbeatNetworkSnapshot, location string) bool {
+	if snapshot.NetworkType != "wifi" {
+		return false
+	}
+	if !isWifiInterfaceName(snapshot.NetworkIface) {
+		return false
+	}
+	if strings.TrimSpace(snapshot.WifiSSID) != "" || snapshot.WifiRSSI != 0 {
+		return false
+	}
+	if snapshot.CellularRSRP != 0 || snapshot.CellularRSRQ != 0 || snapshot.CellularSINR != 0 {
+		return true
+	}
+	return isMobileCarrierLocation(location)
+}
+
+func isWifiInterfaceName(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(value, "wl") || strings.HasPrefix(value, "wlan") || strings.Contains(value, "wifi")
+}
+
+func isMobileCarrierLocation(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, marker := range []string{"移动", "联通", "电信", "铁塔", "广电", "cmcc", "china mobile", "unicom", "telecom"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func signalPercentFromDBM(dbm int) int {

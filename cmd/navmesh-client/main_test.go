@@ -249,6 +249,32 @@ func TestDetectNetworkSignalTreatsWlanIfaceAsCellularWhenOnlyCellularSignalExist
 	}
 }
 
+func TestDetectNetworkSignalPrefersCellularWhenWlanWifiHasNoAssociation(t *testing.T) {
+	restoreWirelessCapabilityProbe(t, func(string) bool { return true })
+	snapshot := detectNetworkSignalWithCollectors(
+		"wlan0",
+		func(iface string) (networkSnapshot, bool) {
+			return networkSnapshot{
+				NetworkType:  "cellular",
+				NetworkIface: iface,
+			}, true
+		},
+		func(iface string) (networkSnapshot, bool) {
+			return networkSnapshot{
+				NetworkType:  "wifi",
+				NetworkIface: iface,
+				SignalDBM:    -67,
+				SignalPct:    72,
+				WifiRSSI:     -67,
+			}, true
+		},
+	)
+
+	if snapshot.NetworkType != "cellular" || snapshot.NetworkIface != "wlan0" {
+		t.Fatalf("detectNetworkSignalWithCollectors() = type=%q iface=%q, want cellular wlan0", snapshot.NetworkType, snapshot.NetworkIface)
+	}
+}
+
 func TestDetectNetworkSignalTreatsWlanIfaceWithoutWirelessCapabilitiesAsCellular(t *testing.T) {
 	restoreWirelessCapabilityProbe(t, func(string) bool { return false })
 	snapshot := detectNetworkSignalWithCollectors(
@@ -266,6 +292,39 @@ func TestDetectNetworkSignalTreatsWlanIfaceWithoutWirelessCapabilitiesAsCellular
 	}
 }
 
+func TestDetectNetworkSignalKeepsAssociatedWlanWifi(t *testing.T) {
+	restoreWirelessCapabilityProbe(t, func(string) bool { return true })
+	snapshot := detectNetworkSignalWithCollectors(
+		"wlan0",
+		func(string) (networkSnapshot, bool) {
+			t.Fatal("cellular collector should not be used for associated wifi")
+			return networkSnapshot{}, false
+		},
+		func(iface string) (networkSnapshot, bool) {
+			return networkSnapshot{
+				NetworkType:  "wifi",
+				NetworkIface: iface,
+				WifiSSID:     "site-wifi",
+				WifiRSSI:     -61,
+			}, true
+		},
+	)
+
+	if snapshot.NetworkType != "wifi" || snapshot.NetworkIface != "wlan0" || snapshot.WifiSSID != "site-wifi" {
+		t.Fatalf("detectNetworkSignalWithCollectors() = %+v, want associated wifi wlan0", snapshot)
+	}
+}
+
+func TestWifiAssociationEvidenceIgnoresUnassociatedSSID(t *testing.T) {
+	snapshot := networkSnapshot{NetworkType: "wifi", NetworkIface: "wlan0", WifiSSID: " off/any "}
+	if hasWifiAssociationEvidence(snapshot) {
+		t.Fatal("hasWifiAssociationEvidence() = true, want false for off/any")
+	}
+	if got := snapshot.normalized().WifiSSID; got != "" {
+		t.Fatalf("normalized WifiSSID = %q, want empty", got)
+	}
+}
+
 func TestDetectNetworkSignalKeepsWlanIfaceAsWifiWhenWirelessCapabilitiesExist(t *testing.T) {
 	restoreWirelessCapabilityProbe(t, func(string) bool { return true })
 	snapshot := detectNetworkSignalWithCollectors(
@@ -280,6 +339,28 @@ func TestDetectNetworkSignalKeepsWlanIfaceAsWifiWhenWirelessCapabilitiesExist(t 
 
 	if snapshot.NetworkType != "wifi" || snapshot.NetworkIface != "wlan0" {
 		t.Fatalf("detectNetworkSignalWithCollectors() = type=%q iface=%q, want wifi wlan0", snapshot.NetworkType, snapshot.NetworkIface)
+	}
+}
+
+func TestCellularModemEvidenceRecognizesOperatorOutput(t *testing.T) {
+	out := `
+  -------------------------
+  3GPP | operator name: China Mobile
+       | access tech: lte
+       | registration state: home
+`
+	if !hasCellularModemEvidence(out) {
+		t.Fatal("hasCellularModemEvidence() = false, want true for operator output")
+	}
+}
+
+func TestCellularModemEvidenceIgnoresDisabledStateOnly(t *testing.T) {
+	out := `
+  -------------------------
+  Status | state: disabled
+`
+	if hasCellularModemEvidence(out) {
+		t.Fatal("hasCellularModemEvidence() = true, want false for disabled state only")
 	}
 }
 

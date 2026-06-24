@@ -37,9 +37,10 @@ const (
 type EmailService struct{}
 
 type EmailTemplateInput struct {
-	Code      string
-	Title     string
-	Variables map[string]string
+	Code       string
+	Title      string
+	Variables  map[string]string
+	DeviceGuid string
 }
 
 type DebugEmailTemplateInput struct {
@@ -115,7 +116,12 @@ func (s EmailService) SendTemplate(input EmailTemplateInput) (*EmailSendResult, 
 	if err != nil {
 		return nil, err
 	}
-	recipients, err := ServiceGroupApp.MessageService.EnabledRecipientsByMessageType(code)
+	var recipients []domains.MessageRecipient
+	if strings.TrimSpace(input.DeviceGuid) != "" {
+		recipients, err = ServiceGroupApp.MessageService.EnabledRecipientsByMessageTypeAndDevice(code, input.DeviceGuid)
+	} else {
+		recipients, err = ServiceGroupApp.MessageService.EnabledRecipientsByMessageType(code)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -430,9 +436,10 @@ func (s EmailService) NotifyDeviceOffline(device *domains.Device, message string
 	}
 	variables := DeviceOfflineTemplateVariables(device, message, now)
 	result, err := sendTemplateEmail(s, EmailTemplateInput{
-		Code:      TemplateCodeDeviceOfflineNotice,
-		Title:     "设备离线通知",
-		Variables: variables,
+		Code:       TemplateCodeDeviceOfflineNotice,
+		Title:      "设备离线通知",
+		Variables:  variables,
+		DeviceGuid: device.Guid,
 	})
 	if err != nil {
 		if global.NAV_LOG != nil {
@@ -455,9 +462,10 @@ func (s EmailService) NotifyDiskUsageHigh(device *domains.Device, req HeartbeatR
 	}
 	variables := DiskUsageHighTemplateVariables(device, req, message, now)
 	result, err := sendTemplateEmail(s, EmailTemplateInput{
-		Code:      TemplateCodeDiskUsageHighNotice,
-		Title:     "磁盘阈值通知",
-		Variables: variables,
+		Code:       TemplateCodeDiskUsageHighNotice,
+		Title:      "磁盘阈值通知",
+		Variables:  variables,
+		DeviceGuid: device.Guid,
 	})
 	if err != nil {
 		if global.NAV_LOG != nil {

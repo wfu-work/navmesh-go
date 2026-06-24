@@ -2103,8 +2103,14 @@ func detectNetworkSignalWithCollectors(
 			}
 			return networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
 		}
-		if snapshot, ok := collectWifi(iface); ok {
-			return snapshot.normalized()
+		if wifiSnapshot, hasWifi := collectWifi(iface); hasWifi {
+			if hasWifiAssociationEvidence(wifiSnapshot) {
+				return wifiSnapshot.normalized()
+			}
+			if cellularSnapshot, hasCellular := collectCellular(iface); hasCellular {
+				return cellularSnapshot.normalized()
+			}
+			return wifiSnapshot.normalized()
 		}
 		if snapshot, ok := collectCellular(iface); ok {
 			return snapshot.normalized()
@@ -2163,7 +2169,7 @@ func collectCellularSignalMMCLI(iface string) (networkSnapshot, bool) {
 	if snapshot.SignalPct == 0 {
 		snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP))
 	}
-	return snapshot, snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 || snapshot.CellularRSRP != 0
+	return snapshot, snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 || snapshot.CellularRSRP != 0 || hasCellularModemEvidence(out)
 }
 
 func collectCellularSignalQMICLI(iface string) (networkSnapshot, bool) {
@@ -2206,16 +2212,67 @@ func collectCellularSignalUQMI(iface string) (networkSnapshot, bool) {
 }
 
 func collectWifiSignal(iface string) (networkSnapshot, bool) {
-	if snapshot, ok := collectWifiSignalProc(iface); ok {
-		return snapshot, true
+	var fallback networkSnapshot
+	hasFallback := false
+	for _, collector := range []func(string) (networkSnapshot, bool){
+		collectWifiSignalIW,
+		collectWifiSignalIWConfig,
+		collectWifiSignalProc,
+	} {
+		snapshot, ok := collector(iface)
+		if !ok {
+			continue
+		}
+		if hasWifiAssociationEvidence(snapshot) {
+			return snapshot, true
+		}
+		if !hasFallback || snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 {
+			fallback = snapshot
+			hasFallback = true
+		}
 	}
-	if snapshot, ok := collectWifiSignalIW(iface); ok {
-		return snapshot, true
+	return fallback, hasFallback
+}
+
+func hasWifiAssociationEvidence(snapshot networkSnapshot) bool {
+	return normalizeWifiSSID(snapshot.WifiSSID) != ""
+}
+
+func normalizeWifiSSID(value string) string {
+	value = strings.TrimSpace(value)
+	switch strings.ToLower(value) {
+	case "", "off/any", "any":
+		return ""
+	default:
+		return value
 	}
-	if snapshot, ok := collectWifiSignalIWConfig(iface); ok {
-		return snapshot, true
+}
+
+func hasCellularModemEvidence(value string) bool {
+	value = strings.ToLower(value)
+	for _, marker := range []string{
+		"operator name",
+		"operator id",
+		"access tech",
+		"access technology",
+		"3gpp",
+		"lte",
+		"nr5g",
+		"gsm",
+		"umts",
+		"imei",
+		"equipment identifier",
+		"sim path",
+		"own numbers",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
 	}
-	return networkSnapshot{}, false
+	if regexp.MustCompile(`(?:registration(?: state)?|state)\s*:\s*(?:home|roaming|registered|connected|enabled)`).MatchString(value) {
+		return true
+	}
+	return false
 }
 
 func collectWifiSignalProc(iface string) (networkSnapshot, bool) {
@@ -2271,7 +2328,7 @@ func collectWifiSignalIW(iface string) (networkSnapshot, bool) {
 	}
 	snapshot := networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
 	if out, err := runCommandOutput(1200*time.Millisecond, "iw", "dev", iface, "link"); err == nil {
-		snapshot.WifiSSID = firstRegexSubmatch(out, `(?m)^\s*SSID:\s*(.+?)\s*$`)
+		snapshot.WifiSSID = normalizeWifiSSID(firstRegexSubmatch(out, `(?m)^\s*SSID:\s*(.+?)\s*$`))
 		rssi := firstIntRegex(out, `(?i)signal:\s*(-?\d+)`)
 		snapshot.SignalDBM = rssi
 		snapshot.WifiRSSI = rssi
@@ -2296,7 +2353,7 @@ func collectWifiSignalIWConfig(iface string) (networkSnapshot, bool) {
 		iface = firstRegexSubmatch(out, `(?m)^(\S+)\s+IEEE`)
 	}
 	snapshot := networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
-	snapshot.WifiSSID = firstRegexSubmatch(out, `ESSID:"([^"]*)"`)
+	snapshot.WifiSSID = normalizeWifiSSID(firstRegexSubmatch(out, `ESSID:"([^"]*)"`))
 	rssi := firstIntRegex(out, `(?i)Signal level[=:\s]+(-?\d+)`)
 	if rssi != 0 {
 		snapshot.SignalDBM = rssi
@@ -2478,7 +2535,7 @@ func (snapshot networkSnapshot) logFields() string {
 func (snapshot networkSnapshot) normalized() networkSnapshot {
 	snapshot.NetworkType = normalizeNetworkType(snapshot.NetworkType)
 	snapshot.NetworkIface = strings.TrimSpace(snapshot.NetworkIface)
-	snapshot.WifiSSID = strings.TrimSpace(snapshot.WifiSSID)
+	snapshot.WifiSSID = normalizeWifiSSID(snapshot.WifiSSID)
 	snapshot.PingTarget = strings.TrimSpace(snapshot.PingTarget)
 	if snapshot.SignalPct < 0 {
 		snapshot.SignalPct = 0

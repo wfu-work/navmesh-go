@@ -47,6 +47,7 @@ type MessageRecipient struct {
 	Phone        string `json:"phone" gorm:"size:64;comment:手机号"`
 	Role         string `json:"role" gorm:"size:128;comment:角色"`
 	MessageTypes string `json:"messageTypes" gorm:"size:512;comment:消息类型"`
+	DeviceGuids  string `json:"deviceGuids" gorm:"size:2048;comment:通知设备范围，空表示全部设备"`
 	Tags         string `json:"tags" gorm:"size:512;comment:标签"`
 	Remark       string `json:"remark" gorm:"size:512;comment:备注"`
 	Status       int    `json:"status" gorm:"index;comment:状态"`
