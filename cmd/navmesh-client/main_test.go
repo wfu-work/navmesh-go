@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -342,6 +343,26 @@ func TestDetectNetworkSignalKeepsWlanIfaceAsWifiWhenWirelessCapabilitiesExist(t 
 	}
 }
 
+func TestDetectNetworkSignalDoesNotPromoteGlobalCellularEvidenceForEthernet(t *testing.T) {
+	snapshot := detectNetworkSignalWithCollectors(
+		"eth0",
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{
+				NetworkType:  "cellular",
+				NetworkIface: "eth0",
+				CellularRSRP: -88,
+			}, true
+		},
+		func(string) (networkSnapshot, bool) {
+			return networkSnapshot{}, false
+		},
+	)
+
+	if snapshot.NetworkType != "ethernet" || snapshot.NetworkIface != "eth0" {
+		t.Fatalf("detectNetworkSignalWithCollectors() = type=%q iface=%q, want ethernet eth0", snapshot.NetworkType, snapshot.NetworkIface)
+	}
+}
+
 func TestCellularModemEvidenceRecognizesOperatorOutput(t *testing.T) {
 	out := `
   -------------------------
@@ -398,6 +419,25 @@ func TestNetworkSnapshotDerivesSignalFromWifiRSSI(t *testing.T) {
 	}
 	if snapshot.SignalPct != 66 {
 		t.Fatalf("signalPct = %d, want derived percent 66", snapshot.SignalPct)
+	}
+}
+
+func TestCollectNetworkSnapshotPrefersOutboundInterface(t *testing.T) {
+	restoreOutboundInterfaceDetector(t, func(string) string { return "eth0" })
+	restoreNetworkSignalDetector(t, func(iface string) networkSnapshot {
+		return networkSnapshot{NetworkType: inferNetworkType(iface), NetworkIface: iface}
+	})
+
+	snapshot := collectNetworkSnapshot(context.Background(), clientConfig{}, trafficSnapshot{
+		Interface:  "wwan0",
+		RXBytes:    1000,
+		TXBytes:    2000,
+		SampleTime: 1000,
+		BootID:     "boot-1",
+	})
+
+	if snapshot.NetworkType != "ethernet" || snapshot.NetworkIface != "eth0" {
+		t.Fatalf("collectNetworkSnapshot() = type=%q iface=%q, want ethernet eth0", snapshot.NetworkType, snapshot.NetworkIface)
 	}
 }
 
@@ -503,5 +543,23 @@ func restoreWirelessCapabilityProbe(t *testing.T, probe func(string) bool) {
 	interfaceHasWirelessCapabilities = probe
 	t.Cleanup(func() {
 		interfaceHasWirelessCapabilities = previous
+	})
+}
+
+func restoreOutboundInterfaceDetector(t *testing.T, probe func(string) string) {
+	t.Helper()
+	previous := outboundInterfaceDetector
+	outboundInterfaceDetector = probe
+	t.Cleanup(func() {
+		outboundInterfaceDetector = previous
+	})
+}
+
+func restoreNetworkSignalDetector(t *testing.T, probe func(string) networkSnapshot) {
+	t.Helper()
+	previous := networkSignalDetector
+	networkSignalDetector = probe
+	t.Cleanup(func() {
+		networkSignalDetector = previous
 	})
 }

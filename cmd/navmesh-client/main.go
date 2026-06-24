@@ -56,6 +56,8 @@ const (
 
 var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
 var interfaceHasWirelessCapabilities = defaultInterfaceHasWirelessCapabilities
+var outboundInterfaceDetector = detectOutboundInterface
+var networkSignalDetector = detectNetworkSignal
 
 type clientConfig struct {
 	Server         string
@@ -2017,6 +2019,14 @@ func collectTrafficSnapshot(preferredIface string) trafficSnapshot {
 	if iface == "" {
 		return trafficSnapshot{}
 	}
+	return collectInterfaceTrafficSnapshot(iface)
+}
+
+func collectInterfaceTrafficSnapshot(iface string) trafficSnapshot {
+	iface = strings.TrimSpace(iface)
+	if iface == "" {
+		return trafficSnapshot{}
+	}
 	counters, err := gopsnet.IOCounters(true)
 	if err != nil {
 		return trafficSnapshot{}
@@ -2060,14 +2070,22 @@ func (snapshot trafficSnapshot) logFields() string {
 }
 
 func collectNetworkSnapshot(ctx context.Context, cfg clientConfig, traffic trafficSnapshot) networkSnapshot {
-	snapshot := detectNetworkSignal(traffic.Interface)
+	networkIface := outboundInterfaceDetector(cfg.API)
+	if networkIface == "" {
+		networkIface = strings.TrimSpace(traffic.Interface)
+	}
+	snapshot := networkSignalDetector(networkIface)
 	if snapshot.NetworkIface == "" {
-		snapshot.NetworkIface = strings.TrimSpace(traffic.Interface)
+		snapshot.NetworkIface = networkIface
 	}
 	if snapshot.NetworkType == "" {
 		snapshot.NetworkType = inferNetworkType(snapshot.NetworkIface)
 	}
-	rxRate, txRate := updateTrafficRates(traffic)
+	rateTraffic := traffic
+	if networkIface != "" && networkIface != strings.TrimSpace(traffic.Interface) {
+		rateTraffic = collectInterfaceTrafficSnapshot(networkIface)
+	}
+	rxRate, txRate := updateTrafficRates(rateTraffic)
 	snapshot.RXRateBps = rxRate
 	snapshot.TXRateBps = txRate
 	target, latency, loss := probeHeartbeatLatency(ctx, cfg)
@@ -2117,13 +2135,25 @@ func detectNetworkSignalWithCollectors(
 		}
 		return networkSnapshot{NetworkType: "wifi", NetworkIface: iface}
 	}
+	if iface != "" {
+		if hasCellularInterfaceEvidence(iface) {
+			if snapshot, ok := collectCellular(iface); ok {
+				return snapshot.normalized()
+			}
+			return networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+		}
+		if wifiSnapshot, ok := collectWifi(iface); ok {
+			return wifiSnapshot.normalized()
+		}
+		return networkSnapshot{NetworkType: inferNetworkType(iface), NetworkIface: iface}
+	}
 	if snapshot, ok := collectCellular(""); ok {
 		return snapshot.normalized()
 	}
 	if snapshot, ok := collectWifi(""); ok {
 		return snapshot.normalized()
 	}
-	return networkSnapshot{NetworkType: inferNetworkType(iface), NetworkIface: iface}
+	return networkSnapshot{}
 }
 
 func collectCellularSignal(iface string) (networkSnapshot, bool) {
@@ -2147,29 +2177,54 @@ func collectCellularSignalMMCLI(iface string) (networkSnapshot, bool) {
 	if _, err := exec.LookPath("mmcli"); err != nil {
 		return networkSnapshot{}, false
 	}
-	modem := "0"
+	modems := []string{"0"}
 	if out, err := runCommandOutput(1200*time.Millisecond, "mmcli", "-L"); err == nil {
-		if parsed := firstRegexSubmatch(out, `/Modem/([0-9]+)`); parsed != "" {
-			modem = parsed
+		matches := regexp.MustCompile(`/Modem/([0-9]+)`).FindAllStringSubmatch(out, -1)
+		if len(matches) > 0 {
+			modems = modems[:0]
+			for _, match := range matches {
+				if len(match) > 1 && match[1] != "" {
+					modems = append(modems, match[1])
+				}
+			}
 		}
 	}
-	out, err := runCommandOutput(1500*time.Millisecond, "mmcli", "-m", modem, "--signal-get")
-	if err != nil || strings.TrimSpace(out) == "" {
-		out, err = runCommandOutput(1500*time.Millisecond, "mmcli", "-m", modem)
-		if err != nil {
-			return networkSnapshot{}, false
+	for _, modem := range modems {
+		detailOut, detailErr := runCommandOutput(1500*time.Millisecond, "mmcli", "-m", modem)
+		if detailErr != nil && strings.TrimSpace(detailOut) == "" {
+			continue
 		}
+		if iface != "" && !mmcliReferencesInterface(detailOut, iface) {
+			continue
+		}
+		signalOut, signalErr := runCommandOutput(1500*time.Millisecond, "mmcli", "-m", modem, "--signal-get")
+		out := detailOut
+		if strings.TrimSpace(signalOut) != "" {
+			out += "\n" + signalOut
+		}
+		if signalErr != nil && strings.TrimSpace(out) == "" {
+			continue
+		}
+		snapshot := networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
+		snapshot.SignalDBM = firstIntRegex(out, `(?i)(?:rssi)[^-\d]*(-?\d+)`)
+		snapshot.CellularRSRP = firstIntRegex(out, `(?i)(?:rsrp)[^-\d]*(-?\d+)`)
+		snapshot.CellularRSRQ = firstIntRegex(out, `(?i)(?:rsrq)[^-\d]*(-?\d+)`)
+		snapshot.CellularSINR = firstIntRegex(out, `(?i)(?:sinr|snr)[^-\d]*(-?\d+)`)
+		snapshot.SignalPct = firstIntRegex(out, `(?i)(?:signal quality|quality)[^0-9]+(\d+)\s*%`)
+		if snapshot.SignalPct == 0 {
+			snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP))
+		}
+		return snapshot, snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 || snapshot.CellularRSRP != 0 || hasCellularModemEvidence(out)
 	}
-	snapshot := networkSnapshot{NetworkType: "cellular", NetworkIface: iface}
-	snapshot.SignalDBM = firstIntRegex(out, `(?i)(?:rssi)[^-\d]*(-?\d+)`)
-	snapshot.CellularRSRP = firstIntRegex(out, `(?i)(?:rsrp)[^-\d]*(-?\d+)`)
-	snapshot.CellularRSRQ = firstIntRegex(out, `(?i)(?:rsrq)[^-\d]*(-?\d+)`)
-	snapshot.CellularSINR = firstIntRegex(out, `(?i)(?:sinr|snr)[^-\d]*(-?\d+)`)
-	snapshot.SignalPct = firstIntRegex(out, `(?i)(?:signal quality|quality)[^0-9]+(\d+)\s*%`)
-	if snapshot.SignalPct == 0 {
-		snapshot.SignalPct = signalPercentFromDBM(firstNonZeroInt(snapshot.SignalDBM, snapshot.CellularRSRP))
+	return networkSnapshot{}, false
+}
+
+func mmcliReferencesInterface(output, iface string) bool {
+	iface = strings.ToLower(strings.TrimSpace(iface))
+	if iface == "" {
+		return true
 	}
-	return snapshot, snapshot.SignalDBM != 0 || snapshot.SignalPct != 0 || snapshot.CellularRSRP != 0 || hasCellularModemEvidence(out)
+	return strings.Contains(strings.ToLower(output), iface)
 }
 
 func collectCellularSignalQMICLI(iface string) (networkSnapshot, bool) {
@@ -2236,6 +2291,51 @@ func collectWifiSignal(iface string) (networkSnapshot, bool) {
 
 func hasWifiAssociationEvidence(snapshot networkSnapshot) bool {
 	return normalizeWifiSSID(snapshot.WifiSSID) != ""
+}
+
+func hasCellularInterfaceEvidence(iface string) bool {
+	iface = strings.TrimSpace(iface)
+	if iface == "" {
+		return false
+	}
+	if isCellularTrafficInterface(iface) {
+		return true
+	}
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	base := filepath.Join("/sys/class/net", iface)
+	if _, err := os.Stat(filepath.Join(base, "device", "usbmisc")); err == nil {
+		return true
+	}
+	for _, path := range []string{
+		filepath.Join(base, "device", "uevent"),
+		filepath.Join(base, "uevent"),
+	} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lower := strings.ToLower(string(data))
+		for _, marker := range []string{
+			"qmi_wwan",
+			"cdc_mbim",
+			"cdc_ncm",
+			"huawei_cdc_ncm",
+			"rndis_host",
+			"option",
+			"qcserial",
+			"usbnet",
+			"mbim",
+			"qmi",
+			"modem",
+		} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func normalizeWifiSSID(value string) string {
@@ -2674,6 +2774,84 @@ func firstIntRegex(value string, pattern string) int {
 func parseFloat(value string) float64 {
 	parsed, _ := strconv.ParseFloat(strings.TrimSpace(value), 64)
 	return parsed
+}
+
+func detectOutboundInterface(api string) string {
+	target := outboundRouteTarget(api)
+	if target == "" {
+		return ""
+	}
+	conn, err := net.DialTimeout("udp", target, time.Second)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil {
+		return ""
+	}
+	return interfaceNameForIP(addr.IP)
+}
+
+func outboundRouteTarget(api string) string {
+	api = strings.TrimSpace(api)
+	if api == "" {
+		return ""
+	}
+	parsed, err := url.Parse(api)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return ""
+	}
+	port := parsed.Port()
+	if port == "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "https", "wss":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func interfaceNameForIP(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	items, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, item := range items {
+		if item.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := item.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if interfaceAddrIP(addr).Equal(ip) {
+				return item.Name
+			}
+		}
+	}
+	return ""
+}
+
+func interfaceAddrIP(addr net.Addr) net.IP {
+	switch value := addr.(type) {
+	case *net.IPNet:
+		return value.IP
+	case *net.IPAddr:
+		return value.IP
+	default:
+		return nil
+	}
 }
 
 func minDuration(a, b time.Duration) time.Duration {
