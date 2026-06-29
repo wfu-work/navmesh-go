@@ -258,7 +258,7 @@ sqlite:
 
 navmesh:
   data-dir: ./data/navmesh
-  heartbeat-timeout: 90s
+  heartbeat-timeout: 180s
   device-register-token: "xxxxxx"
 ```
 
@@ -274,7 +274,8 @@ navmesh:
 | `http_mapping_enabled` | `true` | 是否启用 HTTP 映射网关 |
 | `http_listen` | `:3009` | HTTP 映射网关监听地址 |
 | `device_register_token` | `xxxxxx` | 设备首次注册 Token |
-| `device_heartbeat_timeout` | `90s` | 设备离线判定超时时间 |
+| `device_heartbeat_timeout` | `180s` | 设备离线判定超时时间 |
+| `device_offline_event_delay` | `600s` | 设备离线后生成离线提醒事件的延迟 |
 | `client_upgrade_enabled` | `true` | 是否允许心跳下发客户端升级任务 |
 | `client_download_base` | 空 | 客户端二进制公开下载地址前缀 |
 

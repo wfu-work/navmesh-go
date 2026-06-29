@@ -412,6 +412,7 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", device.Guid).Updates(updates).Error; err != nil {
 		return nil, err
 	}
+	s.closeOpenDeviceOfflineEvents(device.Guid, now)
 	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, networkSnapshot, now); err != nil {
 		return nil, err
 	}
@@ -789,6 +790,7 @@ func (s DeviceService) TouchOnline(guid string) {
 			"last_seen_time": now,
 			"update_time":    now,
 		}).Error
+	s.closeOpenDeviceOfflineEvents(guid, now)
 }
 
 func (s DeviceService) MarkOnlineDevicesOffline() (int64, error) {
@@ -826,7 +828,7 @@ func (s DeviceService) MarkStaleOnlineDevicesOffline(timeout time.Duration) (int
 
 func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, error) {
 	if timeout <= 0 {
-		timeout = 300 * time.Second
+		timeout = 600 * time.Second
 	}
 	now := domains.NowMilli()
 	cutoff := now - timeout.Milliseconds()
@@ -839,11 +841,15 @@ func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, e
 	}
 	var created int64
 	for _, device := range devices {
-		if strings.TrimSpace(device.Guid) == "" || s.hasDeviceOfflineEventSinceLastSeen(device.Guid, device.LastSeenTime) {
+		if strings.TrimSpace(device.Guid) == "" {
 			continue
 		}
-		message := "设备心跳超过 300 秒未更新，请检查设备网络或 navmesh-client 运行状态。"
-		if timeout != 300*time.Second {
+		current, ok := s.staleOfflineDeviceForEvent(device.Guid, cutoff)
+		if !ok || s.hasDeviceOfflineEventSinceLastSeen(current.Guid, current.LastSeenTime) {
+			continue
+		}
+		message := "设备心跳超过 600 秒未更新，请检查设备网络或 navmesh-client 运行状态。"
+		if timeout != 600*time.Second {
 			message = fmt.Sprintf("设备心跳超过 %s 未更新，请检查设备网络或 navmesh-client 运行状态。", timeout)
 		}
 		if !ServiceGroupApp.EventService.WithDB(s.DB()).RecordSuppressed(EventInput{
@@ -856,7 +862,7 @@ func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, e
 			continue
 		}
 		created++
-		go ServiceGroupApp.EmailService.NotifyDeviceOffline(&device, message, now)
+		go ServiceGroupApp.EmailService.NotifyDeviceOffline(&current, message, now)
 	}
 	return created, nil
 }
@@ -1401,6 +1407,40 @@ func (s DeviceService) hasDeviceOfflineEventSinceLastSeen(deviceGuid string, las
 	return count > 0
 }
 
+func (s DeviceService) staleOfflineDeviceForEvent(deviceGuid string, cutoff int64) (domains.Device, bool) {
+	var device domains.Device
+	if strings.TrimSpace(deviceGuid) == "" {
+		return device, false
+	}
+	if err := s.DB().
+		Where("guid = ? AND status = ?", deviceGuid, domains.DeviceStatusOffline).
+		Where("last_seen_time = 0 OR last_seen_time < ?", cutoff).
+		First(&device).Error; err != nil {
+		return device, false
+	}
+	return device, true
+}
+
+func (s DeviceService) closeOpenDeviceOfflineEvents(deviceGuid string, now int64) int64 {
+	deviceGuid = strings.TrimSpace(deviceGuid)
+	if deviceGuid == "" || s.DB() == nil {
+		return 0
+	}
+	if now <= 0 {
+		now = domains.NowMilli()
+	}
+	result := s.DB().Model(&domains.Event{}).
+		Where("device_guid = ? AND event_type = ? AND status = ?", deviceGuid, deviceOfflineEventType, int(domains.StatusEnabled)).
+		Updates(map[string]any{
+			"status":      int(domains.StatusDisabled),
+			"update_time": now,
+		})
+	if result.Error != nil {
+		return 0
+	}
+	return result.RowsAffected
+}
+
 func localDayRangeMillis(now int64) (int64, int64) {
 	t := time.UnixMilli(now).In(time.Local)
 	start := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
@@ -1492,7 +1532,7 @@ func deviceHeartbeatTimeout() time.Duration {
 			}
 		}
 	}
-	return deviceSettingDuration("device_heartbeat_timeout", 90*time.Second)
+	return deviceSettingDuration("device_heartbeat_timeout", 180*time.Second)
 }
 
 func deviceOfflineCheckInterval() time.Duration {
@@ -1500,7 +1540,7 @@ func deviceOfflineCheckInterval() time.Duration {
 }
 
 func deviceOfflineEventDelay() time.Duration {
-	return deviceSettingDuration("device_offline_event_delay", 300*time.Second)
+	return deviceSettingDuration("device_offline_event_delay", 600*time.Second)
 }
 
 func DefaultDeviceRegisterToken() string {

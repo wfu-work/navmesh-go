@@ -34,6 +34,8 @@ type portListener struct {
 	mapping  domains.TCPMapping
 }
 
+const tcpOpenFailedEventSuppressionWindow = 2 * time.Hour
+
 func NewServer(manager *tunnel.Manager) *Server {
 	return &Server{
 		manager:   manager,
@@ -177,13 +179,7 @@ func (s *Server) handleConn(ctx context.Context, item *portListener, client net.
 	cancel()
 	if err != nil {
 		global.NAV_LOG.Warn("open tcp mapping tunnel stream failed", zap.String("mappingGuid", mapping.Guid), zap.String("deviceGuid", device.Guid), zap.Int("publicPort", mapping.PublicPort), zap.Error(err))
-		services.ServiceGroupApp.EventService.Record(services.EventInput{
-			DeviceGuid: device.Guid,
-			EventType:  "open_tcp_failed",
-			Level:      "error",
-			Title:      "open tcp mapping target failed",
-			Message:    err.Error(),
-		})
+		recordTCPOpenFailedEvent(device.Guid, err.Error())
 		closeTCPSession(session.Guid, 0, 0, "open_tunnel_failed: "+err.Error())
 		return
 	}
@@ -206,6 +202,16 @@ func (s *Server) handleConn(ctx context.Context, item *portListener, client net.
 		reason = "closed_by_admin"
 	}
 	closeTCPSession(session.Guid, bytesIn, bytesOut, reason)
+}
+
+func recordTCPOpenFailedEvent(deviceGuid string, message string) bool {
+	return services.ServiceGroupApp.EventService.RecordSuppressed(services.EventInput{
+		DeviceGuid: deviceGuid,
+		EventType:  "open_tcp_failed",
+		Level:      "error",
+		Title:      "open tcp mapping target failed",
+		Message:    message,
+	}, tcpOpenFailedEventSuppressionWindow)
 }
 
 func (s *Server) isStopped() bool {

@@ -173,8 +173,8 @@ func TestTouchOnlineRefreshesLastSeenAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&domains.Device{}); err != nil {
-		t.Fatalf("migrate devices: %v", err)
+	if err := db.AutoMigrate(&domains.Device{}, &domains.Event{}); err != nil {
+		t.Fatalf("migrate tables: %v", err)
 	}
 
 	now := domains.NowMilli()
@@ -186,6 +186,25 @@ func TestTouchOnlineRefreshesLastSeenAndStatus(t *testing.T) {
 	}
 	if err := db.Create(&device).Error; err != nil {
 		t.Fatalf("seed device: %v", err)
+	}
+	events := []domains.Event{
+		{
+			DeviceGuid: device.Guid,
+			EventType:  deviceOfflineEventType,
+			Level:      "warn",
+			Title:      "device heartbeat offline",
+			Status:     int(domains.StatusEnabled),
+		},
+		{
+			DeviceGuid: device.Guid,
+			EventType:  diskUsageHighEventType,
+			Level:      "warn",
+			Title:      "disk usage high",
+			Status:     int(domains.StatusEnabled),
+		},
+	}
+	if err := db.Create(&events).Error; err != nil {
+		t.Fatalf("seed events: %v", err)
 	}
 
 	ServiceGroupApp.DeviceService.WithDB(db).TouchOnline(device.Guid)
@@ -199,6 +218,40 @@ func TestTouchOnlineRefreshesLastSeenAndStatus(t *testing.T) {
 	}
 	if updated.LastSeenTime <= device.LastSeenTime {
 		t.Fatalf("lastSeenTime = %d, want newer than %d", updated.LastSeenTime, device.LastSeenTime)
+	}
+	assertEventStatusByType(t, db, device.Guid, deviceOfflineEventType, int(domains.StatusDisabled))
+	assertEventStatusByType(t, db, device.Guid, diskUsageHighEventType, int(domains.StatusEnabled))
+}
+
+func TestStaleOfflineDeviceForEventRequiresStillOfflineAndExpired(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&domains.Device{}); err != nil {
+		t.Fatalf("migrate devices: %v", err)
+	}
+
+	now := domains.NowMilli()
+	cutoff := now - 10*time.Minute.Milliseconds()
+	devices := []domains.Device{
+		{Sncode: "stale", Alias: "stale", Status: domains.DeviceStatusOffline, LastSeenTime: cutoff - time.Minute.Milliseconds()},
+		{Sncode: "online", Alias: "online", Status: domains.DeviceStatusOnline, LastSeenTime: cutoff - time.Minute.Milliseconds()},
+		{Sncode: "recent", Alias: "recent", Status: domains.DeviceStatusOffline, LastSeenTime: cutoff + time.Minute.Milliseconds()},
+	}
+	if err := db.Create(&devices).Error; err != nil {
+		t.Fatalf("seed devices: %v", err)
+	}
+
+	service := ServiceGroupApp.DeviceService.WithDB(db)
+	if _, ok := service.staleOfflineDeviceForEvent(devices[0].Guid, cutoff); !ok {
+		t.Fatal("stale offline device should be eligible for offline event")
+	}
+	if _, ok := service.staleOfflineDeviceForEvent(devices[1].Guid, cutoff); ok {
+		t.Fatal("online device should not be eligible for offline event")
+	}
+	if _, ok := service.staleOfflineDeviceForEvent(devices[2].Guid, cutoff); ok {
+		t.Fatal("recent offline device should not be eligible for offline event")
 	}
 }
 
@@ -294,6 +347,15 @@ func TestHeartbeatRecordsNetworkQualitySnapshot(t *testing.T) {
 	if err := db.Create(&device).Error; err != nil {
 		t.Fatalf("seed device: %v", err)
 	}
+	if err := db.Create(&domains.Event{
+		DeviceGuid: device.Guid,
+		EventType:  deviceOfflineEventType,
+		Level:      "warn",
+		Title:      "device heartbeat offline",
+		Status:     int(domains.StatusEnabled),
+	}).Error; err != nil {
+		t.Fatalf("seed offline event: %v", err)
+	}
 	token := "device-token"
 	if err := db.Create(&domains.DeviceToken{
 		DeviceGuid: device.Guid,
@@ -346,6 +408,7 @@ func TestHeartbeatRecordsNetworkQualitySnapshot(t *testing.T) {
 	if heartbeat.NetworkType != "cellular" || heartbeat.SignalPct != 100 || heartbeat.RXRateBps != 120000 {
 		t.Fatalf("heartbeat network snapshot = %+v", heartbeat)
 	}
+	assertEventStatusByType(t, db, device.Guid, deviceOfflineEventType, int(domains.StatusDisabled))
 }
 
 func TestNetworkSnapshotDerivesSignalFromWifiRSSI(t *testing.T) {
@@ -466,6 +529,17 @@ func assertDiskUsageEventCount(t *testing.T, db *gorm.DB, deviceGuid string, wan
 	}
 	if count != want {
 		t.Fatalf("disk usage event count = %d, want %d", count, want)
+	}
+}
+
+func assertEventStatusByType(t *testing.T, db *gorm.DB, deviceGuid string, eventType string, want int) {
+	t.Helper()
+	var event domains.Event
+	if err := db.Where("device_guid = ? AND event_type = ?", deviceGuid, eventType).First(&event).Error; err != nil {
+		t.Fatalf("load event %s: %v", eventType, err)
+	}
+	if event.Status != want {
+		t.Fatalf("event %s status = %d, want %d", eventType, event.Status, want)
 	}
 }
 

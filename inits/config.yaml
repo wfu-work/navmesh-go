@@ -22,5 +22,5 @@ zap:
   retention-day: 3
 navmesh:
   data-dir: ./data/navmesh
-  heartbeat-timeout: 90s
+  heartbeat-timeout: 180s
   device-register-token: "navfirst@2020"
