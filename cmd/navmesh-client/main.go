@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -14,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"math"
@@ -42,22 +44,29 @@ import (
 )
 
 const (
-	clientVersion              = "v0.0.6"
-	clientTransportAuto        = "auto"
-	defaultTCPDataChannels     = 32
-	releaseTypeNavmesh         = "navmesh"
-	releaseTypeRain            = "rain"
-	releaseTypeHipnames        = "hipnames"
-	defaultRainInstallDir      = "/mnt/navfirst/nav-rain-go"
-	defaultRainServiceName     = "raind"
-	defaultHipnamesInstallDir  = "/mnt/navfirst/nav-hipnames"
-	defaultHipnamesServiceName = "hipnames"
+	clientVersion                     = "v0.0.7"
+	clientTransportAuto               = "auto"
+	defaultTCPDataChannels            = 8
+	defaultHeartbeatTelemetryInterval = 5 * time.Minute
+	releaseTypeNavmesh                = "navmesh"
+	releaseTypeRain                   = "rain"
+	releaseTypeHipnames               = "hipnames"
+	defaultRainInstallDir             = "/mnt/navfirst/nav-rain-go"
+	defaultRainServiceName            = "raind"
+	defaultHipnamesInstallDir         = "/mnt/navfirst/nav-hipnames"
+	defaultHipnamesServiceName        = "hipnames"
+	upgradeDownloadMaxAttempts        = 6
+	upgradeDownloadIdleTimeout        = 2 * time.Minute
+	upgradeDownloadRetryInitialWait   = 1 * time.Second
+	upgradeDownloadRetryMaxWait       = 30 * time.Second
+	upgradeDownloadRetryCycleWait     = 1 * time.Minute
 )
 
 var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
 var interfaceHasWirelessCapabilities = defaultInterfaceHasWirelessCapabilities
 var outboundInterfaceDetector = detectOutboundInterface
 var networkSignalDetector = detectNetworkSignal
+var systemdServiceDir = "/etc/systemd/system"
 
 type clientConfig struct {
 	Server         string
@@ -85,6 +94,7 @@ type clientConfig struct {
 	ReconnectWait  time.Duration
 	ReconnectMax   time.Duration
 	Heartbeat      time.Duration
+	Telemetry      time.Duration
 	HeartbeatFail  int
 	RequestTimeout time.Duration
 	ServiceName    string
@@ -219,6 +229,19 @@ var networkQualityState = struct {
 	traffic trafficRateState
 }{}
 
+type heartbeatTelemetry struct {
+	key       string
+	sampledAt time.Time
+	system    systemSnapshot
+	traffic   trafficSnapshot
+	network   networkSnapshot
+}
+
+var heartbeatTelemetryState struct {
+	sync.Mutex
+	item heartbeatTelemetry
+}
+
 var vpnRestartState = struct {
 	sync.Mutex
 	lastRequestedAt int64
@@ -226,6 +249,7 @@ var vpnRestartState = struct {
 }{ch: make(chan clientVPNRestartCommand, 1)}
 
 var errVPNRestartRequested = errors.New("vpn restart requested")
+var errUpgradeDownloadRetryable = errors.New("upgrade download temporarily unavailable")
 
 type clientUpgradeReporter struct {
 	cfg            clientConfig
@@ -290,6 +314,7 @@ func parseFlags() clientConfig {
 	flag.DurationVar(&cfg.ReconnectWait, "reconnectWait", 5*time.Second, "首次重连等待时间")
 	flag.DurationVar(&cfg.ReconnectMax, "reconnectMax", 60*time.Second, "指数退避最大重连等待时间")
 	flag.DurationVar(&cfg.Heartbeat, "heartbeat", 30*time.Second, "QUIC 和 HTTP 心跳间隔")
+	flag.DurationVar(&cfg.Telemetry, "telemetry", defaultHeartbeatTelemetryInterval, "系统、网络和流量指标采集间隔")
 	flag.IntVar(&cfg.HeartbeatFail, "heartbeatFail", 3, "连续心跳失败多少次后主动断开并重连")
 	flag.DurationVar(&cfg.RequestTimeout, "requestTimeout", 10*time.Second, "HTTP 请求和本地端口连接超时时间")
 	flag.StringVar(&cfg.ServiceName, "serviceName", "navmesh-client", "systemd 服务名称，用于客户端在线升级后重启")
@@ -325,6 +350,9 @@ func parseFlags() clientConfig {
 	}
 	if cfg.Heartbeat <= 0 {
 		cfg.Heartbeat = 30 * time.Second
+	}
+	if cfg.Telemetry <= 0 {
+		cfg.Telemetry = defaultHeartbeatTelemetryInterval
 	}
 	if cfg.HeartbeatFail <= 0 {
 		cfg.HeartbeatFail = 3
@@ -699,7 +727,6 @@ func connectAndServeQUIC(ctx context.Context, cfg clientConfig) error {
 	defer cancelHeartbeat()
 	heartbeatErr := make(chan error, 2)
 	go heartbeatLoop(heartbeatCtx, controlConn, cfg, heartbeatErr)
-	go quicTunnelHeartbeatLoop(heartbeatCtx, dataConn, cfg, tunnel.RoleData, heartbeatErr)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -775,7 +802,8 @@ func connectAndServeTCP(ctx context.Context, cfg clientConfig) error {
 		return err
 	}
 	defer control.Close()
-	if err := sendTCPHello(control, cfg, tunnel.RoleControl); err != nil {
+	controlReader := bufio.NewReader(control)
+	if err := sendTCPHello(control, controlReader, cfg, tunnel.RoleControl); err != nil {
 		return err
 	}
 	dataCtx, cancelData := context.WithCancel(ctx)
@@ -787,7 +815,7 @@ func connectAndServeTCP(ctx context.Context, cfg clientConfig) error {
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
 	heartbeatErr := make(chan error, 1)
-	go tcpHeartbeatLoop(heartbeatCtx, control, cfg, heartbeatErr)
+	go tcpHeartbeatLoop(heartbeatCtx, control, controlReader, cfg, heartbeatErr)
 	snapshot := collectSystemSnapshot()
 	log.Printf("tcp tunnel connected server=%s sncode=%s hostname=%s hostIp=%s wanIp=%s %s", addr, cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, snapshot.logFields())
 	for {
@@ -806,7 +834,7 @@ func connectAndServeTCP(ctx context.Context, cfg clientConfig) error {
 	}
 }
 
-func sendTCPHello(conn net.Conn, cfg clientConfig, role string) error {
+func sendTCPHello(conn net.Conn, reader io.Reader, cfg clientConfig, role string) error {
 	_ = conn.SetDeadline(time.Now().Add(cfg.RequestTimeout))
 	frame := tunnel.Frame{
 		Type:          tunnel.FrameTypeHello,
@@ -823,7 +851,7 @@ func sendTCPHello(conn net.Conn, cfg clientConfig, role string) error {
 	if err := writeFrame(conn, frame); err != nil {
 		return err
 	}
-	ack, err := readFrame(conn)
+	ack, err := readFrame(reader)
 	if err != nil {
 		return err
 	}
@@ -848,7 +876,7 @@ func tcpDataLoop(ctx context.Context, cfg clientConfig, index int, errCh chan<- 
 			}
 			return
 		}
-		if err := sendTCPHello(conn, cfg, tunnel.RoleData); err != nil {
+		if err := sendTCPHello(conn, conn, cfg, tunnel.RoleData); err != nil {
 			_ = conn.Close()
 			select {
 			case errCh <- err:
@@ -948,7 +976,7 @@ func waitForServiceLogDrain(done <-chan struct{}) {
 	}
 }
 
-func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errCh chan<- error) {
+func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, reader io.Reader, cfg clientConfig, errCh chan<- error) {
 	ticker := time.NewTicker(cfg.Heartbeat)
 	defer ticker.Stop()
 	failures := 0
@@ -963,7 +991,7 @@ func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errC
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tcpErr := sendTCPHeartbeat(conn, cfg)
+			tcpErr := sendTCPHeartbeat(conn, reader, cfg)
 			httpErr := postHeartbeat(ctx, cfg)
 			if heartbeatFailed(tcpErr, httpErr) {
 				failures++
@@ -973,8 +1001,7 @@ func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errC
 					log.Printf("http heartbeat failed but tcp tunnel heartbeat ok err=%v", httpErr)
 				}
 				failures = 0
-				snapshot := collectSystemSnapshot()
-				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat, snapshot.logFields())
+				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat)
 			}
 			if failures >= cfg.HeartbeatFail {
 				select {
@@ -987,7 +1014,7 @@ func tcpHeartbeatLoop(ctx context.Context, conn net.Conn, cfg clientConfig, errC
 	}
 }
 
-func sendTCPHeartbeat(conn net.Conn, cfg clientConfig) error {
+func sendTCPHeartbeat(conn net.Conn, reader io.Reader, cfg clientConfig) error {
 	timeout := heartbeatRoundTripTimeout(cfg)
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	defer conn.SetDeadline(time.Time{})
@@ -995,7 +1022,7 @@ func sendTCPHeartbeat(conn net.Conn, cfg clientConfig) error {
 	if err := writeFrame(conn, tunnel.Frame{Type: tunnel.FrameTypeHeartbeat, SnCode: cfg.Sncode, RequestID: requestID}); err != nil {
 		return err
 	}
-	ack, err := readFrame(conn)
+	ack, err := readFrame(reader)
 	if err != nil {
 		return err
 	}
@@ -1030,8 +1057,7 @@ func heartbeatLoop(ctx context.Context, conn *quic.Conn, cfg clientConfig, errCh
 					log.Printf("http heartbeat failed but tunnel heartbeat ok err=%v", httpErr)
 				}
 				failures = 0
-				snapshot := collectSystemSnapshot()
-				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s %s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat, snapshot.logFields())
+				log.Printf("heartbeat ok sncode=%s hostname=%s hostIp=%s wanIp=%s interval=%s", cfg.Sncode, cfg.Hostname, cfg.HostIP, cfg.WanIP, cfg.Heartbeat)
 			}
 			if failures >= cfg.HeartbeatFail {
 				select {
@@ -1125,9 +1151,6 @@ func heartbeatRoundTripTimeout(cfg clientConfig) time.Duration {
 }
 
 func postHeartbeat(ctx context.Context, cfg clientConfig) error {
-	snapshot := collectSystemSnapshot()
-	traffic := collectTrafficSnapshot(cfg.TrafficIface)
-	network := collectNetworkSnapshot(ctx, cfg, traffic)
 	body := map[string]any{
 		"token":         cfg.authToken(),
 		"guid":          cfg.DeviceGuid,
@@ -1137,9 +1160,10 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		"hostname":      cfg.Hostname,
 		"clientVersion": clientVersion,
 	}
-	snapshot.addTo(body)
-	traffic.addTo(body)
-	network.addTo(body)
+	telemetry := collectHeartbeatTelemetry(ctx, cfg, time.Now())
+	telemetry.system.addTo(body)
+	telemetry.traffic.addTo(body)
+	telemetry.network.addTo(body)
 	data, _ := json.Marshal(body)
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 	defer cancel()
@@ -1148,7 +1172,13 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	startedAt := time.Now()
 	resp, err := http.DefaultClient.Do(req)
+	duration := time.Since(startedAt)
+	recordHeartbeatRequestQuality(cfg, duration, err)
+	if err == nil && duration >= time.Second {
+		log.Printf("heartbeat http request slow sncode=%s duration=%s", cfg.Sncode, duration.Round(time.Millisecond))
+	}
 	if err != nil {
 		return err
 	}
@@ -1185,6 +1215,58 @@ func postHeartbeat(ctx context.Context, cfg clientConfig) error {
 		signalVPNRestart(*result.Data.VPNRestart)
 	}
 	return nil
+}
+
+// collectHeartbeatTelemetry limits expensive host, network and external-command
+// probes to the telemetry interval. Heartbeats continue to be sent frequently,
+// but reuse the latest immutable snapshot between samples.
+func collectHeartbeatTelemetry(ctx context.Context, cfg clientConfig, now time.Time) heartbeatTelemetry {
+	key := strings.TrimSpace(cfg.API) + "|" + strings.TrimSpace(cfg.TrafficIface)
+	interval := cfg.Telemetry
+	if interval <= 0 {
+		interval = defaultHeartbeatTelemetryInterval
+	}
+
+	heartbeatTelemetryState.Lock()
+	defer heartbeatTelemetryState.Unlock()
+	if heartbeatTelemetryState.item.key == key &&
+		!heartbeatTelemetryState.item.sampledAt.IsZero() &&
+		now.Sub(heartbeatTelemetryState.item.sampledAt) < interval {
+		return heartbeatTelemetryState.item
+	}
+
+	traffic := collectTrafficSnapshot(cfg.TrafficIface)
+	network := collectNetworkSnapshot(ctx, cfg, traffic)
+	if heartbeatTelemetryState.item.key == key {
+		network.PingLatencyMs = heartbeatTelemetryState.item.network.PingLatencyMs
+		network.PingLossPct = heartbeatTelemetryState.item.network.PingLossPct
+	}
+	item := heartbeatTelemetry{
+		key:       key,
+		sampledAt: now,
+		system:    collectSystemSnapshot(),
+		traffic:   traffic,
+		network:   network,
+	}
+	heartbeatTelemetryState.item = item
+	return item
+}
+
+func recordHeartbeatRequestQuality(cfg clientConfig, duration time.Duration, requestErr error) {
+	key := strings.TrimSpace(cfg.API) + "|" + strings.TrimSpace(cfg.TrafficIface)
+	heartbeatTelemetryState.Lock()
+	defer heartbeatTelemetryState.Unlock()
+	if heartbeatTelemetryState.item.key != key {
+		return
+	}
+	heartbeatTelemetryState.item.network.PingTarget = heartbeatProbeTarget(cfg)
+	if requestErr != nil {
+		heartbeatTelemetryState.item.network.PingLatencyMs = 0
+		heartbeatTelemetryState.item.network.PingLossPct = 100
+		return
+	}
+	heartbeatTelemetryState.item.network.PingLatencyMs = duration.Milliseconds()
+	heartbeatTelemetryState.item.network.PingLossPct = 0
 }
 
 func signalVPNRestart(command clientVPNRestartCommand) {
@@ -1237,9 +1319,18 @@ func startClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand) {
 			upgradeState.Unlock()
 		}()
 		reporter := newClientUpgradeReporter(cfg, upgrade)
-		if err := performClientUpgrade(cfg, upgrade, reporter); err != nil {
+		for {
+			err := performClientUpgrade(cfg, upgrade, reporter)
+			if err == nil {
+				break
+			}
 			log.Printf("client upgrade failed task=%s version=%s err=%v", upgrade.TaskGuid, upgrade.Version, err)
-			reporter.Failed(err.Error())
+			if !errors.Is(err, errUpgradeDownloadRetryable) {
+				reporter.Failed(err.Error())
+				break
+			}
+			reporter.Retrying(err.Error())
+			time.Sleep(upgradeDownloadRetryCycleWait)
 		}
 	}()
 }
@@ -1258,6 +1349,10 @@ func (r *clientUpgradeReporter) Success(message string) {
 
 func (r *clientUpgradeReporter) Failed(detail string) {
 	r.report("failed", "客户端升级失败", detail, r.progress, r.downloadedSize)
+}
+
+func (r *clientUpgradeReporter) Retrying(detail string) {
+	r.report("running", "下载中断，保留已下载内容等待重试", detail, r.progress, r.downloadedSize)
 }
 
 func (r *clientUpgradeReporter) report(status string, message string, detail string, progress int, downloadedSize int64) {
@@ -1284,7 +1379,13 @@ func (r *upgradeProgressReader) Read(p []byte) (int, error) {
 func performClientUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter *clientUpgradeReporter) error {
 	upgrade.ReleaseType = normalizeUpgradeReleaseType(upgrade.ReleaseType)
 	log.Printf("upgrade started task=%s type=%s version=%s url=%s", upgrade.TaskGuid, upgrade.ReleaseType, upgrade.Version, upgrade.DownloadURL)
-	reporter.Running("准备升级", 3, 0)
+	prepareProgress := 3
+	if reporter != nil && reporter.progress > prepareProgress {
+		prepareProgress = reporter.progress
+	}
+	if reporter != nil {
+		reporter.Running("准备升级", prepareProgress, reporter.downloadedSize)
+	}
 	if err := validateUpgradePlatform(upgrade); err != nil {
 		return err
 	}
@@ -1341,7 +1442,10 @@ func performRainUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	packagePath := filepath.Join(tmpDir, "rain-package")
+	packagePath, err := persistentUpgradePackagePath(cfg, upgrade, "rain-package")
+	if err != nil {
+		return err
+	}
 	extractDir := filepath.Join(tmpDir, "extract")
 	reporter.Running("正在下载北斗降雨应用", 8, 0)
 	if err := downloadUpgradeBinary(cfg, upgrade, packagePath, reporter); err != nil {
@@ -1361,10 +1465,17 @@ func performRainUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, reporter
 	if err := os.Chmod(filepath.Join(defaultRainInstallDir, "navRainApp"), 0o755); err != nil {
 		return err
 	}
+	if err := writeRainSystemdService(defaultRainServiceName, defaultRainInstallDir, "navRainApp"); err != nil {
+		return err
+	}
+	if err := enableSystemdService(defaultRainServiceName); err != nil {
+		return err
+	}
 	reporter.Running("正在重启 raind 服务", 98, reporter.downloadedSize)
 	if err := restartSystemdService(defaultRainServiceName); err != nil {
 		return err
 	}
+	_ = os.Remove(packagePath)
 	reporter.Success("北斗降雨应用已升级并重启")
 	log.Printf("rain upgrade installed task=%s installDir=%s service=%s", upgrade.TaskGuid, defaultRainInstallDir, defaultRainServiceName)
 	return nil
@@ -1382,7 +1493,10 @@ func performHipnamesUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, repo
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	packagePath := filepath.Join(tmpDir, "hipnames-package")
+	packagePath, err := persistentUpgradePackagePath(cfg, upgrade, "hipnames-package")
+	if err != nil {
+		return err
+	}
 	extractDir := filepath.Join(tmpDir, "extract")
 	reporter.Running("正在下载单机版解算应用", 8, 0)
 	if err := downloadUpgradeBinary(cfg, upgrade, packagePath, reporter); err != nil {
@@ -1413,49 +1527,149 @@ func performHipnamesUpgrade(cfg clientConfig, upgrade clientUpgradeCommand, repo
 	if err := restartSystemdService(defaultHipnamesServiceName); err != nil {
 		return err
 	}
+	_ = os.Remove(packagePath)
 	reporter.Success("单机版解算应用已升级并重启")
 	log.Printf("hipnames upgrade installed task=%s installDir=%s service=%s app=%s", upgrade.TaskGuid, defaultHipnamesInstallDir, defaultHipnamesServiceName, appName)
 	return nil
 }
 
 func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targetPath string, reporter *clientUpgradeReporter) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	if strings.TrimSpace(targetPath) == "" {
+		return errors.New("upgrade target path required")
+	}
 	url := upgrade.DownloadURL
 	if strings.HasPrefix(url, "/") {
 		url = strings.TrimRight(cfg.API, "/") + url
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	partPath := upgradePartialPath(targetPath, upgrade)
+	// A process can terminate after promotion but before extraction/install;
+	// move that completed target back into the resumable slot on the next run.
+	if _, statErr := os.Stat(partPath); errors.Is(statErr, os.ErrNotExist) {
+		if _, targetErr := os.Stat(targetPath); targetErr == nil {
+			if renameErr := os.Rename(targetPath, partPath); renameErr != nil {
+				return fmt.Errorf("prepare upgrade partial file: %w", renameErr)
+			}
+		}
+	}
+	partSize, hash, err := loadUpgradePartial(partPath)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("download status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	if upgrade.Size > 0 && partSize > upgrade.Size {
+		if err := os.Remove(partPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove oversized upgrade partial file: %w", err)
+		}
+		partSize = 0
+		hash = sha256.New()
 	}
 	totalSize := upgrade.Size
-	if totalSize <= 0 && resp.ContentLength > 0 {
-		totalSize = resp.ContentLength
-	}
-	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-	if err != nil {
-		return err
-	}
-	hash := sha256.New()
-	downloadedSize := int64(0)
-	lastProgress := 8
-	lastReportAt := time.Now()
-	reader := io.Reader(resp.Body)
 	if reporter != nil {
-		reader = &upgradeProgressReader{
+		reporter.Running(upgradeDownloadMessage(upgrade), downloadProgress(partSize, totalSize), partSize)
+	}
+	downloadedSize := partSize
+	lastProgress := downloadProgress(downloadedSize, totalSize)
+	lastReportAt := time.Now()
+	var lastErr error
+	lastFailureRetryable := false
+	for attempt := 0; attempt < upgradeDownloadMaxAttempts; attempt++ {
+		lastErr = nil
+		lastFailureRetryable = false
+		attemptCtx, cancel := context.WithCancel(context.Background())
+		stopIdleWatch, touchIdle := startUpgradeDownloadIdleWatch(cancel)
+		req, requestErr := http.NewRequestWithContext(attemptCtx, http.MethodGet, url, nil)
+		if requestErr != nil {
+			stopIdleWatch()
+			cancel()
+			return requestErr
+		}
+		if downloadedSize > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", downloadedSize))
+		}
+		resp, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			stopIdleWatch()
+			cancel()
+			lastErr = requestErr
+			lastFailureRetryable = true
+			if !retryUpgradeDownload(attempt, lastErr) {
+				break
+			}
+			continue
+		}
+		responseTotal := totalSize
+		if parsedTotal, ok := parseUpgradeContentRangeTotal(resp.Header.Get("Content-Range")); ok {
+			responseTotal = parsedTotal
+		}
+		if responseTotal <= 0 && resp.ContentLength > 0 {
+			if resp.StatusCode == http.StatusPartialContent {
+				responseTotal = downloadedSize + resp.ContentLength
+			} else {
+				responseTotal = resp.ContentLength
+			}
+		}
+		if responseTotal > 0 {
+			totalSize = responseTotal
+		}
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && totalSize > 0 && downloadedSize == totalSize {
+			_ = resp.Body.Close()
+			stopIdleWatch()
+			cancel()
+			break
+		}
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			_ = resp.Body.Close()
+			stopIdleWatch()
+			cancel()
+			lastErr = fmt.Errorf("server rejected resume range at %d bytes", downloadedSize)
+			lastFailureRetryable = true
+			if err := os.Remove(partPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("reset rejected upgrade partial file: %w", err)
+			}
+			downloadedSize = 0
+			hash = sha256.New()
+			if !retryUpgradeDownload(attempt, lastErr) {
+				break
+			}
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			stopIdleWatch()
+			cancel()
+			lastErr = fmt.Errorf("download status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+			lastFailureRetryable = isRetryableUpgradeDownloadStatus(resp.StatusCode)
+			if !retryUpgradeDownloadStatus(attempt, resp.StatusCode) {
+				break
+			}
+			continue
+		}
+		appendMode := downloadedSize > 0 && resp.StatusCode == http.StatusPartialContent
+		if downloadedSize > 0 && !appendMode {
+			downloadedSize = 0
+			hash = sha256.New()
+		}
+		flags := os.O_CREATE | os.O_WRONLY
+		if appendMode {
+			flags |= os.O_APPEND
+		} else {
+			flags |= os.O_TRUNC
+		}
+		out, openErr := os.OpenFile(partPath, flags, 0o755)
+		if openErr != nil {
+			_ = resp.Body.Close()
+			stopIdleWatch()
+			cancel()
+			return openErr
+		}
+		reader := io.Reader(&upgradeProgressReader{
 			reader: resp.Body,
 			onRead: func(n int64) {
+				touchIdle()
 				downloadedSize += n
+				if reporter == nil {
+					return
+				}
 				progress := downloadProgress(downloadedSize, totalSize)
 				now := time.Now()
 				if progress >= lastProgress+5 || now.Sub(lastReportAt) >= 2*time.Second {
@@ -1464,36 +1678,227 @@ func downloadUpgradeBinary(cfg clientConfig, upgrade clientUpgradeCommand, targe
 					lastReportAt = now
 				}
 			},
+		})
+		_, copyErr := io.Copy(io.MultiWriter(out, hash), reader)
+		syncErr := out.Sync()
+		closeErr := out.Close()
+		_ = resp.Body.Close()
+		stopIdleWatch()
+		cancel()
+		currentSize, statErr := fileSize(partPath)
+		if statErr != nil {
+			return statErr
+		}
+		downloadedSize = currentSize
+		if copyErr != nil {
+			lastErr = copyErr
+			lastFailureRetryable = true
+		} else if syncErr != nil {
+			lastErr = syncErr
+			lastFailureRetryable = true
+		} else if closeErr != nil {
+			lastErr = closeErr
+			lastFailureRetryable = true
+		} else if totalSize > 0 {
+			if currentSize < totalSize {
+				lastErr = io.ErrUnexpectedEOF
+				lastFailureRetryable = true
+			} else if currentSize > totalSize {
+				lastErr = fmt.Errorf("download size exceeded expected size: want=%d got=%d", totalSize, currentSize)
+				lastFailureRetryable = true
+			}
+		}
+		if lastErr == nil {
+			break
+		}
+		if !retryUpgradeDownload(attempt, lastErr) {
+			break
 		}
 	}
-	size, copyErr := io.Copy(io.MultiWriter(out, hash), reader)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(targetPath)
-		return copyErr
+	if lastErr != nil {
+		if lastFailureRetryable {
+			return fmt.Errorf("%w: after %d attempts (partial=%d bytes): %v", errUpgradeDownloadRetryable, upgradeDownloadMaxAttempts, downloadedSize, lastErr)
+		}
+		return fmt.Errorf("download upgrade package after %d attempts (partial=%d bytes): %w", upgradeDownloadMaxAttempts, downloadedSize, lastErr)
 	}
-	if closeErr != nil {
-		_ = os.Remove(targetPath)
-		return closeErr
+	size, err := fileSize(partPath)
+	if err != nil {
+		return err
 	}
 	if reporter != nil {
 		reporter.Running(upgradeVerifyMessage(upgrade), 84, size)
 	}
 	if upgrade.Size > 0 && size != upgrade.Size {
-		_ = os.Remove(targetPath)
 		return fmt.Errorf("download size mismatch want=%d got=%d", upgrade.Size, size)
 	}
 	if upgrade.Sha256 != "" {
 		got := hex.EncodeToString(hash.Sum(nil))
 		if !strings.EqualFold(got, upgrade.Sha256) {
-			_ = os.Remove(targetPath)
+			_ = os.Remove(partPath)
 			return fmt.Errorf("sha256 mismatch want=%s got=%s", upgrade.Sha256, got)
 		}
 	}
 	if reporter != nil {
 		reporter.Running(upgradeVerifiedMessage(upgrade), 88, size)
 	}
+	if err := os.Rename(partPath, targetPath); err != nil {
+		return fmt.Errorf("promote downloaded upgrade package: %w", err)
+	}
 	return nil
+}
+
+// startUpgradeDownloadIdleWatch cancels a request only when no bytes have
+// arrived for the idle timeout. There is deliberately no total download
+// deadline: a slow but healthy link may take as long as it needs.
+func startUpgradeDownloadIdleWatch(cancel context.CancelFunc) (func(), func()) {
+	stop := make(chan struct{})
+	activity := make(chan struct{}, 1)
+	var once sync.Once
+	stopWatch := func() { once.Do(func() { close(stop) }) }
+	touch := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+	go func() {
+		timer := time.NewTimer(upgradeDownloadIdleTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-timer.C:
+				cancel()
+				return
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(upgradeDownloadIdleTimeout)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return stopWatch, touch
+}
+
+func loadUpgradePartial(path string) (int64, hash.Hash, error) {
+	hasher := sha256.New()
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, hasher, nil
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	defer file.Close()
+	size, err := io.Copy(hasher, file)
+	if err != nil {
+		return 0, nil, err
+	}
+	return size, hasher, nil
+}
+
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func parseUpgradeContentRangeTotal(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	slash := strings.LastIndexByte(value, '/')
+	if slash < 0 || slash+1 >= len(value) {
+		return 0, false
+	}
+	total, err := strconv.ParseInt(strings.TrimSpace(value[slash+1:]), 10, 64)
+	return total, err == nil && total > 0
+}
+
+func retryUpgradeDownload(attempt int, err error) bool {
+	if attempt >= upgradeDownloadMaxAttempts-1 {
+		return false
+	}
+	shift := attempt
+	if shift > 5 {
+		shift = 5
+	}
+	wait := upgradeDownloadRetryInitialWait * time.Duration(1<<shift)
+	if wait > upgradeDownloadRetryMaxWait {
+		wait = upgradeDownloadRetryMaxWait
+	}
+	log.Printf("upgrade download interrupted attempt=%d/%d retryIn=%s err=%v", attempt+1, upgradeDownloadMaxAttempts, wait, err)
+	time.Sleep(wait)
+	return true
+}
+
+func retryUpgradeDownloadStatus(attempt int, status int) bool {
+	if !isRetryableUpgradeDownloadStatus(status) {
+		return false
+	}
+	return retryUpgradeDownload(attempt, fmt.Errorf("download status %d", status))
+}
+
+func isRetryableUpgradeDownloadStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
+}
+
+func persistentUpgradePackagePath(cfg clientConfig, upgrade clientUpgradeCommand, label string) (string, error) {
+	stateFile := strings.TrimSpace(cfg.StateFile)
+	if stateFile == "" {
+		stateFile = defaultStateFile()
+	}
+	directory := filepath.Join(filepath.Dir(stateFile), ".navmesh-upgrades")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create upgrade cache directory: %w", err)
+	}
+	name := upgradeCacheIdentity(upgrade)
+	if name == "" {
+		name = "package"
+	}
+	label = sanitizeUpgradeCacheName(label)
+	if label == "" {
+		label = "package"
+	}
+	return filepath.Join(directory, name+"-"+label), nil
+}
+
+func upgradePartialPath(targetPath string, upgrade clientUpgradeCommand) string {
+	identity := upgradeCacheIdentity(upgrade)
+	if identity == "" {
+		return targetPath + ".part"
+	}
+	return targetPath + "." + identity + ".part"
+}
+
+func upgradeCacheIdentity(upgrade clientUpgradeCommand) string {
+	if value := sanitizeUpgradeCacheName(upgrade.Sha256); value != "" {
+		return value
+	}
+	version := sanitizeUpgradeCacheName(upgrade.Version)
+	if version == "" || upgrade.Size <= 0 {
+		return ""
+	}
+	return version + "-" + strconv.FormatInt(upgrade.Size, 10)
+}
+
+func sanitizeUpgradeCacheName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var builder strings.Builder
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' {
+			builder.WriteRune(char)
+		}
+	}
+	return builder.String()
 }
 
 func upgradeDownloadMessage(upgrade clientUpgradeCommand) string {
@@ -1914,7 +2319,12 @@ func writeSimpleSystemdService(serviceName string, description string, workDir s
 	if !serviceLogNamePattern.MatchString(serviceName + ".service") {
 		return fmt.Errorf("invalid service name: %s", serviceName)
 	}
-	servicePath := filepath.Join("/etc/systemd/system", serviceName+".service")
+	servicePath := filepath.Join(systemdServiceDir, serviceName+".service")
+	if _, err := os.Stat(servicePath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	content := fmt.Sprintf(`[Unit]
 Description=%s
 After=network-online.target
@@ -1931,6 +2341,40 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 `, description, workDir, filepath.Join(workDir, execName))
+	return os.WriteFile(servicePath, []byte(content), 0o644)
+}
+
+func writeRainSystemdService(serviceName string, workDir string, execName string) error {
+	serviceName = strings.TrimSpace(serviceName)
+	execName = strings.TrimSpace(execName)
+	if serviceName == "" || execName == "" {
+		return errors.New("service name and executable name are required")
+	}
+	if !serviceLogNamePattern.MatchString(serviceName + ".service") {
+		return fmt.Errorf("invalid service name: %s", serviceName)
+	}
+	servicePath := filepath.Join(systemdServiceDir, serviceName+".service")
+	if _, err := os.Stat(servicePath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	content := fmt.Sprintf(`[Unit]
+Description=navfirst rain predict for go
+After=network.target
+
+[Service]
+Type=idle
+TimeoutStartSec=infinity
+ExecStartPre=/bin/sleep 5
+ExecStart=%s
+WorkingDirectory=%s
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`, filepath.Join(workDir, execName), workDir)
 	return os.WriteFile(servicePath, []byte(content), 0o644)
 }
 
@@ -2070,6 +2514,7 @@ func (snapshot trafficSnapshot) logFields() string {
 }
 
 func collectNetworkSnapshot(ctx context.Context, cfg clientConfig, traffic trafficSnapshot) networkSnapshot {
+	_ = ctx
 	networkIface := outboundInterfaceDetector(cfg.API)
 	if networkIface == "" {
 		networkIface = strings.TrimSpace(traffic.Interface)
@@ -2083,15 +2528,14 @@ func collectNetworkSnapshot(ctx context.Context, cfg clientConfig, traffic traff
 	}
 	rateTraffic := traffic
 	if networkIface != "" && networkIface != strings.TrimSpace(traffic.Interface) {
-		rateTraffic = collectInterfaceTrafficSnapshot(networkIface)
+		// Avoid a second full interface counter scan; omit rate metrics when the
+		// configured traffic interface differs from the outbound interface.
+		rateTraffic = trafficSnapshot{}
 	}
 	rxRate, txRate := updateTrafficRates(rateTraffic)
 	snapshot.RXRateBps = rxRate
 	snapshot.TXRateBps = txRate
-	target, latency, loss := probeHeartbeatLatency(ctx, cfg)
-	snapshot.PingTarget = target
-	snapshot.PingLatencyMs = latency
-	snapshot.PingLossPct = loss
+	snapshot.PingTarget = heartbeatProbeTarget(cfg)
 	return snapshot.normalized()
 }
 
@@ -2531,27 +2975,6 @@ func bytesPerIntervalToBps(bytesValue int64, elapsedMs int64) int64 {
 		return 0
 	}
 	return bytesValue * 8 * 1000 / elapsedMs
-}
-
-func probeHeartbeatLatency(ctx context.Context, cfg clientConfig) (string, int64, float64) {
-	target := heartbeatProbeTarget(cfg)
-	if target == "" {
-		return "", 0, 0
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, minDuration(cfg.RequestTimeout, 3*time.Second))
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, target, nil)
-	if err != nil {
-		return target, 0, 100
-	}
-	start := time.Now()
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return target, 0, 100
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-	_ = resp.Body.Close()
-	return target, time.Since(start).Milliseconds(), 0
 }
 
 func heartbeatProbeTarget(cfg clientConfig) string {
@@ -3102,6 +3525,13 @@ func readFrame(r io.Reader) (tunnel.Frame, error) {
 }
 
 func readFrameLine(r io.Reader) ([]byte, error) {
+	if reader, ok := r.(*bufio.Reader); ok {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 64*1024 {
+			return nil, errors.New("frame too large")
+		}
+		return line, err
+	}
 	line := make([]byte, 0, 256)
 	buf := make([]byte, 1)
 	for {

@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"sort"
 	"strings"
 
 	"navmesh-go/domains"
@@ -320,7 +321,7 @@ func (s MessageService) DeleteRecipient(guid string) error {
 
 func (s MessageService) EnabledRecipients() ([]domains.MessageRecipient, error) {
 	var rows []domains.MessageRecipient
-	err := s.DB().Where("status = ? AND email <> ?", int(domains.StatusEnabled), "").Order("update_time DESC").Find(&rows).Error
+	err := s.DB().Where("status = ? AND email <> ?", int(domains.StatusEnabled), "").Order("update_time DESC, id ASC").Find(&rows).Error
 	return rows, err
 }
 
@@ -357,6 +358,17 @@ func (s MessageService) EnabledRecipientsByMessageTypeAndDevice(messageType stri
 			filtered = append(filtered, row)
 		}
 	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		allDevicesI := normalizeCSVList(filtered[i].DeviceGuids) == ""
+		allDevicesJ := normalizeCSVList(filtered[j].DeviceGuids) == ""
+		if allDevicesI != allDevicesJ {
+			return allDevicesI
+		}
+		if filtered[i].UpdateTime != filtered[j].UpdateTime {
+			return filtered[i].UpdateTime > filtered[j].UpdateTime
+		}
+		return filtered[i].Id < filtered[j].Id
+	})
 	return filtered, nil
 }
 
@@ -733,15 +745,8 @@ func pageMessageQuery[T any](db *gorm.DB, params map[string]string, order string
 	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
+	page := ParsePage(params, DefaultMaxPageSize)
 	var items []T
-	err := db.Order(order).Limit(size).Offset((page - 1) * size).Find(&items).Error
+	err := db.Order(order).Limit(page.Size).Offset((page.Page - 1) * page.Size).Find(&items).Error
 	return items, total, err
 }

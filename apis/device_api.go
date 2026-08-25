@@ -22,31 +22,27 @@ type DeviceApi struct{}
 var serviceLogNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
 
 func (d DeviceApi) Register(c *gin.Context) {
-	var req services.RegisterDeviceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.RegisterDeviceRequest](c)
+	if !ok {
 		return
 	}
 	result, err := deviceService.Register(req, c.ClientIP())
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(result, c)
 }
 
 func (d DeviceApi) Heartbeat(c *gin.Context) {
-	var req services.HeartbeatRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.HeartbeatRequest](c)
+	if !ok {
 		return
 	}
 	if req.Token == "" {
 		req.Token = utils.BearerToken(c)
 	}
 	device, err := deviceService.Heartbeat(req, c.ClientIP())
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	payload := map[string]any{}
@@ -71,8 +67,7 @@ func (d DeviceApi) Heartbeat(c *gin.Context) {
 func (d DeviceApi) List(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := deviceService.List(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
@@ -81,11 +76,18 @@ func (d DeviceApi) List(c *gin.Context) {
 func (d DeviceApi) Stats(c *gin.Context) {
 	params := utils.QueryParams(c)
 	stats, err := deviceService.Stats(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(stats, c)
+}
+
+func (d DeviceApi) Dashboard(c *gin.Context) {
+	result, err := deviceService.Dashboard()
+	if fail(c, err) {
+		return
+	}
+	response.Ok(result, c)
 }
 
 func (d DeviceApi) TrafficDaily(c *gin.Context) {
@@ -94,8 +96,7 @@ func (d DeviceApi) TrafficDaily(c *gin.Context) {
 		params["deviceGuid"] = guid
 	}
 	items, summary, err := deviceTrafficService.Daily(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(gin.H{"items": items, "summary": summary}, c)
@@ -103,67 +104,60 @@ func (d DeviceApi) TrafficDaily(c *gin.Context) {
 
 func (d DeviceApi) Get(c *gin.Context) {
 	result, err := deviceService.Get(c.Param("guid"))
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(result, c)
 }
 
 func (d DeviceApi) Update(c *gin.Context) {
-	var req services.UpdateDeviceProfileRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.UpdateDeviceProfileRequest](c)
+	if !ok {
 		return
 	}
 	guid := c.Param("guid")
 	device, err := deviceService.UpdateProfile(guid, req)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "update", Resource: "device", ResourceID: guid, Message: req.Alias, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "update", Resource: "device", ResourceID: guid, Message: req.Alias})
 	response.Ok(device, c)
 }
 
 func (d DeviceApi) Delete(c *gin.Context) {
 	guid := c.Param("guid")
-	if err := deviceService.Delete(guid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, deviceService.Delete(guid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "delete", Resource: "device", ResourceID: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "delete", Resource: "device", ResourceID: guid})
 	response.Ok(true, c)
 }
 
 func (d DeviceApi) Disable(c *gin.Context) {
 	guid := c.Param("guid")
-	if err := deviceService.Disable(guid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, deviceService.Disable(guid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "device", ResourceID: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "disable", Resource: "device", ResourceID: guid})
 	response.Ok(true, c)
 }
 
 func (d DeviceApi) Enable(c *gin.Context) {
 	guid := c.Param("guid")
-	if err := deviceService.Enable(guid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, deviceService.Enable(guid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "enable", Resource: "device", ResourceID: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "enable", Resource: "device", ResourceID: guid})
 	response.Ok(true, c)
 }
 
 func (d DeviceApi) RestartVPN(c *gin.Context) {
 	guid := c.Param("guid")
 	command, err := deviceService.RequestVPNRestart(guid)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "restart", Resource: "device_vpn", ResourceID: guid, Message: "VPN 重启指令", SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "restart", Resource: "device_vpn", ResourceID: guid, Message: "VPN 重启指令"})
 	eventService.Record(services.EventInput{DeviceGuid: guid, EventType: "vpn_restart", Level: "info", Title: "VPN 重启指令已创建", Message: "等待客户端心跳执行"})
 	response.Ok(command, c)
 }
@@ -188,7 +182,7 @@ func (d DeviceApi) StreamServiceLogs(c *gin.Context) {
 	}
 	defer stream.Close()
 
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "view", Resource: "device_service_log", ResourceID: guid, Message: serviceName, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "view", Resource: "device_service_log", ResourceID: guid, Message: serviceName})
 
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.Header("Cache-Control", "no-cache, no-transform")
@@ -242,27 +236,24 @@ func normalizeServiceLogQuery(serviceName string, tailText string) (string, int,
 func (d DeviceApi) DisableToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")
-	if err := deviceTokenService.Disable(guid, tokenGuid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, deviceTokenService.Disable(guid, tokenGuid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "device_token", ResourceID: tokenGuid, Message: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "disable", Resource: "device_token", ResourceID: tokenGuid, Message: guid})
 	response.Ok(true, c)
 }
 
 func (d DeviceApi) CreateToken(c *gin.Context) {
-	var req services.CreateDeviceTokenRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.CreateDeviceTokenRequest](c)
+	if !ok {
 		return
 	}
 	guid := c.Param("guid")
 	result, err := deviceTokenService.CreateToken(guid, req)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "create", Resource: "device_token", ResourceID: result.Item.Guid, Message: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "create", Resource: "device_token", ResourceID: result.Item.Guid, Message: guid})
 	response.Ok(result, c)
 }
 
@@ -270,22 +261,20 @@ func (d DeviceApi) RotateToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")
 	result, err := deviceTokenService.Rotate(guid, tokenGuid)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "rotate", Resource: "device_token", ResourceID: tokenGuid, Message: result.Item.Guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "rotate", Resource: "device_token", ResourceID: tokenGuid, Message: result.Item.Guid})
 	response.Ok(result, c)
 }
 
 func (d DeviceApi) EnableToken(c *gin.Context) {
 	guid := c.Param("guid")
 	tokenGuid := c.Param("tokenGuid")
-	if err := deviceTokenService.Enable(guid, tokenGuid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, deviceTokenService.Enable(guid, tokenGuid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "enable", Resource: "device_token", ResourceID: tokenGuid, Message: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "enable", Resource: "device_token", ResourceID: tokenGuid, Message: guid})
 	response.Ok(true, c)
 }
 
@@ -294,47 +283,41 @@ func (d DeviceApi) TypeDefaults(c *gin.Context) {
 }
 
 func (d DeviceApi) CreateUpgradeTask(c *gin.Context) {
-	var req services.CreateDeviceUpgradeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.CreateDeviceUpgradeRequest](c)
+	if !ok {
 		return
 	}
 	guid := c.Param("guid")
 	release, err := releaseService.GetEnabled(req.ReleaseGuid)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	task, err := deviceUpgradeService.CreateTask(guid, req, publicReleaseDownloadURL(c, release))
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "create", Resource: "device_upgrade", ResourceID: task.Guid, Message: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "create", Resource: "device_upgrade", ResourceID: task.Guid, Message: guid})
 	response.Ok(task, c)
 }
 
 func (d DeviceApi) ListUpgradeTasks(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := deviceUpgradeService.List(c.Param("guid"), params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
 }
 
 func (d DeviceApi) ReportUpgrade(c *gin.Context) {
-	var req services.DeviceUpgradeReportRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.DeviceUpgradeReportRequest](c)
+	if !ok {
 		return
 	}
 	if req.Token == "" {
 		req.Token = utils.BearerToken(c)
 	}
-	if err := deviceUpgradeService.Report(req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, deviceUpgradeService.Report(req)) {
 		return
 	}
 	response.Ok(true, c)

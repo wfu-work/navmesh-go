@@ -199,20 +199,7 @@ func (s ReleaseService) List(params map[string]string) ([]domains.Release, int64
 	if statusParam := strings.TrimSpace(params["status"]); statusParam != "" {
 		db = db.Where("status = ?", utils.Str2Int(statusParam))
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.Release
-	err := db.Order("update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
+	items, total, err := queryPage[domains.Release](db, params, DefaultMaxPageSize, "update_time DESC")
 	for index := range items {
 		items[index].NormalizeDefaults()
 	}

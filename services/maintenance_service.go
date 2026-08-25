@@ -22,6 +22,7 @@ const (
 	retentionCleanerTaskName = "retention_cleanup"
 	retentionCleanerSpec     = "@every 1m"
 	retentionMinimumInterval = time.Minute
+	retentionDeleteBatchSize = 1000
 )
 
 var (
@@ -65,7 +66,7 @@ func (s MaintenanceService) CleanupRetention() RetentionCleanupResult {
 	now := domains.NowMilli()
 	return RetentionCleanupResult{
 		AuditLogs:         deleteBefore(&domains.AuditLog{}, "create_time", now, settingInt("audit_retention_days", 90)),
-		HTTPAccessLogs:    deleteBefore(&domains.HTTPAccessLog{}, "create_time", now, settingInt("http_access_retention_days", 30)),
+		HTTPAccessLogs:    deleteBefore(&domains.HttpAccessLog{}, "create_time", now, settingInt("http_access_retention_days", 30)),
 		TunnelSessions:    deleteBefore(&domains.TunnelSession{}, "end_time", now, settingInt("session_retention_days", 90), closedRows),
 		DeviceHeartbeats:  deleteBefore(&domains.DeviceHeartbeat{}, "create_time", now, settingInt("heartbeat_retention_days", 7)),
 		DeviceTrafficDays: deleteBefore(&domains.DeviceTrafficDaily{}, "last_seen_time", now, settingInt("traffic_daily_retention_days", 370)),
@@ -114,16 +115,39 @@ func deleteBefore(model any, column string, now int64, days int, scopes ...func(
 		return 0
 	}
 	cutoff := now - int64(days)*24*60*60*1000
-	db := global.NAV_DB.Where(column+" < ?", cutoff)
-	for _, scope := range scopes {
-		db = scope(db)
+	var deleted int64
+	for {
+		candidates := global.NAV_DB.Model(model).Select("id").Where(column+" < ?", cutoff)
+		for _, scope := range scopes {
+			candidates = scope(candidates)
+		}
+		var tx *gorm.DB
+		if strings.EqualFold(global.NAV_DB.Dialector.Name(), "sqlite") {
+			// SQLite can execute the limited subquery directly. This removes the
+			// ID slice allocation and halves round trips for the default database.
+			tx = global.NAV_DB.Where("id IN (?)", candidates.Limit(retentionDeleteBatchSize)).Delete(model)
+		} else {
+			// Keep the two-step form for dialects (notably MySQL) that reject
+			// modifying a table while reading it from a subquery.
+			var ids []uint
+			if err := candidates.Order("id ASC").Limit(retentionDeleteBatchSize).Pluck("id", &ids).Error; err != nil {
+				global.NAV_LOG.Warn("navmesh retention select batch failed", zap.String("column", column), zap.Error(err))
+				return deleted
+			}
+			if len(ids) == 0 {
+				return deleted
+			}
+			tx = global.NAV_DB.Where("id IN ?", ids).Delete(model)
+		}
+		if tx.Error != nil {
+			global.NAV_LOG.Warn("navmesh retention delete batch failed", zap.String("column", column), zap.Error(tx.Error))
+			return deleted
+		}
+		deleted += tx.RowsAffected
+		if tx.RowsAffected < retentionDeleteBatchSize {
+			return deleted
+		}
 	}
-	tx := db.Delete(model)
-	if tx.Error != nil {
-		global.NAV_LOG.Warn("navmesh retention delete failed", zap.String("column", column), zap.Error(tx.Error))
-		return 0
-	}
-	return tx.RowsAffected
 }
 
 func closedRows(db *gorm.DB) *gorm.DB {

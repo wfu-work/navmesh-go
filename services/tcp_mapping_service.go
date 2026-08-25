@@ -59,21 +59,7 @@ func (s TCPMappingService) List(params map[string]string) ([]domains.TCPMapping,
 	if publicPort := utils.Str2Int(params["publicPort"]); publicPort > 0 {
 		db = db.Where("public_port = ?", publicPort)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.TCPMapping
-	err := db.Order("update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPage[domains.TCPMapping](db, params, DefaultMaxPageSize, "update_time DESC, id DESC")
 }
 
 func (s TCPMappingService) Enabled() ([]domains.TCPMapping, error) {

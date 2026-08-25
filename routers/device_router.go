@@ -16,6 +16,7 @@ func (d *DeviceRouter) InitDeviceRouter(publicGroup *gin.RouterGroup, privateGro
 	{
 		devices.GET("list", deviceApi.List)
 		devices.GET("stats", deviceApi.Stats)
+		devices.GET("dashboard", deviceApi.Dashboard)
 		devices.GET("traffic/daily", deviceApi.TrafficDaily)
 		devices.GET("types/defaults", deviceApi.TypeDefaults)
 		devices.GET(":guid/service-logs/stream", deviceApi.StreamServiceLogs)

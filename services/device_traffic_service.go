@@ -107,15 +107,13 @@ func (s DeviceTrafficService) Daily(params map[string]string) ([]domains.DeviceT
 	if iface := normalizeTrafficInterface(params["iface"]); iface != "" {
 		db = db.Where("iface = ?", iface)
 	}
+	summary := DeviceTrafficSummary{}
+	if err := db.Select("COALESCE(SUM(rx_bytes), 0) AS rx_bytes, COALESCE(SUM(tx_bytes), 0) AS tx_bytes, COALESCE(SUM(total_bytes), 0) AS total_bytes").Scan(&summary).Error; err != nil {
+		return nil, DeviceTrafficSummary{}, err
+	}
 	var items []domains.DeviceTrafficDaily
 	if err := db.Order("day ASC, device_guid ASC, iface ASC").Find(&items).Error; err != nil {
 		return nil, DeviceTrafficSummary{}, err
-	}
-	summary := DeviceTrafficSummary{}
-	for _, item := range items {
-		summary.RXBytes += item.RXBytes
-		summary.TXBytes += item.TXBytes
-		summary.TotalBytes += item.TotalBytes
 	}
 	return items, summary, nil
 }

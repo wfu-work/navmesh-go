@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"navmesh-go/domains"
@@ -32,7 +33,14 @@ const (
 	deviceOfflineEventType              = "device_offline"
 	deviceOfflineEventSuppressionWindow = 6 * time.Hour
 	deviceOnlineTouchMinInterval        = 15 * time.Second
+	defaultTelemetrySampleInterval      = 5 * time.Minute
 )
+
+var telemetryIntervalState struct {
+	sync.Mutex
+	loadedAt time.Time
+	value    time.Duration
+}
 
 func (s DeviceService) WithDB(db *gorm.DB) DeviceService {
 	s.CrudService = *s.CrudService.WithDB(db)
@@ -344,6 +352,8 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 		return nil, errors.New("device disabled")
 	}
 	now := domains.NowMilli()
+	previousStatus := device.Status
+	DefaultLivenessRegistry.Touch(device.Guid, now)
 	updates := map[string]any{
 		"status":         domains.DeviceStatusOnline,
 		"last_seen_time": now,
@@ -406,22 +416,97 @@ func (s DeviceService) Heartbeat(req HeartbeatRequest, sourceIP string) (*domain
 	}
 	networkSnapshot := reconcileNetworkSnapshotWithLocation(networkSnapshotFromHeartbeat(req), location)
 	addNetworkSnapshotUpdates(updates, networkSnapshot)
-	if hasHeartbeatMetrics(req, networkSnapshot) {
+	hasTelemetry := hasHeartbeatMetrics(req, networkSnapshot)
+	sampleTelemetry := hasTelemetry && DefaultTelemetrySampler.ShouldPersist(device.Guid, now, telemetrySampleInterval())
+	persistHeartbeat := previousStatus != domains.DeviceStatusOnline || sampleTelemetry
+	if hasTelemetry {
 		updates["last_metric_at"] = now
 	}
-	if err := s.DB().Model(&domains.Device{}).Where("guid = ?", device.Guid).Updates(updates).Error; err != nil {
-		return nil, err
+	applyHeartbeatResultToDevice(&device, req, sourceIP, wanIP, location, networkSnapshot, now)
+	if persistHeartbeat {
+		if err := s.DB().Model(&domains.Device{}).Where("guid = ?", device.Guid).Updates(updates).Error; err != nil {
+			if sampleTelemetry {
+				DefaultTelemetrySampler.Forget(device.Guid, now)
+			}
+			return nil, err
+		}
+		s.closeOpenDeviceOfflineEvents(device.Guid, now)
+		if sampleTelemetry {
+			if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, networkSnapshot, now); err != nil {
+				DefaultTelemetrySampler.Forget(device.Guid, now)
+				return nil, err
+			}
+			s.recordDailyDiskUsageEvent(device.Guid, req, now)
+			if err := ServiceGroupApp.DeviceTrafficService.WithDB(s.DB()).RecordHeartbeatSample(device.Guid, req, now); err != nil {
+				global.NAV_LOG.Warn("record device traffic sample failed", zap.String("deviceGuid", device.Guid), zap.Error(err))
+			}
+			DefaultTelemetrySampler.MarkPersisted(device.Guid, now)
+		}
+		DefaultLivenessRegistry.MarkPersisted(device.Guid, now)
 	}
-	s.closeOpenDeviceOfflineEvents(device.Guid, now)
-	if err := s.recordHeartbeat(device.Guid, sourceIP, strings.TrimSpace(req.HostIP), wanIP, location, networkSnapshot, now); err != nil {
-		return nil, err
-	}
-	s.recordDailyDiskUsageEvent(device.Guid, req, now)
-	if err := ServiceGroupApp.DeviceTrafficService.WithDB(s.DB()).RecordHeartbeatSample(device.Guid, req, now); err != nil {
-		global.NAV_LOG.Warn("record device traffic sample failed", zap.String("deviceGuid", device.Guid), zap.Error(err))
-	}
-	_ = s.DB().Where("guid = ?", device.Guid).First(&device).Error
 	return &device, nil
+}
+
+func applyHeartbeatResultToDevice(device *domains.Device, req HeartbeatRequest, sourceIP, wanIP, location string, network heartbeatNetworkSnapshot, now int64) {
+	if device == nil {
+		return
+	}
+	device.Status = domains.DeviceStatusOnline
+	device.LastSeenTime = now
+	device.SourceIP = sourceIP
+	device.UpdateTime = now
+	if wanIP != "" || (strings.TrimSpace(device.WanIP) != "" && normalizeIPv4(device.WanIP) == "") {
+		device.WanIP = wanIP
+	}
+	if location != "" || wanIP == "" {
+		device.Location = location
+	}
+	if value := strings.TrimSpace(req.HostIP); value != "" {
+		device.HostIP = value
+	}
+	if value := strings.TrimSpace(req.Hostname); value != "" {
+		device.Hostname = value
+	}
+	if value := strings.TrimSpace(req.ClientVersion); value != "" {
+		device.ClientVersion = value
+	}
+	if value := strings.TrimSpace(req.OS); value != "" {
+		device.OS = value
+	}
+	if value := strings.TrimSpace(req.OSVersion); value != "" {
+		device.OSVersion = value
+	}
+	if value := strings.TrimSpace(req.Kernel); value != "" {
+		device.Kernel = value
+	}
+	if value := strings.TrimSpace(req.Arch); value != "" {
+		device.Arch = value
+	}
+	if req.MemoryTotal > 0 {
+		device.MemoryTotal = req.MemoryTotal
+	}
+	if req.MemoryUsed > 0 {
+		device.MemoryUsed = req.MemoryUsed
+	}
+	if req.MemoryFree > 0 {
+		device.MemoryFree = req.MemoryFree
+	}
+	if req.DiskTotal > 0 {
+		device.DiskTotal = req.DiskTotal
+	}
+	if req.DiskUsed > 0 {
+		device.DiskUsed = req.DiskUsed
+	}
+	if req.DiskFree > 0 {
+		device.DiskFree = req.DiskFree
+	}
+	if req.DiskUsedPct > 0 {
+		device.DiskUsedPct = req.DiskUsedPct
+	}
+	applyNetworkSnapshotToDevice(device, network)
+	if hasHeartbeatMetrics(req, network) {
+		device.LastMetricAt = now
+	}
 }
 
 func (s DeviceService) UpdateProfile(guid string, req UpdateDeviceProfileRequest) (*domains.Device, error) {
@@ -469,6 +554,7 @@ func (s DeviceService) UpdateProfile(guid string, req UpdateDeviceProfileRequest
 			global.NAV_LOG.Warn("refresh ssh alias after sncode update failed", zap.String("deviceGuid", guid), zap.Error(err))
 		}
 	}
+	triggerHTTPRouteReload()
 	return &device, nil
 }
 
@@ -480,30 +566,30 @@ func (s DeviceService) List(params map[string]string) ([]domains.Device, int64, 
 	if pageInfo.Size <= 0 {
 		pageInfo.Size = 20
 	}
+	if pageInfo.Size > DefaultMaxPageSize {
+		pageInfo.Size = DefaultMaxPageSize
+	}
 	db := s.deviceListQuery(params, true)
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var items []domains.Device
-	err := db.Order("update_time DESC").Limit(pageInfo.Size).Offset((pageInfo.Page - 1) * pageInfo.Size).Find(&items).Error
+	err := db.Order("update_time DESC, id DESC").Limit(pageInfo.Size).Offset((pageInfo.Page - 1) * pageInfo.Size).Find(&items).Error
 	return items, total, err
 }
 
 func (s DeviceService) Stats(params map[string]string) (*DeviceStats, error) {
 	stats := &DeviceStats{}
-	if err := s.deviceListQuery(params, true).Count(&stats.Total).Error; err != nil {
+	if err := s.deviceListQuery(params, true).Select(`
+		COUNT(*) AS total,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS registered,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS online,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS offline,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS disabled
+	`, domains.DeviceStatusRegistered, domains.DeviceStatusOnline, domains.DeviceStatusOffline, domains.DeviceStatusDisabled).Scan(stats).Error; err != nil {
 		return nil, err
 	}
-	countStatus := func(status int) int64 {
-		var count int64
-		_ = s.deviceListQuery(params, true).Where("status = ?", status).Count(&count).Error
-		return count
-	}
-	stats.Registered = countStatus(domains.DeviceStatusRegistered)
-	stats.Online = countStatus(domains.DeviceStatusOnline)
-	stats.Offline = countStatus(domains.DeviceStatusOffline)
-	stats.Disabled = countStatus(domains.DeviceStatusDisabled)
 	return stats, nil
 }
 
@@ -599,7 +685,7 @@ func (s DeviceService) Delete(guid string) error {
 	}
 	closeRuntimeDeviceConnection(guid, "device deleted")
 	s.closeDeviceRuntimeSessions(guid)
-	return s.DB().Transaction(func(tx *gorm.DB) error {
+	err := s.DB().Transaction(func(tx *gorm.DB) error {
 		if err := tx.Unscoped().Where("device_guid = ?", guid).Delete(&domains.DeviceToken{}).Error; err != nil {
 			return err
 		}
@@ -626,6 +712,13 @@ func (s DeviceService) Delete(guid string) error {
 		}
 		return tx.Unscoped().Where("guid = ?", guid).Delete(&domains.Device{}).Error
 	})
+	if err == nil {
+		invalidateDeviceTokenValidationCache(s.DB(), guid)
+		DefaultTelemetrySampler.ForgetDevice(guid)
+		DefaultLivenessRegistry.ForgetDevice(guid)
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s DeviceService) Disable(guid string) error {
@@ -634,10 +727,14 @@ func (s DeviceService) Disable(guid string) error {
 		return errors.New("guid required")
 	}
 	now := domains.NowMilli()
-	return s.DB().Model(&domains.Device{}).Where("guid = ?", guid).Updates(map[string]any{
+	err := s.DB().Model(&domains.Device{}).Where("guid = ?", guid).Updates(map[string]any{
 		"status":      domains.DeviceStatusDisabled,
 		"update_time": now,
 	}).Error
+	if err == nil {
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s DeviceService) Enable(guid string) error {
@@ -655,12 +752,16 @@ func (s DeviceService) Enable(guid string) error {
 			return err
 		}
 	}
-	return s.DB().Model(&domains.Device{}).
+	err := s.DB().Model(&domains.Device{}).
 		Where("guid = ? AND status IN ?", guid, []int{domains.DeviceStatusRegistered, domains.DeviceStatusDisabled}).
 		Updates(map[string]any{
 			"status":      domains.DeviceStatusOffline,
 			"update_time": now,
 		}).Error
+	if err == nil {
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s DeviceService) TypeDefaults() []domains.DeviceGroup {
@@ -826,6 +927,30 @@ func (s DeviceService) MarkStaleOnlineDevicesOffline(timeout time.Duration) (int
 	return result.RowsAffected, result.Error
 }
 
+func telemetrySampleInterval() time.Duration {
+	if global.NAV_VIPER != nil {
+		if value := strings.TrimSpace(global.NAV_VIPER.GetString("navmesh.telemetry-sample-interval")); value != "" {
+			if interval, err := time.ParseDuration(value); err == nil && interval > 0 {
+				return interval
+			}
+		}
+	}
+	telemetryIntervalState.Lock()
+	defer telemetryIntervalState.Unlock()
+	if !telemetryIntervalState.loadedAt.IsZero() && time.Since(telemetryIntervalState.loadedAt) < 5*time.Second {
+		return telemetryIntervalState.value
+	}
+	telemetryIntervalState.value = deviceSettingDuration("telemetry_sample_interval", defaultTelemetrySampleInterval)
+	telemetryIntervalState.loadedAt = time.Now()
+	return telemetryIntervalState.value
+}
+
+func invalidateTelemetrySampleInterval() {
+	telemetryIntervalState.Lock()
+	telemetryIntervalState.loadedAt = time.Time{}
+	telemetryIntervalState.Unlock()
+}
+
 func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, error) {
 	if timeout <= 0 {
 		timeout = 600 * time.Second
@@ -836,6 +961,8 @@ func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, e
 	if err := s.DB().
 		Where("status = ?", domains.DeviceStatusOffline).
 		Where("last_seen_time = 0 OR last_seen_time < ?", cutoff).
+		Where("NOT EXISTS (SELECT 1 FROM navmesh_events e WHERE e.device_guid = navmesh_devices.guid AND e.event_type = ? AND e.create_time >= navmesh_devices.last_seen_time AND e.deleted_time IS NULL)", deviceOfflineEventType).
+		Limit(500).
 		Find(&devices).Error; err != nil {
 		return 0, err
 	}
@@ -844,25 +971,25 @@ func (s DeviceService) RecordStaleOfflineEvents(timeout time.Duration) (int64, e
 		if strings.TrimSpace(device.Guid) == "" {
 			continue
 		}
-		current, ok := s.staleOfflineDeviceForEvent(device.Guid, cutoff)
-		if !ok || s.hasDeviceOfflineEventSinceLastSeen(current.Guid, current.LastSeenTime) {
+		if DefaultLivenessRegistry.LastSeen(device.Guid) > cutoff {
 			continue
 		}
 		message := "设备心跳超过 600 秒未更新，请检查设备网络或 navmesh-client 运行状态。"
 		if timeout != 600*time.Second {
 			message = fmt.Sprintf("设备心跳超过 %s 未更新，请检查设备网络或 navmesh-client 运行状态。", timeout)
 		}
-		if !ServiceGroupApp.EventService.WithDB(s.DB()).RecordSuppressed(EventInput{
+		ServiceGroupApp.EventService.WithDB(s.DB()).RecordAt(EventInput{
 			DeviceGuid: device.Guid,
 			EventType:  deviceOfflineEventType,
 			Level:      "warn",
 			Title:      "device heartbeat offline",
 			Message:    message,
-		}, deviceOfflineEventSuppressionWindow) {
-			continue
-		}
+		}, now)
 		created++
-		go ServiceGroupApp.EmailService.NotifyDeviceOffline(&current, message, now)
+		deviceCopy := device
+		DefaultNotificationRunner.Submit(func(context.Context) {
+			ServiceGroupApp.EmailService.NotifyDeviceOffline(&deviceCopy, message, now)
+		})
 	}
 	return created, nil
 }
@@ -878,6 +1005,10 @@ func (s DeviceService) StartOfflineCleaner(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if err := DefaultLivenessRegistry.Flush(); err != nil {
+				global.NAV_LOG.Warn("flush device liveness before offline scan failed", zap.Error(err))
+				continue
+			}
 			affected, err := s.MarkStaleOnlineDevicesOffline(timeout)
 			if err != nil {
 				global.NAV_LOG.Warn("mark stale online devices offline failed", zap.Error(err))
@@ -1394,7 +1525,9 @@ func (s DeviceService) recordDailyDiskUsageEvent(deviceGuid string, req Heartbea
 	if err := s.DB().Where("guid = ?", deviceGuid).First(&device).Error; err != nil {
 		return
 	}
-	go ServiceGroupApp.EmailService.NotifyDiskUsageHigh(&device, req, message, now)
+	DefaultNotificationRunner.Submit(func(context.Context) {
+		ServiceGroupApp.EmailService.NotifyDiskUsageHigh(&device, req, message, now)
+	})
 }
 
 func (s DeviceService) hasDeviceOfflineEventSinceLastSeen(deviceGuid string, lastSeenTime int64) bool {

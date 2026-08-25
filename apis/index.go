@@ -1,6 +1,11 @@
 package apis
 
-import "navmesh-go/services"
+import (
+	"navmesh-go/services"
+
+	"github.com/gin-gonic/gin"
+	"github.com/wfu-work/nav-common-go-lib/response"
+)
 
 var ApiGroupApp = new(ApiGroup)
 
@@ -41,3 +46,35 @@ var (
 	sshService           = services.ServiceGroupApp.SSHService
 	tcpMappingService    = services.ServiceGroupApp.TCPMappingService
 )
+
+// bindJSON centralizes request decoding and keeps malformed JSON responses
+// consistent across API handlers.
+func bindJSON[T any](c *gin.Context) (T, bool) {
+	var request T
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return request, false
+	}
+	return request, true
+}
+
+// fail writes the standard API error response and returns true when an error
+// is present, allowing handlers to use a compact early-return pattern.
+func fail(c *gin.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	response.FailWithMessage(err.Error(), c)
+	return true
+}
+
+// recordAudit fills request-scoped audit metadata in one place. Callers only
+// need to provide the action/resource-specific fields.
+func recordAudit(c *gin.Context, input services.AuditInput) {
+	if c == nil {
+		return
+	}
+	input.Actor = actorName(c)
+	input.SourceIP = c.ClientIP()
+	auditService.Record(input)
+}

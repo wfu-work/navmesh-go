@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"navmesh-go/domains"
+	"navmesh-go/internal/streambridge"
 	"navmesh-go/services"
 	"navmesh-go/tunnel"
 
@@ -25,6 +25,9 @@ type Server struct {
 	mu        sync.Mutex
 	listeners map[int]*portListener
 	stopped   bool
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 type portListener struct {
@@ -46,6 +49,7 @@ func NewServer(manager *tunnel.Manager) *Server {
 func (s *Server) Start() error {
 	s.mu.Lock()
 	s.stopped = false
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	if s.listeners == nil {
 		s.listeners = make(map[int]*portListener)
 	}
@@ -62,13 +66,18 @@ func (s *Server) Stop() {
 		return
 	}
 	s.stopped = true
+	cancel := s.cancel
 	listeners := s.listeners
 	s.listeners = make(map[int]*portListener)
 	s.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	for _, item := range listeners {
 		_ = item.listener.Close()
 	}
+	s.wg.Wait()
 	global.NAV_LOG.Info("navmesh tcp mapping gateway stopped")
 }
 
@@ -108,6 +117,7 @@ func (s *Server) Reload() error {
 		item := &portListener{port: port, listener: listener}
 		item.setMapping(mapping)
 		s.listeners[port] = item
+		s.wg.Add(1)
 		go s.acceptLoop(item)
 		global.NAV_LOG.Info("tcp mapping listener started", zap.Int("publicPort", port), zap.String("mappingGuid", mapping.Guid))
 	}
@@ -129,6 +139,7 @@ func (s *Server) ListenerCount() int {
 }
 
 func (s *Server) acceptLoop(item *portListener) {
+	defer s.wg.Done()
 	for {
 		conn, err := item.listener.Accept()
 		if err != nil {
@@ -139,12 +150,26 @@ func (s *Server) acceptLoop(item *portListener) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		go s.handleConn(context.Background(), item, conn)
+		ctx := s.serverContext()
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleConn(ctx, item, conn)
+		}()
 	}
 }
 
 func (s *Server) handleConn(ctx context.Context, item *portListener, client net.Conn) {
 	defer client.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Close()
+		case <-done:
+		}
+	}()
 	mapping := item.snapshot()
 	sourceIP := remoteAddrIP(client.RemoteAddr())
 	if mapping.Guid == "" || mapping.Status == int(domains.StatusDisabled) {
@@ -196,9 +221,9 @@ func (s *Server) handleConn(ctx context.Context, item *portListener, client net.
 		zap.Int("targetPort", mapping.TargetPort),
 		zap.String("sourceIp", sourceIP),
 	)
-	bytesIn, bytesOut := bridge(client, upstream, services.DefaultRuntimePolicy.IdleTimeout())
+	bytesIn, bytesOut := streambridge.Bridge(client, upstream, services.DefaultRuntimePolicy.IdleTimeout())
 	reason := "closed"
-	if isForceClosed(session.Guid) {
+	if services.DefaultSessionRegistry.ConsumeForceClosed(session.Guid) {
 		reason = "closed_by_admin"
 	}
 	closeTCPSession(session.Guid, bytesIn, bytesOut, reason)
@@ -218,6 +243,15 @@ func (s *Server) isStopped() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopped
+}
+
+func (s *Server) serverContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
 }
 
 func (l *portListener) setMapping(mapping domains.TCPMapping) {
@@ -277,91 +311,5 @@ func remoteAddrIP(addr net.Addr) string {
 	if err != nil {
 		return addr.String()
 	}
-	return normalizeIP(host)
-}
-
-func normalizeIP(host string) string {
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	if ip == nil {
-		return strings.Trim(host, "[]")
-	}
-	return ip.String()
-}
-
-type countingWriter struct {
-	w io.Writer
-	n int64
-}
-
-func (w *countingWriter) Write(p []byte) (int, error) {
-	n, err := w.w.Write(p)
-	w.n += int64(n)
-	return n, err
-}
-
-func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser, idleTimeout time.Duration) (int64, int64) {
-	aCounter := &countingWriter{w: a}
-	bCounter := &countingWriter{w: b}
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = copyWithIdleDeadline(bCounter, a, idleTimeout)
-		_ = b.Close()
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = copyWithIdleDeadline(aCounter, b, idleTimeout)
-		_ = a.Close()
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
-	return bCounter.n, aCounter.n
-}
-
-func copyWithIdleDeadline(dst io.Writer, src io.Reader, idleTimeout time.Duration) (int64, error) {
-	if idleTimeout <= 0 {
-		return io.Copy(dst, src)
-	}
-	buf := make([]byte, 32*1024)
-	var written int64
-	for {
-		setReadDeadline(src, time.Now().Add(idleTimeout))
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			setWriteDeadline(dst, time.Now().Add(idleTimeout))
-			nw, ew := dst.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				return written, ew
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if er != nil {
-			return written, er
-		}
-	}
-}
-
-func setReadDeadline(value any, deadline time.Time) {
-	if conn, ok := value.(interface{ SetReadDeadline(time.Time) error }); ok {
-		_ = conn.SetReadDeadline(deadline)
-	}
-}
-
-func setWriteDeadline(value any, deadline time.Time) {
-	if conn, ok := value.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		_ = conn.SetWriteDeadline(deadline)
-	}
-}
-
-func isForceClosed(guid string) bool {
-	var session domains.TunnelSession
-	if err := global.NAV_DB.Select("force_closed").Where("guid = ?", guid).First(&session).Error; err != nil {
-		return false
-	}
-	return session.ForceClosed
+	return streambridge.NormalizeIP(host)
 }

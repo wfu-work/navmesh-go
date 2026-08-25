@@ -19,6 +19,8 @@ type DeviceUpgradeService struct {
 
 const deviceUpgradeRunningLease = 15 * time.Minute
 
+const deviceUpgradeInsertBatchSize = 100
+
 func (s DeviceUpgradeService) WithDB(db *gorm.DB) DeviceUpgradeService {
 	s.CrudService = *s.CrudService.WithDB(db)
 	return s
@@ -204,25 +206,48 @@ func (s DeviceUpgradeService) CreateBatch(releaseGuid string, req CreateDeviceUp
 			return err
 		}
 		result.Batch = batch
+		var devices []domains.Device
+		if err := tx.Where("guid IN ?", deviceGuids).Find(&devices).Error; err != nil {
+			return err
+		}
+		deviceByGuid := make(map[string]domains.Device, len(devices))
+		for _, device := range devices {
+			deviceByGuid[device.Guid] = device
+		}
+		activeDeviceGuids := make(map[string]struct{}, len(devices))
+		if len(devices) > 0 {
+			var activeTasks []domains.DeviceUpgradeTask
+			if err := tx.Model(&domains.DeviceUpgradeTask{}).
+				Select("device_guid").
+				Where("device_guid IN ? AND status IN ?", deviceGuids, []int{domains.DeviceUpgradeStatusPending, domains.DeviceUpgradeStatusRunning}).
+				Find(&activeTasks).Error; err != nil {
+				return err
+			}
+			for _, task := range activeTasks {
+				activeDeviceGuids[task.DeviceGuid] = struct{}{}
+			}
+		}
+		tasks := make([]domains.DeviceUpgradeTask, 0, len(deviceGuids))
 		for _, guid := range deviceGuids {
-			var device domains.Device
-			if err := tx.Where("guid = ?", guid).First(&device).Error; err != nil {
+			device, ok := deviceByGuid[guid]
+			if !ok {
 				result.Failures = append(result.Failures, DeviceUpgradeFailure{DeviceGuid: guid, Message: "device not found"})
 				continue
 			}
-			task, err := svc.buildTask(device, *release, batch.Guid, batch.Message, downloadURL, true)
+			task, err := svc.buildTaskWithActiveSet(device, *release, batch.Guid, batch.Message, downloadURL, true, activeDeviceGuids)
 			if err != nil {
 				result.Failures = append(result.Failures, DeviceUpgradeFailure{DeviceGuid: guid, Message: err.Error()})
 				continue
 			}
-			if err := tx.Create(&task).Error; err != nil {
-				return err
-			}
-			result.Tasks = append(result.Tasks, task)
+			tasks = append(tasks, task)
 		}
-		if len(result.Tasks) == 0 {
+		if len(tasks) == 0 {
 			return errors.New("no upgrade tasks created")
 		}
+		if err := tx.CreateInBatches(&tasks, deviceUpgradeInsertBatchSize).Error; err != nil {
+			return err
+		}
+		result.Tasks = append(result.Tasks, tasks...)
 		batch.TotalCount = len(result.Tasks)
 		batch.UpdateTime = domains.NowMilli()
 		if err := tx.Model(&domains.DeviceUpgradeBatch{}).Where("guid = ?", batch.Guid).Updates(map[string]any{
@@ -259,21 +284,7 @@ func (s DeviceUpgradeService) List(deviceGuid string, params map[string]string) 
 	if status := utils.Str2Int(params["status"]); status > 0 {
 		db = db.Where("status = ?", status)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.DeviceUpgradeTask
-	err := db.Order("create_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPage[domains.DeviceUpgradeTask](db, params, DefaultMaxPageSize, "create_time DESC")
 }
 
 func (s DeviceUpgradeService) ListBatches(params map[string]string) ([]DeviceUpgradeBatchSummary, int64, error) {
@@ -285,37 +296,66 @@ func (s DeviceUpgradeService) ListBatches(params map[string]string) ([]DeviceUpg
 	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
+	page := ParsePage(params, DefaultMaxPageSize)
 	var batches []domains.DeviceUpgradeBatch
-	if err := db.Order("create_time DESC").Limit(size).Offset((page - 1) * size).Find(&batches).Error; err != nil {
+	if err := db.Order("create_time DESC").Limit(page.Size).Offset((page.Page - 1) * page.Size).Find(&batches).Error; err != nil {
 		return nil, 0, err
 	}
-	items := make([]DeviceUpgradeBatchSummary, 0, len(batches))
-	for _, batch := range batches {
-		items = append(items, s.batchSummary(batch))
+	items, err := s.batchSummaries(batches)
+	if err != nil {
+		return nil, 0, err
 	}
 	return items, total, nil
 }
 
 func (s DeviceUpgradeService) batchSummary(batch domains.DeviceUpgradeBatch) DeviceUpgradeBatchSummary {
-	summary := DeviceUpgradeBatchSummary{DeviceUpgradeBatch: batch}
-	var rows []struct {
-		Status      int
-		Count       int
-		ProgressSum int
+	items, err := s.batchSummaries([]domains.DeviceUpgradeBatch{batch})
+	if err != nil || len(items) == 0 {
+		return DeviceUpgradeBatchSummary{DeviceUpgradeBatch: batch}
 	}
-	_ = s.DB().Model(&domains.DeviceUpgradeTask{}).
-		Select("status, COUNT(*) AS count, SUM(progress) AS progress_sum").
-		Where("batch_guid = ?", batch.Guid).
-		Group("status").
-		Scan(&rows).Error
+	return items[0]
+}
+
+type upgradeBatchTaskAggregate struct {
+	BatchGuid   string
+	Status      int
+	Count       int
+	ProgressSum int
+}
+
+func (s DeviceUpgradeService) batchSummaries(batches []domains.DeviceUpgradeBatch) ([]DeviceUpgradeBatchSummary, error) {
+	items := make([]DeviceUpgradeBatchSummary, 0, len(batches))
+	if len(batches) == 0 {
+		return items, nil
+	}
+	batchGuids := make([]string, 0, len(batches))
+	for _, batch := range batches {
+		if guid := strings.TrimSpace(batch.Guid); guid != "" {
+			batchGuids = append(batchGuids, guid)
+		}
+	}
+	aggregates := make([]upgradeBatchTaskAggregate, 0)
+	if len(batchGuids) > 0 {
+		if err := s.DB().Model(&domains.DeviceUpgradeTask{}).
+			Select("batch_guid, status, COUNT(*) AS count, COALESCE(SUM(progress), 0) AS progress_sum").
+			Where("batch_guid IN ?", batchGuids).
+			Group("batch_guid, status").
+			Scan(&aggregates).Error; err != nil {
+			return nil, err
+		}
+	}
+	byBatch := make(map[string][]upgradeBatchTaskAggregate, len(aggregates))
+	for _, aggregate := range aggregates {
+		byBatch[aggregate.BatchGuid] = append(byBatch[aggregate.BatchGuid], aggregate)
+	}
+	for _, batch := range batches {
+		items = append(items, summarizeUpgradeBatch(batch, byBatch[batch.Guid]))
+	}
+	return items, nil
+}
+
+func summarizeUpgradeBatch(batch domains.DeviceUpgradeBatch, rows []upgradeBatchTaskAggregate) DeviceUpgradeBatchSummary {
+	summary := DeviceUpgradeBatchSummary{DeviceUpgradeBatch: batch}
 	total := 0
 	progressSum := 0
 	for _, row := range rows {
@@ -473,6 +513,10 @@ func (s DeviceUpgradeService) Report(req DeviceUpgradeReportRequest) error {
 }
 
 func (s DeviceUpgradeService) buildTask(device domains.Device, release domains.Release, batchGuid string, message string, downloadURL string, requireOnline bool) (domains.DeviceUpgradeTask, error) {
+	return s.buildTaskWithActiveSet(device, release, batchGuid, message, downloadURL, requireOnline, nil)
+}
+
+func (s DeviceUpgradeService) buildTaskWithActiveSet(device domains.Device, release domains.Release, batchGuid string, message string, downloadURL string, requireOnline bool, activeDeviceGuids map[string]struct{}) (domains.DeviceUpgradeTask, error) {
 	release.NormalizeDefaults()
 	if requireOnline && device.Status != domains.DeviceStatusOnline {
 		return domains.DeviceUpgradeTask{}, errors.New("device is not online")
@@ -489,14 +533,20 @@ func (s DeviceUpgradeService) buildTask(device domains.Device, release domains.R
 	if reason := releaseUpgradeDisabledReason(release, device); reason != "" {
 		return domains.DeviceUpgradeTask{}, errors.New(reason)
 	}
-	var activeCount int64
-	if err := s.DB().Model(&domains.DeviceUpgradeTask{}).
-		Where("device_guid = ? AND status IN ?", device.Guid, []int{domains.DeviceUpgradeStatusPending, domains.DeviceUpgradeStatusRunning}).
-		Count(&activeCount).Error; err != nil {
-		return domains.DeviceUpgradeTask{}, err
-	}
-	if activeCount > 0 {
-		return domains.DeviceUpgradeTask{}, errors.New("device already has an active upgrade task")
+	if activeDeviceGuids != nil {
+		if _, ok := activeDeviceGuids[device.Guid]; ok {
+			return domains.DeviceUpgradeTask{}, errors.New("device already has an active upgrade task")
+		}
+	} else {
+		var activeCount int64
+		if err := s.DB().Model(&domains.DeviceUpgradeTask{}).
+			Where("device_guid = ? AND status IN ?", device.Guid, []int{domains.DeviceUpgradeStatusPending, domains.DeviceUpgradeStatusRunning}).
+			Count(&activeCount).Error; err != nil {
+			return domains.DeviceUpgradeTask{}, err
+		}
+		if activeCount > 0 {
+			return domains.DeviceUpgradeTask{}, errors.New("device already has an active upgrade task")
+		}
 	}
 	now := domains.NowMilli()
 	task := domains.DeviceUpgradeTask{

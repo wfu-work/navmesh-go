@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -182,12 +183,15 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) {
 }
 
 func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
-	frame, err := readFrameFromReader(conn)
+	reader := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	frame, err := readFrameFromReader(reader)
 	if err != nil || frame.Type != FrameTypeHello {
 		_ = writeFrameToWriter(conn, Frame{Type: FrameTypeError, OK: false, Message: "hello required"})
 		_ = conn.Close()
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	device, err := services.ServiceGroupApp.DeviceService.Authenticate(
 		frame.Token,
 		frame.DeviceGuid,
@@ -214,12 +218,11 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
 		}
 	}()
 	for {
-		next, err := readFrameFromReader(conn)
+		next, err := readFrameFromReader(reader)
 		if err != nil {
 			return
 		}
 		s.manager.Touch(device.Guid)
-		services.ServiceGroupApp.DeviceService.TouchOnline(device.Guid)
 		switch next.Type {
 		case FrameTypeHeartbeat, FrameTypePing:
 			_ = writeFrameToWriter(conn, Frame{Type: FrameTypePong, OK: true, RequestID: next.RequestID})
@@ -237,7 +240,6 @@ func (s *Server) handleStream(ctx context.Context, deviceGuid string, stream *qu
 		return
 	}
 	s.manager.Touch(deviceGuid)
-	services.ServiceGroupApp.DeviceService.TouchOnline(deviceGuid)
 	switch frame.Type {
 	case FrameTypeHeartbeat, FrameTypePing:
 		_ = writeFrame(stream, Frame{Type: FrameTypePong, OK: true, RequestID: frame.RequestID})
@@ -265,6 +267,13 @@ func readFrameFromReader(r io.Reader) (Frame, error) {
 }
 
 func readFrameLine(r io.Reader) ([]byte, error) {
+	if reader, ok := r.(*bufio.Reader); ok {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 64*1024 {
+			return nil, errors.New("frame too large")
+		}
+		return line, err
+	}
 	line := make([]byte, 0, 256)
 	buf := make([]byte, 1)
 	for {

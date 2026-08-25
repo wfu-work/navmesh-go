@@ -11,7 +11,21 @@ import (
 	"gorm.io/gorm"
 )
 
-type SessionService struct{}
+type SessionService struct {
+	db *gorm.DB
+}
+
+func (s SessionService) WithDB(db *gorm.DB) SessionService {
+	s.db = db
+	return s
+}
+
+func (s SessionService) DB() *gorm.DB {
+	if s.db != nil {
+		return s.db
+	}
+	return global.NAV_DB
+}
 
 type SessionStats struct {
 	Total            int64 `json:"total"`
@@ -31,7 +45,11 @@ type SessionStats struct {
 }
 
 func (s SessionService) List(params map[string]string) ([]domains.TunnelSession, int64, error) {
-	db := global.NAV_DB.Model(&domains.TunnelSession{})
+	db := s.DB()
+	if db == nil {
+		return nil, 0, errors.New("database is not initialized")
+	}
+	db = db.Model(&domains.TunnelSession{})
 	if deviceGuid := strings.TrimSpace(params["deviceGuid"]); deviceGuid != "" {
 		db = db.Where("device_guid = ?", deviceGuid)
 	}
@@ -44,21 +62,7 @@ func (s SessionService) List(params map[string]string) ([]domains.TunnelSession,
 	if status := utils.Str2Int(params["status"]); status > 0 {
 		db = db.Where("status = ?", status)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.TunnelSession
-	err := db.Order("start_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPageCursor[domains.TunnelSession](db, params, DefaultMaxPageSize, "start_time", "start_time DESC, id DESC")
 }
 
 func (s SessionService) Close(guid string) error {
@@ -66,13 +70,17 @@ func (s SessionService) Close(guid string) error {
 	if guid == "" {
 		return errors.New("guid required")
 	}
+	db := s.DB()
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
 	closedRuntime := DefaultSessionRegistry.CloseSession(guid)
 	now := domains.NowMilli()
 	reason := "closed_by_admin"
 	if !closedRuntime {
 		reason = "closed_by_admin_offline"
 	}
-	return global.NAV_DB.Model(&domains.TunnelSession{}).Where("guid = ?", guid).Updates(map[string]any{
+	return db.Model(&domains.TunnelSession{}).Where("guid = ?", guid).Updates(map[string]any{
 		"status":            int(domains.StatusDisabled),
 		"force_closed":      true,
 		"disconnect_reason": reason,
@@ -82,27 +90,28 @@ func (s SessionService) Close(guid string) error {
 }
 
 func (s SessionService) Stats(params map[string]string) (*SessionStats, error) {
-	db := global.NAV_DB.Model(&domains.TunnelSession{})
+	db := s.DB()
+	if db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	db = db.Model(&domains.TunnelSession{})
 	if deviceGuid := strings.TrimSpace(params["deviceGuid"]); deviceGuid != "" {
 		db = db.Where("device_guid = ?", deviceGuid)
 	}
 	stats := &SessionStats{}
-	if err := db.Count(&stats.Total).Error; err != nil {
+	if err := db.Select(`
+		COUNT(*) AS total,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS active,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS closed,
+		COALESCE(SUM(CASE WHEN session_type = 'ssh' THEN 1 ELSE 0 END), 0) AS ssh,
+		COALESCE(SUM(CASE WHEN session_type = 'http' THEN 1 ELSE 0 END), 0) AS http,
+		COALESCE(SUM(CASE WHEN session_type = 'tcp' THEN 1 ELSE 0 END), 0) AS tcp,
+		COALESCE(SUM(bytes_in), 0) AS bytes_in,
+		COALESCE(SUM(bytes_out), 0) AS bytes_out,
+		COALESCE(SUM(CASE WHEN force_closed = ? THEN 1 ELSE 0 END), 0) AS force_closed
+	`, int(domains.StatusEnabled), int(domains.StatusDisabled), true).Scan(stats).Error; err != nil {
 		return nil, err
 	}
-	_ = db.Session(&gorm.Session{}).Where("status = ?", int(domains.StatusEnabled)).Count(&stats.Active).Error
-	_ = db.Session(&gorm.Session{}).Where("status = ?", int(domains.StatusDisabled)).Count(&stats.Closed).Error
-	_ = db.Session(&gorm.Session{}).Where("session_type = ?", "ssh").Count(&stats.SSH).Error
-	_ = db.Session(&gorm.Session{}).Where("session_type = ?", "http").Count(&stats.HTTP).Error
-	_ = db.Session(&gorm.Session{}).Where("session_type = ?", "tcp").Count(&stats.TCP).Error
-	_ = db.Session(&gorm.Session{}).Where("force_closed = ?", true).Count(&stats.ForceClosed).Error
-	var sums struct {
-		BytesIn  int64
-		BytesOut int64
-	}
-	_ = db.Session(&gorm.Session{}).Select("COALESCE(SUM(bytes_in), 0) AS bytes_in, COALESCE(SUM(bytes_out), 0) AS bytes_out").Scan(&sums).Error
-	stats.BytesIn = sums.BytesIn
-	stats.BytesOut = sums.BytesOut
 	runtimeStats := DefaultSessionRegistry.Stats()
 	settings := DefaultRuntimePolicy.Snapshot()
 	stats.RuntimeActive = runtimeStats.Active

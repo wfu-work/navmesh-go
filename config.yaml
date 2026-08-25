@@ -15,6 +15,9 @@ local:
 sqlite:
   db-name: navmesh
   path: ./data/
+  log-mode: warn
+  max-idle-conns: 8
+  max-open-conns: 8
 zap:
   director: logback
   level: info
@@ -23,4 +26,12 @@ zap:
 navmesh:
   data-dir: ./data/navmesh
   heartbeat-timeout: 180s
+  liveness-flush-interval: 30s
+  telemetry-sample-interval: 5m
+  access-log-queue-size: 8192
+  access-log-batch-size: 200
+  access-log-flush-interval: 100ms
+  database-slow-threshold: 200ms
+  notification-workers: 4
+  notification-queue-size: 1024
   device-register-token: "navfirst@2020"

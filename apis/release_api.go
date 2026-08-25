@@ -1,6 +1,7 @@
 package apis
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -17,8 +18,7 @@ type ReleaseApi struct{}
 
 func (a ReleaseApi) Upload(c *gin.Context) {
 	file, err := c.FormFile("file")
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	item, err := releaseService.Upload(file, services.UploadReleaseRequest{
@@ -30,21 +30,22 @@ func (a ReleaseApi) Upload(c *gin.Context) {
 		DownloadURL: c.PostForm("downloadUrl"),
 		ChangeLog:   c.PostForm("changeLog"),
 	})
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "upload", Resource: "release", ResourceID: item.Guid, Message: item.FileName, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "upload", Resource: "release", ResourceID: item.Guid, Message: item.FileName})
 	eventService.Record(services.EventInput{EventType: "release_published", Level: "info", Title: services.ReleasePublishedTitle(item), Message: services.ReleasePublishedMessage(item)})
-	go emailService.NotifyReleasePublished(item, publicReleaseDownloadURL(c, item))
+	downloadURL := publicReleaseDownloadURL(c, item)
+	services.DefaultNotificationRunner.Submit(func(context.Context) {
+		emailService.NotifyReleasePublished(item, downloadURL)
+	})
 	response.Ok(item, c)
 }
 
 func (a ReleaseApi) List(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := releaseService.List(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
@@ -52,8 +53,7 @@ func (a ReleaseApi) List(c *gin.Context) {
 
 func (a ReleaseApi) Get(c *gin.Context) {
 	item, err := releaseService.Get(c.Param("guid"))
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(item, c)
@@ -61,30 +61,26 @@ func (a ReleaseApi) Get(c *gin.Context) {
 
 func (a ReleaseApi) UpgradeCandidates(c *gin.Context) {
 	items, err := deviceUpgradeService.Candidates(c.Param("guid"))
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(items, c)
 }
 
 func (a ReleaseApi) CreateUpgradeBatch(c *gin.Context) {
-	var req services.CreateDeviceUpgradeBatchRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.CreateDeviceUpgradeBatchRequest](c)
+	if !ok {
 		return
 	}
 	release, err := releaseService.GetEnabled(c.Param("guid"))
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	result, err := deviceUpgradeService.CreateBatch(release.Guid, req, publicReleaseDownloadURL(c, release))
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "create", Resource: "device_upgrade_batch", ResourceID: result.Batch.Guid, Message: release.Guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "create", Resource: "device_upgrade_batch", ResourceID: result.Batch.Guid, Message: release.Guid})
 	response.Ok(result, c)
 }
 
@@ -92,8 +88,7 @@ func (a ReleaseApi) ListUpgradeBatches(c *gin.Context) {
 	params := utils.QueryParams(c)
 	params["releaseGuid"] = c.Param("guid")
 	items, total, err := deviceUpgradeService.ListBatches(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
@@ -104,8 +99,7 @@ func (a ReleaseApi) ListUpgradeBatchTasks(c *gin.Context) {
 	params["releaseGuid"] = c.Param("guid")
 	params["batchGuid"] = c.Param("batchGuid")
 	items, total, err := deviceUpgradeService.List("", params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
@@ -122,38 +116,34 @@ func (a ReleaseApi) Update(c *gin.Context) {
 		DownloadURL: c.PostForm("downloadUrl"),
 		ChangeLog:   c.PostForm("changeLog"),
 	})
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "update", Resource: "release", ResourceID: item.Guid, Message: item.FileName, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "update", Resource: "release", ResourceID: item.Guid, Message: item.FileName})
 	response.Ok(item, c)
 }
 
 func (a ReleaseApi) Enable(c *gin.Context) {
-	if err := releaseService.SetStatus(c.Param("guid"), domains.ReleaseStatusEnabled); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, releaseService.SetStatus(c.Param("guid"), domains.ReleaseStatusEnabled)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "enable", Resource: "release", ResourceID: c.Param("guid"), SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "enable", Resource: "release", ResourceID: c.Param("guid")})
 	response.Ok(true, c)
 }
 
 func (a ReleaseApi) Disable(c *gin.Context) {
-	if err := releaseService.SetStatus(c.Param("guid"), domains.ReleaseStatusDisabled); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, releaseService.SetStatus(c.Param("guid"), domains.ReleaseStatusDisabled)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "release", ResourceID: c.Param("guid"), SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "disable", Resource: "release", ResourceID: c.Param("guid")})
 	response.Ok(true, c)
 }
 
 func (a ReleaseApi) Delete(c *gin.Context) {
-	if err := releaseService.Delete(c.Param("guid")); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, releaseService.Delete(c.Param("guid"))) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "delete", Resource: "release", ResourceID: c.Param("guid"), SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "delete", Resource: "release", ResourceID: c.Param("guid")})
 	response.Ok(true, c)
 }
 

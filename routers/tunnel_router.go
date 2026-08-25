@@ -8,5 +8,6 @@ func (t *TunnelRouter) InitTunnelRouter(router *gin.RouterGroup) {
 	group := router.Group("tunnel")
 	{
 		group.GET("connections", tunnelApi.Connections)
+		group.GET("runtime-stats", tunnelApi.RuntimeStats)
 	}
 }

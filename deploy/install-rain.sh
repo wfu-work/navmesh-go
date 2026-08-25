@@ -197,8 +197,11 @@ cp -R "$APP_DIR"/. "$INSTALL_DIR"/
 chmod +x "$INSTALL_DIR/navRainApp"
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-log "Writing systemd service ${SERVICE_FILE}"
-cat > "$SERVICE_FILE" <<EOF
+if [ -e "$SERVICE_FILE" ]; then
+  log "Systemd service ${SERVICE_FILE} already exists; keeping existing file"
+else
+  log "Writing systemd service ${SERVICE_FILE}"
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=navfirst rain predict for go
 After=network.target
@@ -215,6 +218,7 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 log "Starting ${SERVICE_NAME} service"
 systemctl daemon-reload

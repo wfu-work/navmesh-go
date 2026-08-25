@@ -37,21 +37,7 @@ func (s CustomDomainService) List(params map[string]string) ([]domains.CustomDom
 	if status := utils.Str2Int(params["status"]); status > 0 {
 		db = db.Where("status = ?", status)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.CustomDomain
-	err := db.Order("update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPage[domains.CustomDomain](db, params, DefaultMaxPageSize, "update_time DESC")
 }
 
 func (s CustomDomainService) Save(req SaveCustomDomainRequest) (*domains.CustomDomain, error) {

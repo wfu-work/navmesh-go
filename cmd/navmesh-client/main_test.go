@@ -3,10 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	gopsnet "github.com/shirou/gopsutil/v4/net"
@@ -120,6 +129,163 @@ func TestHipnamesUpgradeMessages(t *testing.T) {
 	}
 }
 
+func TestDownloadUpgradeBinaryResumesAfterInterruptedResponse(t *testing.T) {
+	data := []byte("0123456789")
+	digest := sha256.Sum256(data)
+	var requests atomic.Int32
+	var requestedRange atomic.Value
+	withUpgradeRoundTripper(t, upgradeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		switch requests.Add(1) {
+		case 1:
+			header.Set("Content-Length", strconv.Itoa(len(data)))
+			return &http.Response{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(data)), Body: &failingUpgradeBody{reader: bytes.NewReader(data[:4])}}, nil
+		case 2:
+			requestedRange.Store(r.Header.Get("Range"))
+			header.Set("Content-Range", "bytes 4-9/10")
+			header.Set("Content-Length", "6")
+			return &http.Response{StatusCode: http.StatusPartialContent, Header: header, ContentLength: 6, Body: io.NopCloser(bytes.NewReader(data[4:]))}, nil
+		default:
+			return &http.Response{StatusCode: http.StatusInternalServerError, Header: header, ContentLength: 0, Body: io.NopCloser(strings.NewReader("unexpected request"))}, nil
+		}
+	}))
+
+	target := filepath.Join(t.TempDir(), "upgrade.bin")
+	upgrade := clientUpgradeCommand{
+		DownloadURL: "http://upgrade.test/package",
+		Sha256:      fmt.Sprintf("%x", digest[:]),
+		Size:        int64(len(data)),
+	}
+	err := downloadUpgradeBinary(clientConfig{}, upgrade, target, nil)
+	if err != nil {
+		t.Fatalf("download with resume: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read resumed target: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("resumed data = %q, want %q", got, data)
+	}
+	if got := requestedRange.Load(); got != "bytes=4-" {
+		t.Fatalf("resume Range = %q, want bytes=4-", got)
+	}
+	if _, err := os.Stat(upgradePartialPath(target, upgrade)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial file remains after successful promotion: %v", err)
+	}
+}
+
+func TestDownloadUpgradeBinaryRestartsWhenRangeIsIgnored(t *testing.T) {
+	data := []byte("abcdef")
+	var requestedRange atomic.Value
+	withUpgradeRoundTripper(t, upgradeRoundTripper(func(r *http.Request) (*http.Response, error) {
+		requestedRange.Store(r.Header.Get("Range"))
+		header := make(http.Header)
+		header.Set("Content-Length", strconv.Itoa(len(data)))
+		return &http.Response{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(data)), Body: io.NopCloser(bytes.NewReader(data))}, nil
+	}))
+
+	target := filepath.Join(t.TempDir(), "upgrade.bin")
+	upgrade := clientUpgradeCommand{
+		DownloadURL: "http://upgrade.test/package",
+		Sha256:      fmt.Sprintf("%x", sha256.Sum256(data)),
+		Size:        int64(len(data)),
+	}
+	if err := os.WriteFile(upgradePartialPath(target, upgrade), data[:3], 0o700); err != nil {
+		t.Fatalf("seed partial package: %v", err)
+	}
+	err := downloadUpgradeBinary(clientConfig{}, upgrade, target, nil)
+	if err != nil {
+		t.Fatalf("download after ignored Range: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read restarted target: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("restarted data = %q, want %q", got, data)
+	}
+	if got := requestedRange.Load(); got != "bytes=3-" {
+		t.Fatalf("initial resume Range = %q, want bytes=3-", got)
+	}
+}
+
+type upgradeRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f upgradeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type failingUpgradeBody struct {
+	reader *bytes.Reader
+	failed bool
+}
+
+func (b *failingUpgradeBody) Read(data []byte) (int, error) {
+	if b.failed {
+		return 0, io.EOF
+	}
+	b.failed = true
+	n, _ := b.reader.Read(data)
+	return n, io.ErrUnexpectedEOF
+}
+
+func (b *failingUpgradeBody) Close() error { return nil }
+
+func withUpgradeRoundTripper(t *testing.T, roundTripper http.RoundTripper) {
+	t.Helper()
+	previous := http.DefaultClient
+	client := *previous
+	client.Transport = roundTripper
+	http.DefaultClient = &client
+	t.Cleanup(func() { http.DefaultClient = previous })
+}
+
+func TestWriteRainSystemdServiceCreatesInstallService(t *testing.T) {
+	serviceDir := t.TempDir()
+	oldDir := systemdServiceDir
+	systemdServiceDir = serviceDir
+	t.Cleanup(func() {
+		systemdServiceDir = oldDir
+	})
+
+	if err := writeRainSystemdService("raind", "/mnt/navfirst/nav-rain-go", "navRainApp"); err != nil {
+		t.Fatalf("write rain systemd service: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(serviceDir, "raind.service"))
+	if err != nil {
+		t.Fatalf("read rain service: %v", err)
+	}
+	text := string(content)
+	for _, want := range []string{
+		"Description=navfirst rain predict for go",
+		"Type=idle",
+		"ExecStartPre=/bin/sleep 5",
+		"ExecStart=/mnt/navfirst/nav-rain-go/navRainApp",
+		"WorkingDirectory=/mnt/navfirst/nav-rain-go",
+		"RestartSec=10s",
+		"WantedBy=multi-user.target",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("service content missing %q:\n%s", want, text)
+		}
+	}
+	servicePath := filepath.Join(serviceDir, "raind.service")
+	if err := os.WriteFile(servicePath, []byte("custom service\n"), 0o600); err != nil {
+		t.Fatalf("replace rain service fixture: %v", err)
+	}
+	if err := writeRainSystemdService("raind", "/different", "different-app"); err != nil {
+		t.Fatalf("preserve existing rain service: %v", err)
+	}
+	preserved, err := os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatalf("read preserved rain service: %v", err)
+	}
+	if string(preserved) != "custom service\n" {
+		t.Fatalf("existing rain service was overwritten: %q", preserved)
+	}
+}
+
 func TestNormalizeIPv4RejectsIPv6(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -159,9 +325,44 @@ func TestIsPublicIPv4RejectsIPv6AndPrivateIP(t *testing.T) {
 	}
 }
 
-func TestDefaultTCPDataChannelsSupportsResourceHeavyPages(t *testing.T) {
-	if defaultTCPDataChannels < 32 {
-		t.Fatalf("defaultTCPDataChannels = %d, want at least 32", defaultTCPDataChannels)
+func TestDefaultTCPDataChannelsKeepsConnectionPoolBounded(t *testing.T) {
+	if defaultTCPDataChannels < 4 || defaultTCPDataChannels > 8 {
+		t.Fatalf("defaultTCPDataChannels = %d, want between 4 and 8", defaultTCPDataChannels)
+	}
+}
+
+func TestCollectHeartbeatTelemetryReusesSnapshotUntilInterval(t *testing.T) {
+	heartbeatTelemetryState.Lock()
+	previous := heartbeatTelemetryState.item
+	heartbeatTelemetryState.item = heartbeatTelemetry{}
+	heartbeatTelemetryState.Unlock()
+	t.Cleanup(func() {
+		heartbeatTelemetryState.Lock()
+		heartbeatTelemetryState.item = previous
+		heartbeatTelemetryState.Unlock()
+	})
+
+	calls := 0
+	restoreOutboundInterfaceDetector(t, func(string) string { return "" })
+	restoreNetworkSignalDetector(t, func(iface string) networkSnapshot {
+		calls++
+		return networkSnapshot{NetworkType: "ethernet", NetworkIface: iface}
+	})
+	cfg := clientConfig{API: "https://example.com", TrafficIface: "none", Telemetry: 5 * time.Minute}
+	start := time.Unix(1000, 0)
+
+	first := collectHeartbeatTelemetry(context.Background(), cfg, start)
+	second := collectHeartbeatTelemetry(context.Background(), cfg, start.Add(time.Minute))
+	third := collectHeartbeatTelemetry(context.Background(), cfg, start.Add(5*time.Minute))
+
+	if calls != 2 {
+		t.Fatalf("network collection calls = %d, want 2", calls)
+	}
+	if !first.sampledAt.Equal(second.sampledAt) {
+		t.Fatalf("cached sample time changed: first=%s second=%s", first.sampledAt, second.sampledAt)
+	}
+	if !third.sampledAt.Equal(start.Add(5 * time.Minute)) {
+		t.Fatalf("refreshed sample time = %s", third.sampledAt)
 	}
 }
 

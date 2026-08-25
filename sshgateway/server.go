@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"navmesh-go/domains"
+	"navmesh-go/internal/streambridge"
 	"navmesh-go/services"
 	"navmesh-go/tunnel"
 
@@ -174,9 +175,9 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 		zap.String("sourceIp", sourceIP),
 	)
 	clientConn := &bufferedConn{Conn: client, reader: reader}
-	bytesIn, bytesOut := bridge(clientConn, upstream, services.DefaultRuntimePolicy.IdleTimeout())
+	bytesIn, bytesOut := streambridge.Bridge(clientConn, upstream, services.DefaultRuntimePolicy.IdleTimeout())
 	reason := "closed"
-	if isForceClosed(session.Guid) {
+	if services.DefaultSessionRegistry.ConsumeForceClosed(session.Guid) {
 		reason = "closed_by_admin"
 	}
 	markSessionClosed(session.Guid, bytesIn, bytesOut, reason)
@@ -338,7 +339,7 @@ func localAddrIP(addr net.Addr) string {
 	if err != nil {
 		return addr.String()
 	}
-	return normalizeIP(host)
+	return streambridge.NormalizeIP(host)
 }
 
 func remoteAddrIP(addr net.Addr) string {
@@ -346,85 +347,7 @@ func remoteAddrIP(addr net.Addr) string {
 	if err != nil {
 		return addr.String()
 	}
-	return normalizeIP(host)
-}
-
-func normalizeIP(host string) string {
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	if ip == nil {
-		return strings.Trim(host, "[]")
-	}
-	return ip.String()
-}
-
-type countingWriter struct {
-	w io.Writer
-	n int64
-}
-
-func (w *countingWriter) Write(p []byte) (int, error) {
-	n, err := w.w.Write(p)
-	w.n += int64(n)
-	return n, err
-}
-
-func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser, idleTimeout time.Duration) (int64, int64) {
-	aCounter := &countingWriter{w: a}
-	bCounter := &countingWriter{w: b}
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = copyWithIdleDeadline(bCounter, a, idleTimeout)
-		_ = b.Close()
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = copyWithIdleDeadline(aCounter, b, idleTimeout)
-		_ = a.Close()
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
-	return bCounter.n, aCounter.n
-}
-
-func copyWithIdleDeadline(dst io.Writer, src io.Reader, idleTimeout time.Duration) (int64, error) {
-	if idleTimeout <= 0 {
-		return io.Copy(dst, src)
-	}
-	buf := make([]byte, 32*1024)
-	var written int64
-	for {
-		setReadDeadline(src, time.Now().Add(idleTimeout))
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			setWriteDeadline(dst, time.Now().Add(idleTimeout))
-			nw, ew := dst.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				return written, ew
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if er != nil {
-			return written, er
-		}
-	}
-}
-
-func setReadDeadline(value any, deadline time.Time) {
-	if conn, ok := value.(interface{ SetReadDeadline(time.Time) error }); ok {
-		_ = conn.SetReadDeadline(deadline)
-	}
-}
-
-func setWriteDeadline(value any, deadline time.Time) {
-	if conn, ok := value.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		_ = conn.SetWriteDeadline(deadline)
-	}
+	return streambridge.NormalizeIP(host)
 }
 
 func markSessionClosed(guid string, bytesIn, bytesOut int64, reason string) {
@@ -438,14 +361,6 @@ func markSessionClosed(guid string, bytesIn, bytesOut int64, reason string) {
 		"disconnect_reason": strings.TrimSpace(reason),
 	}
 	_ = global.NAV_DB.Model(&domains.TunnelSession{}).Where("guid = ?", guid).Updates(updates).Error
-}
-
-func isForceClosed(guid string) bool {
-	var session domains.TunnelSession
-	if err := global.NAV_DB.Select("force_closed").Where("guid = ?", guid).First(&session).Error; err != nil {
-		return false
-	}
-	return session.ForceClosed
 }
 
 func ListenHost(addr string) string {

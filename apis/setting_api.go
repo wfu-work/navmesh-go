@@ -11,26 +11,24 @@ type SettingApi struct{}
 
 func (s SettingApi) List(c *gin.Context) {
 	items, err := settingService.List()
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(items, c)
 }
 
 func (s SettingApi) Save(c *gin.Context) {
-	var req struct {
+	type saveSettingRequest struct {
 		Value string `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[saveSettingRequest](c)
+	if !ok {
 		return
 	}
 	item, err := settingService.Save(c.Param("key"), req.Value)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "save", Resource: "setting", ResourceID: c.Param("key"), SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "save", Resource: "setting", ResourceID: c.Param("key")})
 	response.Ok(item, c)
 }

@@ -9,13 +9,16 @@ import (
 
 type MaintenanceApi struct{}
 
+func (m MaintenanceApi) DatabaseStats(c *gin.Context) {
+	result, err := maintenanceService.DatabaseStats()
+	if fail(c, err) {
+		return
+	}
+	response.Ok(result, c)
+}
+
 func (m MaintenanceApi) CleanupRetention(c *gin.Context) {
 	result := maintenanceService.CleanupRetention()
-	auditService.Record(services.AuditInput{
-		Actor:    actorName(c),
-		Action:   "cleanup_retention",
-		Resource: "maintenance",
-		SourceIP: c.ClientIP(),
-	})
+	recordAudit(c, services.AuditInput{Action: "cleanup_retention", Resource: "maintenance"})
 	response.Ok(result, c)
 }

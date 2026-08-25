@@ -213,8 +213,15 @@ func sshAliasDomain(alias string) string {
 }
 
 func ensureDeviceExists(guid string) error {
+	return ensureDeviceExistsOnDB(ServiceGroupApp.DeviceService.DB(), guid)
+}
+
+func ensureDeviceExistsOnDB(db *gorm.DB, guid string) error {
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
 	var count int64
-	if err := ServiceGroupApp.DeviceService.DB().Model(&domains.Device{}).Where("guid = ? AND status != ?", guid, domains.DeviceStatusDisabled).Count(&count).Error; err != nil {
+	if err := db.Model(&domains.Device{}).Where("guid = ? AND status != ?", guid, domains.DeviceStatusDisabled).Count(&count).Error; err != nil {
 		return err
 	}
 	if count == 0 {
@@ -224,8 +231,15 @@ func ensureDeviceExists(guid string) error {
 }
 
 func ensureDeviceRecordExists(guid string) error {
+	return ensureDeviceRecordExistsOnDB(ServiceGroupApp.DeviceService.DB(), guid)
+}
+
+func ensureDeviceRecordExistsOnDB(db *gorm.DB, guid string) error {
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
 	var count int64
-	if err := ServiceGroupApp.DeviceService.DB().Model(&domains.Device{}).Where("guid = ?", guid).Count(&count).Error; err != nil {
+	if err := db.Model(&domains.Device{}).Where("guid = ?", guid).Count(&count).Error; err != nil {
 		return err
 	}
 	if count == 0 {

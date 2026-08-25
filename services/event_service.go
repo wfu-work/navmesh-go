@@ -57,21 +57,7 @@ func (s EventService) List(params map[string]string) ([]domains.Event, int64, er
 			db = db.Where("status = ?", utils.Str2Int(statusParam))
 		}
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.Event
-	err := db.Order("create_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPageCursor[domains.Event](db, params, DefaultMaxPageSize, "create_time", "create_time DESC, id DESC")
 }
 
 func (s EventService) Ack(guid string) error {
@@ -120,10 +106,13 @@ func (s EventService) RecordSuppressedAt(input EventInput, window time.Duration,
 	if now <= 0 {
 		now = domains.NowMilli()
 	}
-	var count int64
-	if err := s.DB().Model(&domains.Event{}).
+	var existing domains.Event
+	result := s.DB().Model(&domains.Event{}).
+		Select("id").
 		Where("device_guid = ? AND event_type = ? AND title = ? AND create_time >= ?", input.DeviceGuid, input.EventType, input.Title, now-window.Milliseconds()).
-		Count(&count).Error; err != nil || count > 0 {
+		Limit(1).
+		Find(&existing)
+	if result.Error != nil || result.RowsAffected > 0 {
 		return false
 	}
 	s.RecordAt(input, now)

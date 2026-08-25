@@ -49,21 +49,7 @@ func (s MappingService) List(params map[string]string) ([]domains.PortMapping, i
 	if deviceGuids := splitCommaValues(params["deviceGuids"]); len(deviceGuids) > 0 {
 		db = db.Where("device_guid IN ?", deviceGuids)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.PortMapping
-	err := db.Order("update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPage[domains.PortMapping](db, params, DefaultMaxPageSize, "update_time DESC, id DESC")
 }
 
 func (s MappingService) Save(req SavePortMappingRequest) (*domains.PortMapping, error) {
@@ -80,41 +66,55 @@ func (s MappingService) Save(req SavePortMappingRequest) (*domains.PortMapping, 
 	if req.TargetPort <= 0 {
 		return nil, errors.New("targetPort required")
 	}
-	if err := ensureDeviceExists(req.DeviceGuid); err != nil {
-		return nil, err
+	db := s.DB()
+	if db == nil {
+		return nil, errors.New("database is not initialized")
 	}
-	if err := ensurePublicHostAvailable(req.PublicHost, req.Guid); err != nil {
-		return nil, err
-	}
-	now := domains.NowMilli()
 	var row domains.PortMapping
-	err := s.DB().Where("guid = ?", req.Guid).First(&row).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := ensureDeviceExistsOnDB(tx, req.DeviceGuid); err != nil {
+			return err
+		}
+		if err := ensurePublicHostAvailableOnDB(tx, req.PublicHost, req.Guid); err != nil {
+			return err
+		}
+		now := domains.NowMilli()
+		service := s.WithDB(tx)
+		var existing domains.PortMapping
+		queryErr := tx.Where("guid = ?", req.Guid).First(&existing).Error
+		if queryErr != nil && !errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			return queryErr
+		}
+		if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			existing = domains.PortMapping{BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: now}}
+			if req.Guid != "" {
+				existing.Guid = req.Guid
+			}
+		}
+		existing.DeviceGuid = req.DeviceGuid
+		existing.Name = req.Name
+		existing.PublicHost = req.PublicHost
+		existing.TargetHost = req.TargetHost
+		existing.TargetPort = req.TargetPort
+		existing.Protocol = req.Protocol
+		existing.IsCustomDomain = req.IsCustomDomain
+		existing.Status = req.Status
+		existing.UpdateTime = now
+		if err := tx.Save(&existing).Error; err != nil {
+			return err
+		}
+		if existing.IsCustomDomain {
+			if _, err := service.customDomainService().EnsureForMapping(existing); err != nil {
+				return err
+			}
+		}
+		row = existing
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		row = domains.PortMapping{BaseDataEntity: commonDomains.BaseDataEntity{CreateTime: now}}
-		if req.Guid != "" {
-			row.Guid = req.Guid
-		}
-	}
-	row.DeviceGuid = req.DeviceGuid
-	row.Name = req.Name
-	row.PublicHost = req.PublicHost
-	row.TargetHost = req.TargetHost
-	row.TargetPort = req.TargetPort
-	row.Protocol = req.Protocol
-	row.IsCustomDomain = req.IsCustomDomain
-	row.Status = req.Status
-	row.UpdateTime = now
-	if err := s.DB().Save(&row).Error; err != nil {
-		return nil, err
-	}
-	if row.IsCustomDomain {
-		if _, err := s.customDomainService().EnsureForMapping(row); err != nil {
-			return nil, err
-		}
-	}
+	triggerHTTPRouteReload()
 	return &row, nil
 }
 
@@ -123,14 +123,18 @@ func (s MappingService) Disable(guid string) error {
 	if guid == "" {
 		return errors.New("guid required")
 	}
-	return s.DB().Model(&domains.PortMapping{}).Where("guid = ?", guid).Updates(map[string]any{
+	err := s.DB().Model(&domains.PortMapping{}).Where("guid = ?", guid).Updates(map[string]any{
 		"status":      int(domains.StatusDisabled),
 		"update_time": domains.NowMilli(),
 	}).Error
+	if err == nil {
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
-func (s MappingService) AccessLogs(params map[string]string) ([]domains.HTTPAccessLog, int64, error) {
-	db := s.DB().Model(&domains.HTTPAccessLog{})
+func (s MappingService) AccessLogs(params map[string]string) ([]domains.HttpAccessLog, int64, error) {
+	db := s.DB().Model(&domains.HttpAccessLog{})
 	if mappingGuid := strings.TrimSpace(params["mappingGuid"]); mappingGuid != "" {
 		db = db.Where("mapping_guid = ?", mappingGuid)
 	}
@@ -171,21 +175,7 @@ func (s MappingService) AccessLogs(params map[string]string) ([]domains.HTTPAcce
 			db = db.Where("error_message = ''")
 		}
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.HTTPAccessLog
-	err := db.Order("create_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPageCursor[domains.HttpAccessLog](db, params, DefaultMaxPageSize, "create_time", "create_time DESC, id DESC")
 }
 
 func queryInt64(params map[string]string, key string) int64 {
@@ -262,8 +252,15 @@ func normalizeHost(host string) string {
 }
 
 func ensurePublicHostAvailable(publicHost, currentGuid string) error {
+	return ensurePublicHostAvailableOnDB(ServiceGroupApp.MappingService.DB(), publicHost, currentGuid)
+}
+
+func ensurePublicHostAvailableOnDB(db *gorm.DB, publicHost, currentGuid string) error {
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
 	var existing domains.PortMapping
-	err := ServiceGroupApp.MappingService.DB().Where("public_host = ?", publicHost).First(&existing).Error
+	err := db.Where("public_host = ?", publicHost).First(&existing).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}

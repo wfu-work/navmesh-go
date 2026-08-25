@@ -39,6 +39,11 @@ type DeviceConnection struct {
 type Manager struct {
 	mu          sync.RWMutex
 	connections map[string]*DeviceConnection
+	activity    ActivitySink
+}
+
+type ActivitySink interface {
+	Touch(deviceGuid string, at int64)
 }
 
 var (
@@ -48,6 +53,12 @@ var (
 
 func NewManager() *Manager {
 	return &Manager{connections: make(map[string]*DeviceConnection)}
+}
+
+func (m *Manager) SetActivitySink(sink ActivitySink) {
+	m.mu.Lock()
+	m.activity = sink
+	m.mu.Unlock()
 }
 
 func (m *Manager) Register(device domains.Device, conn *quic.Conn) {
@@ -198,13 +209,11 @@ func (m *Manager) Touch(deviceGuid string) {
 	if item := m.connections[deviceGuid]; item != nil {
 		item.info.LastActiveTime = now
 	}
+	sink := m.activity
 	m.mu.Unlock()
-	if global.NAV_DB == nil {
-		return
+	if sink != nil {
+		sink.Touch(deviceGuid, now)
 	}
-	_ = global.NAV_DB.Model(&domains.DeviceConnection{}).
-		Where("device_guid = ? AND status = ?", deviceGuid, int(domains.StatusEnabled)).
-		Updates(map[string]any{"last_active_time": now, "update_time": now}).Error
 }
 
 func (m *Manager) List() []DeviceConnectionInfo {
@@ -267,18 +276,25 @@ func (m *Manager) CloseDeviceIfCurrent(deviceGuid string, expected *DeviceConnec
 func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost string, targetPort int) (io.ReadWriteCloser, error) {
 	m.mu.RLock()
 	item := m.connections[deviceGuid]
+	var data *quic.Conn
+	var tcpControl net.Conn
+	var tcpData chan net.Conn
+	if item != nil {
+		data = item.data
+		tcpControl = item.tcpControl
+		tcpData = item.tcpData
+	}
 	m.mu.RUnlock()
 	if item == nil {
 		return nil, errors.New("device tunnel offline")
 	}
-	dataConn, dataErr := m.openTCPOverDataConn(ctx, item, targetHost, targetPort)
+	dataConn, dataErr := m.openTCPOverDataConn(ctx, tcpControl, tcpData, targetHost, targetPort)
 	if dataErr == nil {
 		m.Touch(deviceGuid)
 		return dataConn, nil
 	}
-	conn := item.data
-	if conn != nil {
-		stream, err := m.openTCPOverQUICConn(ctx, conn, targetHost, targetPort)
+	if data != nil {
+		stream, err := m.openTCPOverQUICConn(ctx, data, targetHost, targetPort)
 		if err == nil {
 			m.Touch(deviceGuid)
 			return stream, nil
@@ -286,7 +302,7 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 		_ = shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp over quic failed: "+err.Error())
 		return nil, err
 	}
-	if item.tcpControl != nil {
+	if tcpControl != nil {
 		_ = isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error())
 		return nil, dataErr
 	}
@@ -297,18 +313,25 @@ func (m *Manager) OpenTCPStream(ctx context.Context, deviceGuid, targetHost stri
 func (m *Manager) OpenServiceLogStream(ctx context.Context, deviceGuid, serviceName string, tail int) (io.ReadWriteCloser, error) {
 	m.mu.RLock()
 	item := m.connections[deviceGuid]
+	var data *quic.Conn
+	var tcpControl net.Conn
+	var tcpData chan net.Conn
+	if item != nil {
+		data = item.data
+		tcpControl = item.tcpControl
+		tcpData = item.tcpData
+	}
 	m.mu.RUnlock()
 	if item == nil {
 		return nil, errors.New("device tunnel offline")
 	}
-	dataConn, dataErr := m.openServiceLogOverDataConn(ctx, item, serviceName, tail)
+	dataConn, dataErr := m.openServiceLogOverDataConn(ctx, tcpControl, tcpData, serviceName, tail)
 	if dataErr == nil {
 		m.Touch(deviceGuid)
 		return dataConn, nil
 	}
-	conn := item.data
-	if conn != nil {
-		stream, err := m.openServiceLogOverQUICConn(ctx, conn, serviceName, tail)
+	if data != nil {
+		stream, err := m.openServiceLogOverQUICConn(ctx, data, serviceName, tail)
 		if err == nil {
 			m.Touch(deviceGuid)
 			return stream, nil
@@ -316,7 +339,7 @@ func (m *Manager) OpenServiceLogStream(ctx context.Context, deviceGuid, serviceN
 		_ = shouldCloseTunnelAfterOpenTCPError(err) && m.CloseDeviceIfCurrent(deviceGuid, item, "open service log over quic failed: "+err.Error())
 		return nil, err
 	}
-	if item.tcpControl != nil {
+	if tcpControl != nil {
 		_ = isTCPDataChannelUnavailable(dataErr) && m.CloseDeviceIfCurrent(deviceGuid, item, "open tcp data channel unavailable: "+dataErr.Error())
 		return nil, dataErr
 	}
@@ -383,15 +406,15 @@ func (m *Manager) openServiceLogOverQUICConn(ctx context.Context, conn *quic.Con
 	return stream, nil
 }
 
-func (m *Manager) openTCPOverDataConn(ctx context.Context, item *DeviceConnection, targetHost string, targetPort int) (io.ReadWriteCloser, error) {
-	if item == nil || item.tcpData == nil {
+func (m *Manager) openTCPOverDataConn(ctx context.Context, tcpControl net.Conn, tcpData <-chan net.Conn, targetHost string, targetPort int) (io.ReadWriteCloser, error) {
+	if tcpData == nil {
 		return nil, errors.New("tcp data channel unavailable")
 	}
-	if item.tcpControl == nil && len(item.tcpData) == 0 {
+	if tcpControl == nil && len(tcpData) == 0 {
 		return nil, errors.New("tcp data channel unavailable")
 	}
 	select {
-	case conn := <-item.tcpData:
+	case conn := <-tcpData:
 		clearDeadline := applyContextDeadline(conn, ctx)
 		defer clearDeadline()
 		frame := Frame{Type: FrameTypeOpenTCP, RequestID: uuid.NewString(), TargetHost: targetHost, TargetPort: targetPort}
@@ -426,15 +449,15 @@ func (m *Manager) openTCPOverDataConn(ctx context.Context, item *DeviceConnectio
 	}
 }
 
-func (m *Manager) openServiceLogOverDataConn(ctx context.Context, item *DeviceConnection, serviceName string, tail int) (io.ReadWriteCloser, error) {
-	if item == nil || item.tcpData == nil {
+func (m *Manager) openServiceLogOverDataConn(ctx context.Context, tcpControl net.Conn, tcpData <-chan net.Conn, serviceName string, tail int) (io.ReadWriteCloser, error) {
+	if tcpData == nil {
 		return nil, errors.New("tcp data channel unavailable")
 	}
-	if item.tcpControl == nil && len(item.tcpData) == 0 {
+	if tcpControl == nil && len(tcpData) == 0 {
 		return nil, errors.New("tcp data channel unavailable")
 	}
 	select {
-	case conn := <-item.tcpData:
+	case conn := <-tcpData:
 		clearDeadline := applyContextDeadline(conn, ctx)
 		defer clearDeadline()
 		if err := writeOpenServiceLogFrame(conn, serviceName, tail); err != nil {
@@ -481,12 +504,13 @@ func validateOpenServiceLogAck(ack Frame) error {
 
 func (m *Manager) CloseAll() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for guid, item := range m.connections {
+	connections := m.connections
+	m.connections = make(map[string]*DeviceConnection)
+	m.mu.Unlock()
+	for guid, item := range connections {
 		closeDeviceItem(item, "server shutting down")
 		global.NAV_LOG.Debug("close tunnel connection", zap.String("deviceGuid", guid))
 	}
-	m.connections = make(map[string]*DeviceConnection)
 }
 
 func closeDeviceItem(item *DeviceConnection, reason string) {

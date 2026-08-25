@@ -2,6 +2,7 @@ package httpgateway
 
 import (
 	"context"
+	"errors"
 	"html/template"
 	"io"
 	"net"
@@ -26,8 +27,11 @@ import (
 type Server struct {
 	addr      string
 	server    *http.Server
+	listener  net.Listener
 	manager   *tunnel.Manager
 	transport *http.Transport
+	routes    *RouteStore
+	wg        sync.WaitGroup
 }
 
 const (
@@ -43,20 +47,30 @@ func NewServer(addr string, manager *tunnel.Manager) *Server {
 	if manager == nil {
 		manager = tunnel.DefaultManager
 	}
-	s := &Server{addr: addr, manager: manager}
+	s := &Server{addr: addr, manager: manager, routes: DefaultRouteStore}
 	s.transport = newTunnelHTTPTransport(manager)
 	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      s,
-		ReadTimeout:  10 * time.Minute,
-		WriteTimeout: 10 * time.Minute,
+		Addr:              addr,
+		Handler:           s,
+		ReadTimeout:       10 * time.Minute,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      10 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	return s
 }
 
 func (s *Server) Start() error {
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	s.listener = listener
+	s.wg.Add(1)
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		defer s.wg.Done()
+		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			global.NAV_LOG.Error("navmesh http mapping gateway failed", zap.String("addr", s.addr), zap.Error(err))
 		}
 	}()
@@ -71,6 +85,15 @@ func (s *Server) Stop(ctx context.Context) {
 	if s.server != nil {
 		_ = s.server.Shutdown(ctx)
 	}
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -82,7 +105,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if bytesIn < 0 {
 		bytesIn = 0
 	}
-	mapping, device, err := findMapping(host)
+	var mapping domains.PortMapping
+	var device domains.Device
+	allowed := true
+	var err error
+	if s.routes != nil && s.routes.Ready() {
+		var route CachedRoute
+		var ok bool
+		route, ok = s.routes.Lookup(host)
+		if !ok {
+			err = errors.New("http mapping not found")
+		} else {
+			mapping = route.Mapping
+			device = route.Device
+			allowed = route.AllowHTTP
+		}
+	} else {
+		mapping, device, err = findMapping(host)
+		if err == nil {
+			allowed = services.ServiceGroupApp.AccessPolicyService.IsAllowed(device.Guid, mapping.Guid, mapping.Protocol)
+		}
+	}
 	if err != nil {
 		renderGatewayErrorPage(w, gatewayErrorPage{
 			StatusCode: http.StatusNotFound,
@@ -95,7 +138,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAccessLog(mappingLogInput{Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusNotFound, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: err.Error()})
 		return
 	}
-	if !services.ServiceGroupApp.AccessPolicyService.IsAllowed(device.Guid, mapping.Guid, mapping.Protocol) {
+	if !allowed {
 		renderGatewayErrorPage(w, gatewayErrorPage{
 			StatusCode:  http.StatusForbidden,
 			Title:       "访问被拒绝",
@@ -106,7 +149,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			MappingName: displayMappingName(mapping),
 			Hint:        "如需访问，请在管理后台调整访问策略后再重试。",
 		})
-		writeAccessLog(mappingLogInput{Mapping: mapping, Device: device, Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusForbidden, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: "access policy denied"})
+		writeAccessLog(mappingLogInput{MappingGuid: mapping.Guid, DeviceGuid: device.Guid, Host: host, Method: r.Method, Path: requestPath, SourceIP: clientIP, StatusCode: http.StatusForbidden, DurationMs: time.Since(start).Milliseconds(), BytesIn: bytesIn, ErrorMessage: "access policy denied"})
 		return
 	}
 	proxy := newHTTPReverseProxy(s.transport, mapping, device, host, clientIP)
@@ -279,8 +322,8 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	finish := func(reason string) {
 		finishOnce.Do(func() {
 			writeAccessLog(mappingLogInput{
-				Mapping:      rt.mapping,
-				Device:       rt.device,
+				MappingGuid:  rt.mapping.Guid,
+				DeviceGuid:   rt.device.Guid,
 				Host:         rt.host,
 				Method:       requestMethod,
 				Path:         requestPath,
@@ -291,7 +334,7 @@ func (rt *httpMappingRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 				UpstreamMs:   atomic.LoadInt64(&upstreamMs),
 				FirstByteMs:  atomic.LoadInt64(&firstByteMs),
 				ReusedConn:   reusedConn.Load(),
-				BytesIn:      bytesIn,
+				BytesIn:      atomic.LoadInt64(&bytesIn),
 				BytesOut:     atomic.LoadInt64(&bytesOut),
 				ErrorMessage: accessLogErrorMessage(reason),
 			})
@@ -464,7 +507,7 @@ func (c *tunnelHTTPConn) Close() error {
 		return nil
 	}
 	reason := "closed"
-	if isForceClosed(c.sessionGuid) {
+	if services.DefaultSessionRegistry.ConsumeForceClosed(c.sessionGuid) {
 		reason = "closed_by_admin"
 	}
 	if c.sessionGuid != "" {
@@ -875,12 +918,4 @@ func closeHTTPSession(guid string, bytesIn, bytesOut int64, reason string) {
 		"update_time":       now,
 		"disconnect_reason": strings.TrimSpace(reason),
 	}).Error
-}
-
-func isForceClosed(guid string) bool {
-	var session domains.TunnelSession
-	if err := global.NAV_DB.Select("force_closed").Where("guid = ?", guid).First(&session).Error; err != nil {
-		return false
-	}
-	return session.ForceClosed
 }

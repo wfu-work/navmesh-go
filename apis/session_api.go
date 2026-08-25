@@ -13,8 +13,7 @@ type SessionApi struct{}
 func (s SessionApi) List(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := sessionService.List(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
@@ -23,8 +22,7 @@ func (s SessionApi) List(c *gin.Context) {
 func (s SessionApi) Stats(c *gin.Context) {
 	params := utils.QueryParams(c)
 	stats, err := sessionService.Stats(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(stats, c)
@@ -32,10 +30,9 @@ func (s SessionApi) Stats(c *gin.Context) {
 
 func (s SessionApi) Close(c *gin.Context) {
 	guid := c.Param("guid")
-	if err := sessionService.Close(guid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, sessionService.Close(guid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "close", Resource: "tunnel_session", ResourceID: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "close", Resource: "tunnel_session", ResourceID: guid})
 	response.Ok(true, c)
 }

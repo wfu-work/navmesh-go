@@ -3,6 +3,8 @@ package services
 import (
 	"errors"
 	"strings"
+	"sync"
+	"time"
 
 	"navmesh-go/domains"
 	"navmesh-go/utils"
@@ -14,6 +16,21 @@ import (
 
 type GroupService struct {
 	commonServices.CrudService[domains.DeviceGroup]
+}
+
+type deviceGroupCacheKey struct {
+	db   *gorm.DB
+	guid string
+}
+
+type deviceGroupCacheEntry struct {
+	group     domains.DeviceGroup
+	expiresAt time.Time
+}
+
+var enabledDeviceGroupCache struct {
+	sync.Mutex
+	items map[deviceGroupCacheKey]deviceGroupCacheEntry
 }
 
 func (s GroupService) WithDB(db *gorm.DB) GroupService {
@@ -57,16 +74,9 @@ func (s GroupService) List(params map[string]string) ([]domains.DeviceGroup, int
 		err := db.Order("sort ASC, update_time DESC").Find(&items).Error
 		return items, total, err
 	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
+	page := ParsePage(params, DefaultMaxPageSize)
 	var items []domains.DeviceGroup
-	err := db.Order("sort ASC, update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
+	err := db.Order("sort ASC, update_time DESC").Limit(page.Size).Offset((page.Page - 1) * page.Size).Find(&items).Error
 	return items, total, err
 }
 
@@ -118,7 +128,12 @@ func (s GroupService) Save(req SaveDeviceGroupRequest) (*domains.DeviceGroup, er
 	row.Remark = req.Remark
 	row.Status = status
 	row.UpdateTime = now
-	return &row, s.DB().Save(&row).Error
+	if err := s.DB().Save(&row).Error; err != nil {
+		return nil, err
+	}
+	invalidateEnabledDeviceGroupCache()
+	triggerHTTPRouteReload()
+	return &row, nil
 }
 
 func (s GroupService) Disable(guid string) error {
@@ -126,10 +141,15 @@ func (s GroupService) Disable(guid string) error {
 	if guid == "" {
 		return errors.New("guid required")
 	}
-	return s.DB().Model(&domains.DeviceGroup{}).Where("guid = ? OR group_key = ?", guid, guid).Updates(map[string]any{
+	err := s.DB().Model(&domains.DeviceGroup{}).Where("guid = ? OR group_key = ?", guid, guid).Updates(map[string]any{
 		"status":      int(domains.StatusDisabled),
 		"update_time": domains.NowMilli(),
 	}).Error
+	if err == nil {
+		invalidateEnabledDeviceGroupCache()
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s GroupService) Delete(guid string) error {
@@ -154,7 +174,12 @@ func (s GroupService) Delete(guid string) error {
 	if deviceCount > 0 {
 		return errors.New("device group is in use")
 	}
-	return s.DB().Unscoped().Where("guid = ? OR group_key = ?", row.Guid, groupKey).Delete(&domains.DeviceGroup{}).Error
+	err := s.DB().Unscoped().Where("guid = ? OR group_key = ?", row.Guid, groupKey).Delete(&domains.DeviceGroup{}).Error
+	if err == nil {
+		invalidateEnabledDeviceGroupCache()
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s GroupService) AssignDevice(deviceGuid string, req AssignDeviceGroupRequest) error {
@@ -171,12 +196,16 @@ func (s GroupService) AssignDevice(deviceGuid string, req AssignDeviceGroupReque
 		}
 		req.GroupGuid = group.Key
 	}
-	return s.DB().Model(&domains.Device{}).Where("guid = ?", deviceGuid).Updates(map[string]any{
+	err := s.DB().Model(&domains.Device{}).Where("guid = ?", deviceGuid).Updates(map[string]any{
 		"group_guid":  req.GroupGuid,
 		"device_type": req.GroupGuid,
 		"tags":        req.Tags,
 		"update_time": domains.NowMilli(),
 	}).Error
+	if err == nil {
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s GroupService) GetEnabled(guid string) (*domains.DeviceGroup, error) {
@@ -184,14 +213,35 @@ func (s GroupService) GetEnabled(guid string) (*domains.DeviceGroup, error) {
 	if guid == "" {
 		return nil, errors.New("device group required")
 	}
+	db := s.DB()
+	cacheKey := deviceGroupCacheKey{db: db, guid: guid}
+	enabledDeviceGroupCache.Lock()
+	if entry, ok := enabledDeviceGroupCache.items[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+		group := entry.group
+		enabledDeviceGroupCache.Unlock()
+		return &group, nil
+	}
+	enabledDeviceGroupCache.Unlock()
 	var row domains.DeviceGroup
-	if err := s.DB().Where("(group_key = ? OR guid = ?) AND status = ?", guid, guid, int(domains.StatusEnabled)).First(&row).Error; err != nil {
+	if err := db.Where("(group_key = ? OR guid = ?) AND status = ?", guid, guid, int(domains.StatusEnabled)).First(&row).Error; err != nil {
 		return nil, errors.New("device group not found")
 	}
 	if row.Key == "" {
 		row.Key = row.Guid
 	}
+	enabledDeviceGroupCache.Lock()
+	if enabledDeviceGroupCache.items == nil {
+		enabledDeviceGroupCache.items = make(map[deviceGroupCacheKey]deviceGroupCacheEntry)
+	}
+	enabledDeviceGroupCache.items[cacheKey] = deviceGroupCacheEntry{group: row, expiresAt: time.Now().Add(time.Minute)}
+	enabledDeviceGroupCache.Unlock()
 	return &row, nil
+}
+
+func invalidateEnabledDeviceGroupCache() {
+	enabledDeviceGroupCache.Lock()
+	enabledDeviceGroupCache.items = make(map[deviceGroupCacheKey]deviceGroupCacheEntry)
+	enabledDeviceGroupCache.Unlock()
 }
 
 func (s GroupService) SeedDefaults() {
@@ -210,6 +260,7 @@ func (s GroupService) SeedDefaults() {
 		_ = s.Create(item)
 	}
 	s.backfillGroupIcons()
+	invalidateEnabledDeviceGroupCache()
 }
 
 func (s GroupService) backfillGroupKeys() {

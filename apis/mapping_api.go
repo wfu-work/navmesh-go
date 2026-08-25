@@ -13,43 +13,38 @@ type MappingApi struct{}
 func (m MappingApi) List(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := mappingService.List(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
 }
 
 func (m MappingApi) Save(c *gin.Context) {
-	var req services.SavePortMappingRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.SavePortMappingRequest](c)
+	if !ok {
 		return
 	}
 	item, err := mappingService.Save(req)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "save", Resource: "port_mapping", ResourceID: item.Guid, Message: item.PublicHost, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "save", Resource: "port_mapping", ResourceID: item.Guid, Message: item.PublicHost})
 	response.Ok(item, c)
 }
 
 func (m MappingApi) Disable(c *gin.Context) {
 	guid := c.Param("guid")
-	if err := mappingService.Disable(guid); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, mappingService.Disable(guid)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "port_mapping", ResourceID: guid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "disable", Resource: "port_mapping", ResourceID: guid})
 	response.Ok(true, c)
 }
 
 func (m MappingApi) AccessLogs(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := mappingService.AccessLogs(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
@@ -58,51 +53,46 @@ func (m MappingApi) AccessLogs(c *gin.Context) {
 func (m MappingApi) CustomDomains(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := customDomainService.List(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
 }
 
 func (m MappingApi) SaveCustomDomain(c *gin.Context) {
-	var req services.SaveCustomDomainRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[services.SaveCustomDomainRequest](c)
+	if !ok {
 		return
 	}
 	item, err := customDomainService.Save(req)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "save", Resource: "custom_domain", ResourceID: item.Domain, Message: item.MappingGuid, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "save", Resource: "custom_domain", ResourceID: item.Domain, Message: item.MappingGuid})
 	response.Ok(item, c)
 }
 
 func (m MappingApi) VerifyCustomDomain(c *gin.Context) {
-	var req struct {
+	type verifyRequest struct {
 		Token string `json:"token"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	req, ok := bindJSON[verifyRequest](c)
+	if !ok {
 		return
 	}
 	domain := c.Param("domain")
-	if err := customDomainService.Verify(domain, req.Token); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, customDomainService.Verify(domain, req.Token)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "verify", Resource: "custom_domain", ResourceID: domain, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "verify", Resource: "custom_domain", ResourceID: domain})
 	response.Ok(true, c)
 }
 
 func (m MappingApi) DisableCustomDomain(c *gin.Context) {
 	domain := c.Param("domain")
-	if err := customDomainService.Disable(domain); err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, customDomainService.Disable(domain)) {
 		return
 	}
-	auditService.Record(services.AuditInput{Actor: actorName(c), Action: "disable", Resource: "custom_domain", ResourceID: domain, SourceIP: c.ClientIP()})
+	recordAudit(c, services.AuditInput{Action: "disable", Resource: "custom_domain", ResourceID: domain})
 	response.Ok(true, c)
 }

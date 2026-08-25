@@ -52,8 +52,8 @@ type Device struct {
 	LastMetricAt          int64   `json:"lastMetricAt" gorm:"index;comment:最后指标上报时间"`
 	GroupGuid             string  `json:"groupGuid" gorm:"size:64;index;comment:设备分组ID"`
 	Tags                  string  `json:"tags" gorm:"size:512;comment:设备标签，逗号分隔"`
-	Status                int     `json:"status" gorm:"index;comment:状态"`
-	LastSeenTime          int64   `json:"lastSeenTime" gorm:"index;comment:最后在线时间"`
+	Status                int     `json:"status" gorm:"index;index:idx_device_status_seen,priority:1;comment:状态"`
+	LastSeenTime          int64   `json:"lastSeenTime" gorm:"index;index:idx_device_status_seen,priority:2;comment:最后在线时间"`
 	VPNRestartRequestedAt int64   `json:"vpnRestartRequestedAt" gorm:"column:vpn_restart_requested_at;index;comment:VPN重启请求时间"`
 	VPNRestartDeliveredAt int64   `json:"vpnRestartDeliveredAt" gorm:"column:vpn_restart_delivered_at;index;comment:VPN重启指令下发时间"`
 }

@@ -8,7 +8,6 @@ import (
 	"navmesh-go/utils"
 
 	commonDomains "github.com/wfu-work/nav-common-go-lib/domains"
-	"github.com/wfu-work/nav-common-go-lib/global"
 	commonServices "github.com/wfu-work/nav-common-go-lib/services"
 	"gorm.io/gorm"
 )
@@ -44,21 +43,7 @@ func (s AccessPolicyService) List(params map[string]string) ([]domains.AccessPol
 	if status := utils.Str2Int(params["status"]); status > 0 {
 		db = db.Where("status = ?", status)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.AccessPolicy
-	err := db.Order("update_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPage[domains.AccessPolicy](db, params, DefaultMaxPageSize, "update_time DESC")
 }
 
 func (s AccessPolicyService) Save(req SaveAccessPolicyRequest) (*domains.AccessPolicy, error) {
@@ -92,7 +77,11 @@ func (s AccessPolicyService) Save(req SaveAccessPolicyRequest) (*domains.AccessP
 	row.AllowTCP = req.AllowTCP
 	row.Status = req.Status
 	row.UpdateTime = now
-	return &row, s.DB().Save(&row).Error
+	if err := s.DB().Save(&row).Error; err != nil {
+		return nil, err
+	}
+	triggerHTTPRouteReload()
+	return &row, nil
 }
 
 func (s AccessPolicyService) Disable(guid string) error {
@@ -100,26 +89,27 @@ func (s AccessPolicyService) Disable(guid string) error {
 	if guid == "" {
 		return errors.New("guid required")
 	}
-	return s.DB().Model(&domains.AccessPolicy{}).Where("guid = ?", guid).Updates(map[string]any{
+	err := s.DB().Model(&domains.AccessPolicy{}).Where("guid = ?", guid).Updates(map[string]any{
 		"status":      int(domains.StatusDisabled),
 		"update_time": domains.NowMilli(),
 	}).Error
+	if err == nil {
+		triggerHTTPRouteReload()
+	}
+	return err
 }
 
 func (s AccessPolicyService) IsAllowed(deviceGuid, mappingGuid, protocol string) bool {
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
-	var policies []domains.AccessPolicy
 	deviceGuid = strings.TrimSpace(deviceGuid)
 	mappingGuid = strings.TrimSpace(mappingGuid)
+	deviceContext := loadPolicyDeviceContext(s.DB(), deviceGuid)
+	var policies []domains.AccessPolicy
 	query := s.DB().Where("status = ?", int(domains.StatusEnabled))
 	if mappingGuid != "" {
-		groupGuid := deviceGroupGuid(deviceGuid)
-		deviceType := deviceTypeGroup(deviceGuid)
-		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id IN ?) OR (scope = ? AND target_id = ?)", "global", "device", deviceGuid, "group", []string{groupGuid, deviceType}, "mapping", mappingGuid)
+		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id IN ?) OR (scope = ? AND target_id = ?)", "global", "device", deviceGuid, "group", deviceContext.targets(), "mapping", mappingGuid)
 	} else {
-		groupGuid := deviceGroupGuid(deviceGuid)
-		deviceType := deviceTypeGroup(deviceGuid)
-		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id IN ?)", "global", "device", deviceGuid, "group", []string{groupGuid, deviceType})
+		query = query.Where("scope = ? OR (scope = ? AND target_id = ?) OR (scope = ? AND target_id IN ?)", "global", "device", deviceGuid, "group", deviceContext.targets())
 	}
 	if err := query.Find(&policies).Error; err != nil || len(policies) == 0 {
 		return true
@@ -138,20 +128,47 @@ func (s AccessPolicyService) IsAllowed(deviceGuid, mappingGuid, protocol string)
 	return allowed
 }
 
-func deviceGroupGuid(deviceGuid string) string {
-	var device domains.Device
-	if err := global.NAV_DB.Select("group_guid").Where("guid = ?", strings.TrimSpace(deviceGuid)).First(&device).Error; err != nil {
-		return ""
-	}
-	return strings.TrimSpace(device.GroupGuid)
+type policyDeviceContext struct {
+	groupGuid  string
+	deviceType string
 }
 
-func deviceTypeGroup(deviceGuid string) string {
-	var device domains.Device
-	if err := global.NAV_DB.Select("device_type").Where("guid = ?", strings.TrimSpace(deviceGuid)).First(&device).Error; err != nil {
-		return ""
+func loadPolicyDeviceContext(db *gorm.DB, deviceGuid string) policyDeviceContext {
+	if db == nil || strings.TrimSpace(deviceGuid) == "" {
+		return policyDeviceContext{}
 	}
-	return strings.TrimSpace(device.DeviceType)
+	var device domains.Device
+	if err := db.Select("group_guid", "device_type").Where("guid = ?", deviceGuid).First(&device).Error; err != nil {
+		return policyDeviceContext{}
+	}
+	return policyDeviceContext{
+		groupGuid:  strings.TrimSpace(device.GroupGuid),
+		deviceType: strings.TrimSpace(device.DeviceType),
+	}
+}
+
+func (c policyDeviceContext) targets() []string {
+	values := make([]string, 0, 2)
+	for _, value := range []string{c.groupGuid, c.deviceType} {
+		if value == "" {
+			continue
+		}
+		duplicate := false
+		for _, existing := range values {
+			if existing == value {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			values = append(values, value)
+		}
+	}
+	// Keep the IN predicate valid when the device has no group metadata.
+	if len(values) == 0 {
+		return []string{""}
+	}
+	return values
 }
 
 func normalizePolicyRequest(req SaveAccessPolicyRequest) SaveAccessPolicyRequest {

@@ -4,12 +4,26 @@ import (
 	"strings"
 
 	"navmesh-go/domains"
-	"navmesh-go/utils"
 
 	"github.com/wfu-work/nav-common-go-lib/global"
+	"gorm.io/gorm"
 )
 
-type AuditService struct{}
+type AuditService struct {
+	db *gorm.DB
+}
+
+func (s AuditService) WithDB(db *gorm.DB) AuditService {
+	s.db = db
+	return s
+}
+
+func (s AuditService) DB() *gorm.DB {
+	if s.db != nil {
+		return s.db
+	}
+	return global.NAV_DB
+}
 
 type AuditInput struct {
 	Actor      string
@@ -34,11 +48,17 @@ func (s AuditService) Record(input AuditInput) {
 		SourceIP:   strings.TrimSpace(input.SourceIP),
 		CreateTime: domains.NowMilli(),
 	}
-	_ = global.NAV_DB.Create(&row).Error
+	if db := s.DB(); db != nil {
+		_ = db.Create(&row).Error
+	}
 }
 
 func (s AuditService) List(params map[string]string) ([]domains.AuditLog, int64, error) {
-	db := global.NAV_DB.Model(&domains.AuditLog{})
+	db := s.DB()
+	if db == nil {
+		return nil, 0, gorm.ErrInvalidDB
+	}
+	db = db.Model(&domains.AuditLog{})
 	if actor := strings.TrimSpace(params["actor"]); actor != "" {
 		db = db.Where("actor = ?", actor)
 	}
@@ -51,19 +71,5 @@ func (s AuditService) List(params map[string]string) ([]domains.AuditLog, int64,
 	if resourceID := strings.TrimSpace(params["resourceId"]); resourceID != "" {
 		db = db.Where("resource_id = ?", resourceID)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	page := utils.Str2Int(params["page"])
-	size := utils.Str2Int(params["size"])
-	if page <= 0 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	var items []domains.AuditLog
-	err := db.Order("create_time DESC").Limit(size).Offset((page - 1) * size).Find(&items).Error
-	return items, total, err
+	return queryPageCursor[domains.AuditLog](db, params, DefaultMaxPageSize, "create_time", "create_time DESC, id DESC")
 }

@@ -22,6 +22,7 @@ type RuntimePolicy struct {
 	total        int
 	byDevice     map[string]int
 	sourceHits   map[string][]time.Time
+	lastHitSweep time.Time
 	lastSettings time.Time
 	settings     RuntimeSettings
 }
@@ -48,6 +49,7 @@ func (p *RuntimePolicy) Acquire(deviceGuid, sourceIP string) (*SessionPermit, er
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.sweepSourceHitsLocked(now)
 	if settings.RateLimitPerMinute > 0 && sourceIP != "" {
 		windowStart := now.Add(-time.Minute)
 		hits := p.sourceHits[sourceIP]
@@ -74,6 +76,27 @@ func (p *RuntimePolicy) Acquire(deviceGuid, sourceIP string) (*SessionPermit, er
 		p.byDevice[deviceGuid]++
 	}
 	return &SessionPermit{DeviceGuid: deviceGuid, SourceIP: sourceIP}, nil
+}
+
+func (p *RuntimePolicy) sweepSourceHitsLocked(now time.Time) {
+	if !p.lastHitSweep.IsZero() && now.Sub(p.lastHitSweep) < time.Minute {
+		return
+	}
+	windowStart := now.Add(-time.Minute)
+	for sourceIP, hits := range p.sourceHits {
+		kept := hits[:0]
+		for _, hit := range hits {
+			if hit.After(windowStart) {
+				kept = append(kept, hit)
+			}
+		}
+		if len(kept) == 0 {
+			delete(p.sourceHits, sourceIP)
+			continue
+		}
+		p.sourceHits[sourceIP] = kept
+	}
+	p.lastHitSweep = now
 }
 
 func (p *RuntimePolicy) Release(permit *SessionPermit) {

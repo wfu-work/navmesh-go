@@ -195,8 +195,11 @@ cp -R "$APP_DIR"/. "$INSTALL_DIR"/
 chmod +x "$INSTALL_DIR/$APP_FILE"
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-log "Writing systemd service ${SERVICE_FILE}"
-cat > "$SERVICE_FILE" <<EOF
+if [ -e "$SERVICE_FILE" ]; then
+  log "Systemd service ${SERVICE_FILE} already exists; keeping existing file"
+else
+  log "Writing systemd service ${SERVICE_FILE}"
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=NavFirst Hipnames
 After=network-online.target
@@ -213,6 +216,7 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 log "Starting ${SERVICE_NAME} service"
 systemctl daemon-reload

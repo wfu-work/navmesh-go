@@ -13,8 +13,7 @@ type AuditApi struct{}
 func (a AuditApi) List(c *gin.Context) {
 	params := utils.QueryParams(c)
 	items, total, err := auditService.List(params)
-	if err != nil {
-		response.FailWithMessage(err.Error(), c)
+	if fail(c, err) {
 		return
 	}
 	response.Ok(services.PageResult(items, total, params), c)
